@@ -1,0 +1,48 @@
+[tool.poetry]
+name = "folding"
+version = "3.0.4"
+description = "Macrocosmos Subnet 25: Mainframe"
+authors = ["Brian McCrindle <brian@macrocosmos.ai>", "Sergio Champoux <sergio@macrocosmos.ai>", "Szymon Fonau <szymon.fonau@macrocosmos.ai>"]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.13"
+torch = "^2.3.0"
+loguru = "0.7.2"
+pandas = "*"
+bittensor = "^9.9.0"
+numpy = "<2.3"
+tenacity = "9.0.0"
+python-dotenv = "1.0.1"
+wandb = "0.17.2"
+eth-utils = "2.1.1"
+parmed = "4.2.2"
+plotly = "5.22.0"
+kaleido = "0.2.1"
+async-timeout = "4.0.3"
+pdbfixer = { git = "https://github.com/macrocosm-os/pdbfixer.git", branch = "master" }
+ipykernel = "^6.29.5"
+tqdm = "^4.67.0"
+openmm = {extras = ["cuda12"], version = "8.2.0"}
+openmm-cuda-12 = "8.2.0"
+atom = { git = "https://github.com/macrocosm-os/atom.git", branch = "main" }
+requests = "^2.32.3"
+boto3 = "^1.35.95"
+pytest-mock = "^3.14.0"
+gjp-models = "^0.1.10"
+mdanalysis = "^2.9.0"
+python-multipart = "^0.0.20"
+bittensor-cli= ">=9.1.0"
+
+[tool.poetry.group.api]
+optional = true
+
+[tool.poetry.group.api.dependencies]
+fastapi = "^0.110.0"
+uvicorn = "^0.27.1"
+structlog = "^24.1.0"
+slowapi = "^0.1.9"
+prometheus-fastapi-instrumentator = "^6.1.0"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"

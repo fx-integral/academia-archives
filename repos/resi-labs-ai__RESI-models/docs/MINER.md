@@ -1,0 +1,512 @@
+# Miner CLI Guide
+
+Guide for miners on the Real Estate Price Prediction Subnet (Bittensor subnet 46).
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Model Requirements](#model-requirements)
+- [Prerequisites](#prerequisites)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Commands Reference](#commands-reference)
+- [HuggingFace Repository Structure](#huggingface-repository-structure)
+- [Competition Rules](#competition-rules)
+- [Troubleshooting](#troubleshooting)
+- [Support](#support)
+
+## Overview
+
+The miner CLI (`miner-cli`) helps you:
+1. **Evaluate** your ONNX model locally before submission
+2. **Submit** your model commitment to the Bittensor blockchain
+
+**How it works:** You train a model to predict real estate prices, test it locally, upload it to HuggingFace, then submit a commitment to the chain. Validators download your model, verify it matches your commitment, and score it based on prediction accuracy.
+
+## Model Requirements
+
+| Requirement | Specification |
+|-------------|---------------|
+| Format | ONNX |
+| Max size | 200 MB |
+| Input shape | `(batch, 10-79)` float32 (numeric features) |
+| Output shape | `(batch, 1)` or `(batch,)` float32 |
+| Image inputs | Optional — see [Property Images](#property-images-optional) |
+
+### Feature Selection
+
+Your model chooses which features it uses via a `feature_config.json` file in your HuggingFace repo. You can select **10 to 79** numeric/boolean features from the available set in `real_estate/data/mappings/feature_config.yaml`.
+
+Five features are **required**: `living_area_sqft`, `latitude`, `longitude`, `bedrooms`, `bathrooms`.
+
+If you don't include a `feature_config.json`, the validator falls back to all 79 features in the default YAML order (backwards compatible).
+
+#### feature_config.json format
+
+```json
+{
+  "version": "1.0",
+  "features": [
+    "living_area_sqft",
+    "latitude",
+    "longitude",
+    "bedrooms",
+    "bathrooms",
+    "lot_size_sqft",
+    "year_built",
+    "stories"
+  ]
+}
+```
+
+The feature order in this list defines the column order of your model's input tensor. Your ONNX model's first input must have shape `(batch, len(features))`.
+
+### Property Images (optional)
+
+Models can optionally receive property images by adding `"property_images"` to the features list:
+
+```json
+{
+  "version": "1.0",
+  "features": [
+    "living_area_sqft",
+    "latitude",
+    "longitude",
+    "bedrooms",
+    "bathrooms",
+    "lot_size_sqft",
+    "year_built",
+    "stories",
+    "property_images"
+  ]
+}
+```
+
+When `property_images` is included, the validator provides two additional ONNX inputs alongside the numeric features:
+
+| Input name | Shape | Dtype | Description |
+|------------|-------|-------|-------------|
+| `features` | `(batch, N)` | float32 | Numeric/boolean features (same as without images) |
+| `images` | `(batch, max_imgs, channels, height, width)` | uint8 | Property photos |
+| `image_counts` | `(batch,)` | int32 | How many real images each property has |
+
+Current v1 image parameters:
+
+| Parameter | Value |
+|-----------|-------|
+| `max_imgs` | 10 (slots per property, fixed) |
+| `channels` | 3 (RGB) |
+| `height` | 224 |
+| `width` | 224 |
+
+So the full `images` shape is `(batch, 10, 3, 224, 224)`.
+
+Your ONNX model must declare inputs named exactly `features`, `images`, and `image_counts`.
+
+The tensor always has 10 image slots per property. Properties with fewer photos have their remaining slots zero-padded. Use `image_counts` to know where real data ends — for example, if `image_counts[i] == 3`, then `images[i, 0:3]` are real photos and `images[i, 3:10]` are zeros.
+
+Models **without** `property_images` in their config are completely unaffected — they receive a single numeric input as before.
+
+## Prerequisites
+
+- Python >=3.11, <3.14
+- Bittensor wallet with registered hotkey
+- HuggingFace account
+- TAO for subnet registration
+
+## Installation
+
+```bash
+git clone https://github.com/resi-labs-ai/RESI-models.git
+cd RESI-models
+
+# Install with pip
+pip install -e .
+
+# Verify
+miner-cli --help
+```
+
+Expected output:
+```
+usage: miner-cli [-h] {evaluate,submit} ...
+
+RESI Miner CLI - Evaluate and submit ONNX models
+
+positional arguments:
+  {evaluate,submit}  Command to execute
+    evaluate         Evaluate an ONNX model locally
+    submit           Submit model commitment to chain
+```
+
+## Usage
+
+### Step 1: Evaluate Your Model
+
+```bash
+miner-cli evaluate --model.path ./my_model.onnx
+```
+
+Check that metrics meet targets (MAPE < 15%, Score > 0.85).
+
+### Step 2: Create HuggingFace Repository
+
+1. Go to [huggingface.co](https://huggingface.co)
+2. Create a new model repository
+3. Upload your onnx model to the repository root
+
+> **Note:** Your repository must be public when validators attempt to download your model.
+
+### Step 3: Submit to Chain
+
+```bash
+miner-cli submit \
+    --model.path ./my_model.onnx \
+    --hf.repo_id your-username/your-repo \
+    --wallet.name miner \
+    --wallet.hotkey default
+```
+
+### Step 4: Complete HuggingFace Setup
+
+After submitting, add these files to your HuggingFace repo:
+
+1. **LICENSE** - Copy the exact text from [MODEL_LICENSE.md](../MODEL_LICENSE.md) into a `LICENSE` file in your repo root. The validator verifies this file by SHA-256 hash - any modification will cause rejection.
+
+2. **Model card metadata** - In your `README.md` front matter, set:
+   ```yaml
+   ---
+   license: other
+   license_name: resi-exclusive
+   license_link: https://huggingface.co/resi-ai/model-license/blob/main/LICENSE
+   ---
+   ```
+
+3. **extrinsic_record.json** - Use values from submit output:
+
+```json
+{
+  "extrinsic": "142858-3",
+  "hotkey": "5ABC...your_hotkey_address...XYZ"
+}
+```
+
+### Step 5: Wait for Validation
+
+Validators will automatically download your model, verify the hash matches your commitment, and score it based on prediction accuracy.
+If your repository is private when validation occurs, your model will not be scored.
+
+## Commands Reference
+
+### miner-cli evaluate
+
+Validates your model and runs inference on test samples.
+
+```bash
+miner-cli evaluate --model.path PATH [--max-size-mb MB]
+```
+
+| Argument | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `--model.path` | Yes | - | Path to ONNX model file |
+| `--max-size-mb` | No | 200 | Maximum model size in MB |
+
+**What it checks:**
+1. File exists and is under size limit
+2. Valid ONNX format
+3. Correct input shape (matches feature_config.json or default 79)
+4. Correct output shape
+5. No NaN or Inf in predictions
+
+**Example output:**
+```
+Evaluating model: ./my_model.onnx
+
+Evaluation Results:
+  MAPE:  8.15%
+  Score: 0.9185
+  MAE:   $23,450
+  RMSE:  $67,890
+  R²:    0.8234
+
+Inference time: 245ms
+✓ Model is valid and ready for submission.
+```
+
+**Metrics explained:**
+| Metric | What it measures | Target |
+|--------|------------------|--------|
+| MAPE | Mean Absolute Percentage Error | < 15% |
+| Score | 1 - MAPE (higher is better) | > 0.85 |
+| MAE | Average dollar error | Lower is better |
+| RMSE | Penalizes large errors more | Lower is better |
+| R² | Variance explained (0-1) | > 0.70 |
+
+### miner-cli submit
+
+Submits your model commitment to the blockchain.
+
+```bash
+miner-cli submit \
+    --model.path PATH \
+    --hf.repo_id USER/REPO \
+    --wallet.name NAME \
+    --wallet.hotkey HOTKEY \
+    [--network NETWORK] \
+    [--netuid UID] \
+    [--skip-scan] \
+    [--scan-blocks N] \
+    [--no-commit-reveal] \
+    [--reveal-blocks N]
+```
+
+| Argument | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `--model.path` | Yes | - | Path to local ONNX model file |
+| `--hf.repo_id` | Yes | - | HuggingFace repo (e.g., `alice/housing-model`) |
+| `--wallet.name` | Yes | - | Bittensor wallet name |
+| `--wallet.hotkey` | Yes | - | Wallet hotkey name |
+| `--network` | No | `finney` | Network: `finney`, `test`, or `ws://` endpoint |
+| `--netuid` | No | Auto | Subnet UID (46 for finney, 428 for test) |
+| `--skip-scan` | No | False | Skip scanning for extrinsic ID |
+| `--scan-blocks` | No | 25 | Blocks to scan for extrinsic |
+| `--no-commit-reveal` | No | False | Disable commit-reveal (not recommended) |
+| `--reveal-blocks` | No | 360 | Blocks until commitment reveal (~1 epoch) |
+
+**Network options:**
+| Network | Flag | Subnet UID |
+|---------|------|------------|
+| Mainnet | `--network finney` | 46 |
+| Testnet | `--network test` | 428 |
+| Custom | `--network ws://host:port` | Must specify `--netuid` |
+
+**Commit-Reveal (enabled by default):**
+
+Your commitment is encrypted using timelock encryption and only revealed after `--reveal-blocks` blocks (~72 minutes by default). This prevents frontrunning - competitors cannot see your model details until the reveal.
+
+How it works:
+1. Your commitment is encrypted with a drand timelock
+2. The encrypted commitment is stored on-chain
+3. After `reveal_round`, the chain automatically decrypts and reveals your commitment
+4. Validators can then download and evaluate your model
+
+To disable commit-reveal (not recommended): `--no-commit-reveal`
+
+**What it does:**
+1. Validates model file exists
+2. Checks HuggingFace repo ID length (max 51 bytes)
+3. Verifies hotkey is registered on subnet
+4. Computes SHA-256 hash of model file
+5. Submits commitment to chain: `{"h":"<hash>","r":"<repo_id>"}`
+6. Scans for extrinsic ID
+
+**Example output:**
+```
+License Notice:
+Your HuggingFace model must use the RESI Proprietary Model License.
+Validators verify metadata and LICENSE file hash before evaluating your model.
+
+Submitting model to chain...
+
+✓ Model committed to chain with commit-reveal!
+
+Commitment details:
+  Repository:         alice/housing-v1
+  Model hash:         a3f8c2e9d1b4f6a8...
+  Submitted at block: 142857
+  Commit-reveal:      Yes (reveal at drand round 25864000)
+
+Scanning for extrinsic (up to 25 blocks)...
+  Found extrinsic: 142858-3
+
+Next steps:
+  1. Ensure model.onnx is uploaded to your HuggingFace repo
+  2. Add the RESI Proprietary Model LICENSE file to your repo (see MODEL_LICENSE.md)
+  3. Set license metadata in your README.md (license: other, license_name: resi-exclusive)
+  4. Add extrinsic_record.json to your repo with this content:
+
+{
+  "extrinsic": "142858-3",
+  "hotkey": "5ABC...XYZ"
+}
+
+  5. Wait for validator evaluation (~72 min after reveal)
+```
+
+## HuggingFace Repository Structure
+
+Your repo must contain:
+
+```
+your-username/housing-model/
+├── model.onnx              # Your ONNX model (required)
+├── LICENSE                  # RESI Proprietary Model License (required, exact text)
+├── extrinsic_record.json   # Chain commitment link (required)
+├── feature_config.json     # Feature selection (optional — defaults to all)
+└── README.md               # Model card with license metadata (required)
+```
+
+> **Note:** Your README.md must include the license metadata in its YAML front matter:
+> `license: other`, `license_name: resi-exclusive`, `license_link: https://huggingface.co/resi-ai/model-license/blob/main/LICENSE`
+
+### extrinsic_record.json Format
+
+```json
+{
+  "extrinsic": "<block_number>-<extrinsic_index>",
+  "hotkey": "<your_hotkey_ss58_address>"
+}
+```
+
+### Private Repositories
+
+Your HuggingFace repository can be **private** before you commit to the chain. This prevents others from monitoring your repo for new model uploads. The workflow:
+
+1. Create a **private** HuggingFace repo
+2. Upload your model and prepare all files
+3. Run `miner-cli submit` to commit to chain
+4. Make the repo **public** so validators can download it
+
+The CLI only hashes your local model file - it doesn't interact with HuggingFace. Validators will need access to download your model after you commit.
+
+### What Validators Check
+
+Validators perform these checks before scoring your model:
+
+**Pre-download (via HuggingFace API):**
+1. RESI Proprietary Model License verified:
+   - Model card metadata: `license: other`, `license_name: resi-exclusive`, `license_link` matches canonical URL
+   - LICENSE file exists and SHA-256 hash matches canonical license text
+2. model.onnx size ≤ 200MB
+3. extrinsic_record.json exists and is valid
+4. Extrinsic exists on chain and was signed by your hotkey
+
+**Post-download:**
+5. SHA-256 hash of downloaded file matches your commitment
+
+**Important:** The file you provide to `miner-cli submit` is hashed locally. This exact file must be uploaded to HuggingFace - any difference will cause validation to fail.
+
+## Competition Rules
+
+### Evaluation Schedule
+
+Evaluation runs **daily at 18:00 UTC** against properties both listed and sold within the last 30 days.
+
+### Non-Disclosure States
+
+Some states have non-disclosure laws for housing sale prices, meaning we can't validate predictions for those states. **Do not include these states in your training data:**
+
+Alaska, Idaho, Kansas, Louisiana, Mississippi, Missouri, Montana, New Mexico, North Dakota, Texas, Utah, and Wyoming.
+
+### Scoring
+
+Models are scored using MAPE (Mean Absolute Percentage Error):
+
+```
+Score = 1 - MAPE
+```
+
+For example, a model with 8.5% average error scores 0.915.
+
+### Winner Selection
+
+1. **Winner set**: All models scoring within **0.5% (0.005)** of the best score are grouped into a winner set.
+2. **Earliest commit wins**: Within the winner set, the model with the **earliest on-chain commitment** (lowest block number) wins. This means a newcomer must beat the existing leader by more than 0.5% to take the top spot.
+3. **Commitment age**: Models must be committed on-chain **~30 days before evaluation** to be eligible.
+
+### Deregistration and the 30-Day Window
+
+The subnet's immunity period is shorter than the 30-day submission window. This means your hotkey may get deregistered before your model becomes eligible for evaluation. This is expected and by design — the 30-day window ensures models cannot memorize recent listing data.
+
+If your hotkey gets deregistered during the waiting period:
+
+1. **Re-register** your hotkey on the subnet once your commitment is old enough (30+ days)
+2. **Your original commitment stays on-chain** — you do not need to re-submit
+3. Validators will pick up your model at the next evaluation cycle after re-registration
+
+This is a one-time cost per model submission. Once your model is being evaluated and earning emissions, it stays registered.
+
+### Emission Distribution
+
+| Category | Share | Description |
+|----------|-------|-------------|
+| Winner | 99% | Highest-scoring model (or earliest commit within threshold) |
+| Non-winners | 1% | Shared proportionally by score among remaining valid models |
+| Copiers | 0% | Detected duplicates receive nothing |
+
+### Duplicate Detection
+
+Predictions are compared at high precision (1e-6). Models producing near-identical outputs are grouped, and only the **earliest committer (pioneer)** in each group is eligible. All others are flagged as copiers and receive 0% emissions.
+
+## Troubleshooting
+
+### Model file not found
+
+```
+ERROR: Model file not found: nonexistent.onnx
+```
+**Fix:** Check your file path. Use absolute path if needed.
+
+### Invalid ONNX format
+
+```
+ERROR: Invalid ONNX format: Unable to parse proto from file...
+```
+**Fix:** Re-export your model. Test with `onnx.checker.check_model("model.onnx")`.
+
+### Wrong number of features
+
+```
+ERROR: Model input dimension does not match declared feature count
+```
+**Fix:** Your ONNX model's input shape must match the number of features in your `feature_config.json` (or 79 if you don't provide one).
+
+### Model too large
+
+```
+ERROR: Model size 250.00MB exceeds limit of 200MB
+```
+**Fix:** Reduce model size via quantization or pruning.
+
+### NaN/Inf predictions
+
+```
+ERROR: Model produced 5 NaN predictions.
+```
+**Fix:** Check for numerical instability. Ensure training data has no extreme values.
+
+### Hotkey not registered
+
+```
+ERROR: Hotkey 5ABC... is not registered on subnet 46.
+```
+**Fix:** Register your hotkey:
+```bash
+btcli subnets register --wallet.name miner --wallet.hotkey default --netuid 46
+```
+
+### Commitment failed
+
+```
+ERROR: Failed to submit commitment: ...
+```
+**Fix:** Check network connection and wallet funds.
+
+### Extrinsic not found
+
+```
+Warning: Could not find extrinsic in scanned blocks
+```
+**Fix:** Increase `--scan-blocks` or find extrinsic manually on a block explorer.
+
+### HuggingFace repo ID too long
+
+```
+ERROR: HF repo ID too long: 64 bytes exceeds 51 byte limit
+```
+**Fix:** Use a shorter repository name.
+
+## Support
+
+- GitHub Issues: [RESI-models Issues](https://github.com/resi-labs-ai/RESI-models/issues)
+- Discord: [Join the Real Estate subnet channel](https://discord.com/channels/799672011265015819/1397618038894759956)

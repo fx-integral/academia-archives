@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cartha-cli"
+version = "1.0.10"
+description = "CLI utilities for Cartha subnet miners."
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+license = "MIT"
+authors = [{ name = "Cartha Contributors" }]
+keywords = ["cartha", "bittensor", "cli", "mining", "subnet", "0xmarkets"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+  "typer[all]>=0.12",
+  "web3>=6.11,<7",
+  "eth-account>=0.10,<0.11",
+  "requests>=2.32",
+  "python-dotenv>=1.0",
+  "bittensor>=9.12.2,<10",
+  "pydantic>=2.6,<3",
+  "pydantic-settings>=2.6,<3",
+  "torch>=2.2,<3",
+]
+
+[project.urls]
+Homepage = "https://liquidity.0xmarkets.io"
+Repository = "https://github.com/General-Tao-Ventures/cartha-cli"
+Documentation = "https://github.com/General-Tao-Ventures/cartha-cli#readme"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.2"]
+
+[dependency-groups]
+dev = ["pytest>=8.2"]
+
+[project.scripts]
+cartha = "cartha_cli:main"
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+

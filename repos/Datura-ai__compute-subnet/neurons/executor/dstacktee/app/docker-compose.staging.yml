@@ -1,0 +1,16 @@
+
+version: '3.7'
+
+services:
+  lium-watchtower:
+    image: daturaai/lium-watchtower@sha256:82f1c8bb209d2028fb1f416dd006185a8917ab8c650da9a5f7362f157328c150
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./.env:/app/.env
+    environment:
+      - WATCHTOWER_ENABLED=true
+      - WATCHTOWER_IMAGE=daturaai/compute-subnet-executor-runner
+      - WATCHTOWER_INTERVAL=300
+      - WATCHTOWER_ENV_FILE_PATH=${PWD}/.env
+    

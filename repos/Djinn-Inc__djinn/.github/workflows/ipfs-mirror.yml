@@ -1,0 +1,260 @@
+name: IPFS Mirror
+
+# Hybrid deploy per DEV-045: Vercel continues to serve djinn.gg, but every
+# push to main also produces a content-addressed IPFS copy. Pin the bundle
+# to Lighthouse (primary pinner) and Crust (redundant sovereign pinner),
+# then point `_dnslink.djinn.gg` at the resulting CID so the bundle is
+# reachable via any public IPFS gateway.
+#
+# If Vercel terminates us, `docs/runbooks/vercel-break-glass.md` is a
+# 10-minute DNS cutover to the IPFS path — the bundle this workflow
+# pins is what takes over.
+#
+# Secrets required (repo or environment-scoped):
+#   LIGHTHOUSE_API_KEY
+#   CRUST_PRIVATE_KEY          (hex, 0x-prefixed; throwaway wallet fine)
+#   NAMECHEAP_API_USER
+#   NAMECHEAP_API_KEY
+#   NAMECHEAP_USERNAME         (optional; defaults to API_USER)
+#   NAMECHEAP_CLIENT_IP        (IP whitelisted in Namecheap; GH runner
+#                               IPs are dynamic, so set this to a static
+#                               egress proxy or the most recent GH-runner
+#                               IP range you've whitelisted in Namecheap)
+#
+# Optional secrets (ENS contenthash parallel attestation, P1-32):
+#   ENS_PRIVATE_KEY            (hex 0x-prefixed; controls djinn.eth)
+#   L1_RPC_URL                 (Ethereum mainnet RPC; defaults to Cloudflare)
+#
+# Build env passed through (public, safe in bundle):
+#   NEXT_PUBLIC_*              (all contract addresses, chain config, etc.)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      skip_dnslink:
+        description: "Skip DNSLink update (pin only)"
+        required: false
+        default: "false"
+
+concurrency:
+  group: ipfs-mirror-${{ github.ref }}
+  cancel-in-progress: false
+
+# Minimal token scope — this workflow only writes artifacts.
+permissions:
+  contents: read
+
+jobs:
+  pin:
+    name: Pin static bundle to IPFS
+    runs-on: ubuntu-latest
+    # Environment gate: enable "Required reviewers" on this environment
+    # in GitHub → Settings → Environments to require human approval
+    # before any pin / DNSLink update runs. Covers MAINNET P0-10.
+    environment:
+      name: production
+      url: https://djinn.gg
+    timeout-minutes: 20
+    outputs:
+      cid: ${{ steps.lighthouse.outputs.cid }}
+      name: ${{ steps.label.outputs.name }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      # Fast-skip when secrets aren't provisioned yet. Without this, every
+      # push to main (~10-20/day) fails at the Lighthouse pin step and spams
+      # the Actions dashboard with red X's that obscure real regressions.
+      # Secrets land → this check passes → full workflow runs unchanged.
+      # See MAINNET_BLOCKERS P1-02 and task #59 for secret provisioning.
+      - name: Check required secrets
+        id: secrets_check
+        env:
+          LIGHTHOUSE_API_KEY: ${{ secrets.LIGHTHOUSE_API_KEY }}
+          CRUST_PRIVATE_KEY: ${{ secrets.CRUST_PRIVATE_KEY }}
+          NAMECHEAP_API_USER: ${{ secrets.NAMECHEAP_API_USER }}
+          NAMECHEAP_API_KEY: ${{ secrets.NAMECHEAP_API_KEY }}
+        run: |
+          missing=()
+          [ -z "$LIGHTHOUSE_API_KEY" ] && missing+=("LIGHTHOUSE_API_KEY")
+          [ -z "$CRUST_PRIVATE_KEY" ] && missing+=("CRUST_PRIVATE_KEY")
+          [ -z "$NAMECHEAP_API_USER" ] && missing+=("NAMECHEAP_API_USER")
+          [ -z "$NAMECHEAP_API_KEY" ] && missing+=("NAMECHEAP_API_KEY")
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "## IPFS Mirror: Skipped (secrets pending)"
+              echo ""
+              echo "Missing repo secrets: \`${missing[*]}\`"
+              echo ""
+              echo "This workflow publishes the static djinn.gg bundle to IPFS"
+              echo "(Lighthouse + Crust) and updates the \`_dnslink.djinn.gg\` TXT"
+              echo "record. It needs the above secrets to run. Tracking item:"
+              echo "MAINNET_BLOCKERS P1-02 + task #59."
+              echo ""
+              echo "Workflow remains armed — next push after secrets land will"
+              echo "pin and update DNSLink automatically."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning title=IPFS Mirror skipped::missing secrets ${missing[*]}"
+          else
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compute build label
+        if: steps.secrets_check.outputs.ok == 'true'
+        id: label
+        run: |
+          count=$(git rev-list --count HEAD)
+          sha=$(git rev-parse --short=12 HEAD)
+          echo "name=djinn-gg-v${count}-${sha}" >> "$GITHUB_OUTPUT"
+          echo "Label: djinn-gg-v${count}-${sha}"
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        if: steps.secrets_check.outputs.ok == 'true'
+        with:
+          version: 9
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: steps.secrets_check.outputs.ok == 'true'
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Install web deps
+        if: steps.secrets_check.outputs.ok == 'true'
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+
+      - name: Build static IPFS bundle
+        if: steps.secrets_check.outputs.ok == 'true'
+        working-directory: web
+        run: pnpm build:ipfs
+        env:
+          NEXT_PUBLIC_CHAIN_ID: ${{ vars.NEXT_PUBLIC_CHAIN_ID || '84532' }}
+          NEXT_PUBLIC_SIGNAL_COMMITMENT_ADDRESS: ${{ vars.NEXT_PUBLIC_SIGNAL_COMMITMENT_ADDRESS }}
+          NEXT_PUBLIC_ESCROW_ADDRESS: ${{ vars.NEXT_PUBLIC_ESCROW_ADDRESS }}
+          NEXT_PUBLIC_COLLATERAL_ADDRESS: ${{ vars.NEXT_PUBLIC_COLLATERAL_ADDRESS }}
+          NEXT_PUBLIC_ACCOUNT_ADDRESS: ${{ vars.NEXT_PUBLIC_ACCOUNT_ADDRESS }}
+          NEXT_PUBLIC_AUDIT_ADDRESS: ${{ vars.NEXT_PUBLIC_AUDIT_ADDRESS }}
+          NEXT_PUBLIC_CREDIT_LEDGER_ADDRESS: ${{ vars.NEXT_PUBLIC_CREDIT_LEDGER_ADDRESS }}
+          NEXT_PUBLIC_OUTCOME_VOTING_ADDRESS: ${{ vars.NEXT_PUBLIC_OUTCOME_VOTING_ADDRESS }}
+          NEXT_PUBLIC_KEY_RECOVERY_ADDRESS: ${{ vars.NEXT_PUBLIC_KEY_RECOVERY_ADDRESS }}
+          NEXT_PUBLIC_USDC_ADDRESS: ${{ vars.NEXT_PUBLIC_USDC_ADDRESS }}
+          NEXT_PUBLIC_TIMELOCK_ADDRESS: ${{ vars.NEXT_PUBLIC_TIMELOCK_ADDRESS }}
+
+      - name: Verify bundle size + entry point
+        if: steps.secrets_check.outputs.ok == 'true'
+        working-directory: web
+        run: |
+          test -f .next-ipfs/index.html
+          size_bytes=$(du -sb .next-ipfs | cut -f1)
+          size_mb=$((size_bytes / 1024 / 1024))
+          echo "Bundle: ${size_mb} MB"
+          if [ "$size_mb" -gt 100 ]; then
+            echo "::error::Bundle exceeds 100 MB sanity cap"
+            exit 1
+          fi
+
+      - name: Install ethers for Crust signer
+        if: steps.secrets_check.outputs.ok == 'true'
+        run: npm install --no-save ethers@6
+
+      - name: Pin to Lighthouse (primary)
+        if: steps.secrets_check.outputs.ok == 'true'
+        id: lighthouse
+        env:
+          LIGHTHOUSE_API_KEY: ${{ secrets.LIGHTHOUSE_API_KEY }}
+        run: |
+          set -euo pipefail
+          out=$(node scripts/pin-lighthouse.mjs web/.next-ipfs "${{ steps.label.outputs.name }}")
+          echo "$out"
+          cid=$(echo "$out" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{console.log(JSON.parse(s).cid)})')
+          echo "cid=$cid" >> "$GITHUB_OUTPUT"
+          echo "CID: $cid"
+
+      - name: Pin to Crust (redundant)
+        if: steps.secrets_check.outputs.ok == 'true'
+        env:
+          CRUST_PRIVATE_KEY: ${{ secrets.CRUST_PRIVATE_KEY }}
+        run: |
+          node scripts/pin-crust.mjs "${{ steps.lighthouse.outputs.cid }}" "${{ steps.label.outputs.name }}"
+
+      - name: Update DNSLink TXT at Namecheap
+        if: steps.secrets_check.outputs.ok == 'true' && inputs.skip_dnslink != 'true'
+        env:
+          NAMECHEAP_API_USER: ${{ secrets.NAMECHEAP_API_USER }}
+          NAMECHEAP_API_KEY: ${{ secrets.NAMECHEAP_API_KEY }}
+          NAMECHEAP_USERNAME: ${{ secrets.NAMECHEAP_USERNAME }}
+          NAMECHEAP_CLIENT_IP: ${{ secrets.NAMECHEAP_CLIENT_IP }}
+        run: |
+          node scripts/update-dnslink.mjs _dnslink "${{ steps.lighthouse.outputs.cid }}"
+
+      # P1-32: parallel ENS contenthash attestation. Optional — only runs
+      # when ENS_PRIVATE_KEY is provisioned. Until djinn.eth is registered
+      # and a controlling key is set, this step skips silently.
+      - name: Check ENS contenthash secret
+        if: steps.secrets_check.outputs.ok == 'true' && inputs.skip_dnslink != 'true'
+        id: ens_check
+        env:
+          ENS_PRIVATE_KEY: ${{ secrets.ENS_PRIVATE_KEY }}
+        run: |
+          if [ -n "$ENS_PRIVATE_KEY" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=ENS attestation skipped::ENS_PRIVATE_KEY not set; djinn.eth contenthash not updated. Tracking item: MAINNET_BLOCKERS P1-32."
+          fi
+
+      - name: Install ENS encoder
+        if: steps.ens_check.outputs.ok == 'true'
+        run: npm install --no-save @ensdomains/content-hash@2.5.7
+
+      - name: Update ENS contenthash for djinn.eth
+        if: steps.ens_check.outputs.ok == 'true'
+        env:
+          ENS_PRIVATE_KEY: ${{ secrets.ENS_PRIVATE_KEY }}
+          L1_RPC_URL: ${{ secrets.L1_RPC_URL }}
+        run: |
+          node scripts/update-ens-contenthash.mjs djinn.eth "${{ steps.lighthouse.outputs.cid }}"
+
+      - name: Write run manifest
+        if: steps.secrets_check.outputs.ok == 'true'
+        run: |
+          mkdir -p build-manifests
+          cat > "build-manifests/${{ steps.label.outputs.name }}.json" <<EOF
+          {
+            "name": "${{ steps.label.outputs.name }}",
+            "cid": "${{ steps.lighthouse.outputs.cid }}",
+            "commit": "${{ github.sha }}",
+            "ref": "${{ github.ref }}",
+            "actor": "${{ github.actor }}",
+            "run_id": "${{ github.run_id }}",
+            "run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+
+      - name: Upload manifest artifact
+        if: steps.secrets_check.outputs.ok == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ipfs-manifest-${{ steps.label.outputs.name }}
+          path: build-manifests/
+          retention-days: 90
+
+      - name: Summarize
+        if: steps.secrets_check.outputs.ok == 'true'
+        run: |
+          echo "### IPFS Mirror" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Label | ${{ steps.label.outputs.name }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| CID | \`${{ steps.lighthouse.outputs.cid }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Lighthouse | https://gateway.lighthouse.storage/ipfs/${{ steps.lighthouse.outputs.cid }}/ |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| dweb.link | https://dweb.link/ipfs/${{ steps.lighthouse.outputs.cid }}/ |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ipfs.io | https://ipfs.io/ipfs/${{ steps.lighthouse.outputs.cid }}/ |" >> "$GITHUB_STEP_SUMMARY"

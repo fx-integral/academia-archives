@@ -1,0 +1,7 @@
+User-agent: *
+Allow: /
+Disallow: /api/
+Disallow: /genius/signal/
+Disallow: /idiot/signal/
+
+Sitemap: https://djinn.gg/sitemap.xml

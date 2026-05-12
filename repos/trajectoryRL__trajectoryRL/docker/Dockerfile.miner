@@ -1,0 +1,24 @@
+# TrajectoryRL Miner
+#
+# Build:
+#   docker build -f docker/Dockerfile.miner -t trajectoryrl-miner .
+
+FROM python:3.10-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY pyproject.toml requirements.txt ./
+COPY trajectoryrl/ trajectoryrl/
+COPY neurons/ neurons/
+
+RUN pip install --no-cache-dir -e .
+
+RUN mkdir -p /app/packs
+
+ENV PYTHONDONTWRITEBYTECODE=1
+
+CMD ["python", "-u", "neurons/miner.py"]

@@ -1,0 +1,232 @@
+[
+  {
+    "channel_id": "830075335084474390",
+    "channel_category": "[\u30fbWelcome\u30fb]",
+    "channel_name": "\ud83d\udce3\u30fbannouncements"
+  },
+  {
+    "channel_id": "1161764867166961704",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\ud835\udefc\u30fbalpha\u30fb1"
+  },
+  {
+    "channel_id": "1220504695404236800",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u03b2\u30fbbeta\u30fb2"
+  },
+  {
+    "channel_id": "1222226314824777853",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u03b3\u30fbgamma\u30fb3"
+  },
+  {
+    "channel_id": "1161765008347254915",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u2206\u30fbdelta\u30fb4"
+  },
+  {
+    "channel_id": "1214225551364202496",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u03b5\u30fbepsilon\u30fb5"
+  },
+  {
+    "channel_id": "1209554949449457705",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u03b6\u30fbzeta\u30fb6"
+  },
+  {
+    "channel_id": "1215311984799653918",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u03b7\u30fbeta\u30fb7"
+  },
+  {
+    "channel_id": "1162384774170677318",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u03b8\u30fbtheta\u30fb8"
+  },
+  {
+    "channel_id": "1162768567821930597",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u03b9\u30fbiota\u30fb9"
+  },
+  {
+    "channel_id": "1217952256306057298",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u03ba\u30fbkappa\u30fb10"
+  },
+  {
+    "channel_id": "1232378968187867147",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u03bb\u30fblambda\u30fb11"
+  },
+  {
+    "channel_id": "1201941624243109888",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u00b5\u30fbmu\u30fb12"
+  },
+  {
+    "channel_id": "1185617142914236518",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u03bd\u30fbnu\u30fb13"
+  },
+  {
+    "channel_id": "1270733850443513927",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u03be\u30fbxi\u30fb14"
+  },
+  {
+    "channel_id": "1272557411948957697",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u03bf\u30fbomicron\u30fb15"
+  },
+  {
+    "channel_id": "1189234502669697064",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u03c0\u30fbpi\u30fb16"
+  },
+  {
+    "channel_id": "1179081290289528864",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u03c1\u30fbrho\u30fb17"
+  },
+  {
+    "channel_id": "1172669887697653881",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u03c3\u30fbsigma\u30fb18"
+  },
+  {
+    "channel_id": "1186691482749505627",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u03c4\u30fbtau\u30fb19"
+  },
+  {
+    "channel_id": "1194736998250975332",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u03c5\u30fbupsilon\u30fb20"
+  },
+  {
+    "channel_id": "1240801129177157692",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u03c6\u30fbphi\u30fb21"
+  },
+  {
+    "channel_id": "1189589759065067580",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u03c7\u30fbchi\u30fb22"
+  },
+  {
+    "channel_id": "1191833510021955695",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u03c8\u30fbpsi\u30fb23"
+  },
+  {
+    "channel_id": "1214246819886931988",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u03c9\u30fbomega\u30fb24"
+  },
+  {
+    "channel_id": "1234881153832321024",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u05d0\u30fbalef\u30fb25"
+  },
+  {
+    "channel_id": "1178397855053000845",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u05d1\u30fbbet\u30fb26"
+  },
+  {
+    "channel_id": "1174835090539433994",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u05d2\u30fbgimel\u30fb27"
+  },
+  {
+    "channel_id": "1211711222421000273",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u05d3\u30fbdalet\u30fb28"
+  },
+  {
+    "channel_id": "1263866060780605501",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u05d4\u30fbhe\u30fb29"
+  },
+  {
+    "channel_id": "1255568373056671804",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u05d5\u30fbvav\u30fb30"
+  },
+  {
+    "channel_id": "1222990781577433232",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u05d6\u30fbzayin\u30fb31"
+  },
+  {
+    "channel_id": "1215319932062011464",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u05d7\u30fbchet\u30fb32"
+  },
+  {
+    "channel_id": "1233428828479819876",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u05d8\u30fbtet\u30fb33"
+  },
+  {
+    "channel_id": "1247680967225905273",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u05d9\u30fbyod\u30fb34"
+  },
+  {
+    "channel_id": "1204855126045753434",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u05da\u30fbfinal-kaf\u30fb35"
+  },
+  {
+    "channel_id": "1230499299197194260",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u05db\u30fbkaf\u30fb36"
+  },
+  {
+    "channel_id": "1253448873305964626",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u05dc\u30fblamed\u30fb37"
+  },
+  {
+    "channel_id": "1263858989800886302",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u05dd\u30fbfinal-mem\u30fb38"
+  },
+  {
+    "channel_id": "1241046233800507482",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u05de\u30fbmem\u30fb39"
+  },
+  {
+    "channel_id": "1245768323036217408",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u05df\u30fbfinal-nun\u30fb40"
+  },
+  {
+    "channel_id": "1263142301786574889",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u05e0\u30fbnun\u30fb41"
+  },
+  {
+    "channel_id": "1275149537547391058",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u05e1\u30fbsamekh\u30fb42"
+  },
+  {
+    "channel_id": "1263507367405031434",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u05e2\u30fbayin\u30fb43"
+  },
+  {
+    "channel_id": "1271486854830755981",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u05e3\u30fbfinal-pe\u30fb44"
+  },
+  {
+    "channel_id": "1267511824601976935",
+    "channel_category": "[\u30fbSubnets\u30fb]",
+    "channel_name": "\u05e4\u30fbpe\u30fb45"
+  }
+]

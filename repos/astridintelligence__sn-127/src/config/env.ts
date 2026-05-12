@@ -1,0 +1,104 @@
+import dotenv from 'dotenv';
+
+dotenv.config();
+
+const defaultDrandApiBaseUrl = 'https://api.drand.sh';
+const defaultDrandChainHash = '52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971';
+const defaultDrandPublicKey =
+    '83cf0f2896adee7eb8b5f01fcad3912212c437e0073e911fb90022d3e760183c8c4b450b6a0a6c3ac6a5776a2d1064510d1fec758c921cc22b0e17e63aaf4bcb5ed66304de9cf809bd274ca73bab4af5a6e9c76a4bc09e76eae8991ef5ece45a';
+
+const defaultArenaApiUrl = 'https://arena-api.astrid.global';
+
+export interface BittensorWeightTarget {
+    readonly uid: number;
+    readonly weight: number;
+}
+
+export interface BittensorConfig {
+    readonly enabled: boolean;
+    readonly wsEndpoint: string;
+    readonly netuid: number;
+    readonly versionKey: number;
+    readonly weightIntervalMs: number;
+    readonly weightsUrl: string | null;
+}
+
+export interface DrandConfig {
+    readonly apiBaseUrl: string;
+    readonly chainHash: string;
+    readonly publicKey: string;
+}
+
+export interface ValidatorConfig {
+    readonly apiUrl: string;
+    readonly arenaApiUrl: string;
+    readonly redisUrl: string;
+    readonly validatorMnemonic: string;
+    readonly validatorSecretSeed: string;
+    readonly validatorSs58Address: string;
+    readonly validatorSs58Format: number;
+    readonly heartbeatIntervalMs: number;
+    readonly maxConcurrentTasks: number;
+    readonly dockerSocketPath: string;
+    readonly adminPort: number;
+    readonly bittensor: BittensorConfig;
+    readonly displayName: string;
+    readonly iconUrl: string;
+
+    readonly drandConfig: DrandConfig;
+
+    readonly logLevel: string;
+    readonly isProduction: boolean;
+}
+
+const int = (value: string | undefined, fallback: number): number => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+const bool = (value: string | undefined, fallback: boolean): boolean => {
+    if (value === undefined) {
+        return fallback;
+    }
+    const normalized = value.trim().toLowerCase();
+    return ['1', 'true', 'yes', 'on'].includes(normalized);
+};
+
+const configuredApiUrl = process.env.API_URL ?? 'https://api.astrid.global/v1';
+const configuredWeightsUrl = `${configuredApiUrl}/bittensor/weights`;
+const configuredEndpoint = process.env.BITTENSOR_WS_ENDPOINT ?? 'wss://entrypoint-finney.opentensor.ai:443';
+
+const config: ValidatorConfig = {
+    apiUrl: configuredApiUrl,
+    arenaApiUrl: process.env.ARENA_API_URL ?? defaultArenaApiUrl,
+    redisUrl: process.env.REDIS_URL ?? 'redis://localhost:6379',
+    validatorMnemonic: process.env.VALIDATOR_MNEMONIC ?? '',
+    validatorSecretSeed: process.env.VALIDATOR_SECRET_SEED ?? '',
+    validatorSs58Address: process.env.VALIDATOR_SS58_ADDRESS ?? '',
+    validatorSs58Format: int(process.env.VALIDATOR_SS58_FORMAT, 42),
+    heartbeatIntervalMs: int(process.env.HEARTBEAT_INTERVAL_MS, 15000),
+    maxConcurrentTasks: int(process.env.MAX_CONCURRENT_TASKS, 2),
+    dockerSocketPath: process.env.DOCKER_SOCKET ?? '/var/run/docker.sock',
+    adminPort: int(process.env.PORT, 5000),
+    bittensor: {
+        enabled: bool(process.env.BITTENSOR_ENABLED, true),
+        wsEndpoint: configuredEndpoint,
+        netuid: int(process.env.BITTENSOR_NETUID, 1),
+        versionKey: Number(process.env.BITTENSOR_VERSION_KEY ?? 0),
+        weightIntervalMs: int(process.env.BITTENSOR_WEIGHT_INTERVAL_MS, 60000),
+        weightsUrl: configuredWeightsUrl.length > 0 ? configuredWeightsUrl : null
+    },
+    displayName: process.env.VALIDATOR_DISPLAY_NAME ?? 'Unset',
+    iconUrl: process.env.VALIDATOR_ICON_URL ?? '',
+
+    drandConfig: {
+        apiBaseUrl: process.env.DRAND_API_BASE_URL ?? defaultDrandApiBaseUrl,
+        chainHash: process.env.DRAND_CHAIN_HASH ?? defaultDrandChainHash,
+        publicKey: process.env.DRAND_PUBLIC_KEY ?? defaultDrandPublicKey
+    },
+
+    logLevel: process.env.LOG_LEVEL ?? 'info',
+    isProduction: process.env.NODE_ENV === 'production'
+};
+
+export default config;

@@ -1,0 +1,146 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "verathos"
+version = "0.1.0"
+description = "Zero-Knowledge Verified LLM Inference and Training"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Fabian Mueller"}
+]
+keywords = [
+    "zero-knowledge",
+    "zkp",
+    "llm",
+    "inference-verification",
+    "verifiable-training",
+    "sumcheck",
+    "verified-llm",
+]
+
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.24",
+    "blake3>=0.3",
+    # zkllm is installed from the local dist/ wheel (not on PyPI).
+    # Run: pip install dist/zkllm-*.whl (setup_miner.sh does this automatically)
+]
+
+[project.optional-dependencies]
+inference = [
+    "transformers>=4.30",
+    "accelerate>=0.20",
+    "safetensors>=0.3",
+]
+training = [
+    "transformers>=4.30",
+    "accelerate>=0.20",
+    "safetensors>=0.3",
+    "peft>=0.5",
+    "datasets>=2.14",
+    "optimum>=1.24.0",
+    "streamlit>=1.30",
+    "altair>=5.0",
+]
+quantization = [
+    "bitsandbytes>=0.42",
+    "gptqmodel>=0.9",
+]
+hashing = [
+    # blake3 is now a core dependency — this extra is kept for backwards
+    # compatibility with existing install commands that reference it.
+]
+vllm = [
+    # Pin >=0.19 — vLLM 0.18.x has a GDN/FLA crash on Qwen3 GDN models
+    # (vllm#37749), fixed in 0.19 (vllm#37448).  Required for Qwen3.6 /
+    # Gemma 4 support.  See setup_miner.sh for the known sm_89 + AWQ
+    # CUDA-graph capture issue and recovery path.
+    "vllm>=0.19,<0.20",
+    "bitsandbytes>=0.42",
+    "streamlit>=1.30",
+    "ninja>=1.11",  # Required by FlashInfer for JIT kernel compilation
+    # Pin `kernels` below 0.13 — kernels 0.13.0 (released 2026-04-11)
+    # ships a `str | None` annotation in `PythonPackage.import_name`
+    # that breaks huggingface_hub 0.36.2's strict dataclass validator
+    # at import time, crashing every fresh vllm install.  0.12.3 is the
+    # last known-good version.
+    "kernels>=0.12,<0.13",
+]
+api = [
+    "fastapi>=0.100",
+    "uvicorn[standard]>=0.20",
+    "httpx>=0.24",
+]
+chain = [
+    "web3>=6.0",
+    "eth-account>=0.9",
+]
+tee = [
+    "pynacl>=1.5",
+]
+tee-gpu = [
+    "pynacl>=1.5",
+    "nv-attestation-sdk>=1.0",
+]
+x402 = [
+    "x402[fastapi,evm]>=2.2",
+]
+postgres = [
+    "psycopg[binary]>=3.1",
+    "psycopg_pool>=3.1",
+]
+neurons = [
+    "verathos[api,chain,tee]",
+    "bittensor>=10.2,<10.3",  # pin minor — bump after testing new releases
+    "async-substrate-interface<2",  # ASI 2.0 breaks bittensor 10.2.x (ScaleObj removed)
+    "substrate-interface>=1.7",
+    "transformers>=4.30",
+    "safetensors>=0.3",
+    "bcrypt>=4.0",
+]
+neurons-pg = [
+    "verathos[neurons,postgres]",
+]
+all = [
+    "verathos[inference,training,quantization,hashing,api]",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.23",
+    "pytest-benchmark>=4.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0",
+]
+
+[project.scripts]
+verathos = "neurons.cli:main"
+
+[project.entry-points."vllm.general_plugins"]
+verathos = "verallm.vllm_plugin:register_verathos_plugin"
+
+[tool.setuptools.packages.find]
+include = ["verallm*", "trainllm*", "neurons*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_ignores = true

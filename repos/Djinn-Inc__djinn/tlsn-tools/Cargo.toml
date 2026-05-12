@@ -1,0 +1,42 @@
+[package]
+name = "djinn-tlsn-tools"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "TLSNotary prover and verifier CLI tools for Djinn Protocol"
+
+[[bin]]
+name = "djinn-tlsn-prover"
+path = "src/bin/prover.rs"
+
+[[bin]]
+name = "djinn-tlsn-verifier"
+path = "src/bin/verifier.rs"
+
+[[bin]]
+name = "djinn-tlsn-notary"
+path = "src/bin/notary.rs"
+
+[dependencies]
+tlsn = { git = "https://github.com/tlsnotary/tlsn.git", tag = "v0.1.0-alpha.14" }
+tlsn-formats = { git = "https://github.com/tlsnotary/tlsn.git", tag = "v0.1.0-alpha.14" }
+
+anyhow = "1"
+pem = "3"
+bincode = "1"
+chrono = "0.4"
+clap = { version = "4.5", features = ["derive"] }
+futures = "0.3"
+hex = "0.4"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["full"] }
+k256 = { version = "0.13", features = ["ecdsa"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-std", "fs"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+webpki-root-certs = "1"

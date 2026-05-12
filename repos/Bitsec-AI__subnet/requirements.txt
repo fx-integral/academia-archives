@@ -1,0 +1,11 @@
+bittensor==9.9.0
+dotenv==0.9.9
+flaky>=3.8.1
+numpy>=1
+openai>=1.47
+pydantic>=2
+rich>=13
+setuptools>=68
+starlette>=0.30.0
+tenacity>=9
+wandb>=0.19.6

@@ -1,0 +1,59 @@
+[workspace]
+members = [
+    "crates/sn2-types",
+    "crates/sn2-frame-codec",
+    "crates/sn2-chain",
+    "crates/sn2-verify",
+    "crates/sn2-circuit-store",
+    "crates/sn2-validator",
+    "crates/sn2-miner",
+]
+exclude = ["fuzz"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82.0"
+license = "MIT"
+repository = "https://github.com/inference-labs-inc/subnet-2"
+
+[workspace.dependencies]
+sn2-types = { path = "crates/sn2-types" }
+sn2-frame-codec = { path = "crates/sn2-frame-codec" }
+sn2-chain = { path = "crates/sn2-chain" }
+sn2-verify = { path = "crates/sn2-verify" }
+sn2-circuit-store = { path = "crates/sn2-circuit-store" }
+
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", features = ["rustls-tls", "json", "stream"], default-features = false }
+axum = "0.7"
+rmp-serde = "1"
+hex = "0.4"
+sp-core = "34"
+bittensor_wallet = { version = "4.0.1", package = "btwallet", default-features = false }
+subxt = "0.50"
+btlightning = { version = "0.2.9", features = ["btwallet", "subtensor"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+metrics = "0.23"
+metrics-exporter-prometheus = "0.15"
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+sha2 = "0.10"
+semver = "1"
+rand = "0.9"
+dirs-next = "2"
+futures-util = "0.3"
+shellexpand = "3.1.2"
+openssl = { version = "0.10", features = ["vendored"] }
+flate2 = "1"
+dsperse = { git = "https://github.com/inference-labs-inc/dsperse", rev = "6af459e8" }
+ndarray = { version = "0.17", features = ["serde"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+bittensor-drand = { git = "https://github.com/inference-labs-inc/bittensor-drand.git", rev = "e55ed98", default-features = false }

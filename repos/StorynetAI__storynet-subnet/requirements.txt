@@ -1,0 +1,47 @@
+# StoryNet Bittensor Subnet Requirements
+# ======================================
+
+# Core Bittensor SDK
+# IMPORTANT: Version 9.0.0+ required for commit-reveal weights support (Feb 2025)
+bittensor>=9.0.0
+
+# Data validation and parsing
+pydantic>=2.0.0
+
+# Async support
+asyncio-mqtt>=0.16.0
+aiohttp>=3.9.0
+
+# AI API clients
+openai>=1.10.0
+google-generativeai>=0.3.0  # For Gemini API support
+
+# Local GPU model support (optional, for recommended local generation)
+transformers>=4.35.0
+accelerate>=0.25.0
+bitsandbytes>=0.41.0  # For 4bit/8bit quantization
+torch>=2.1.0  # Install with CUDA: pip install torch --index-url https://download.pytorch.org/whl/cu118
+# flash-attn>=2.3.0  # Optional, for faster inference (uncomment if GPU supports it)
+
+# Embedding models (optional, for local embeddings)
+sentence-transformers>=2.2.0
+
+# Data processing
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Utilities
+python-dotenv>=1.0.0
+pyyaml>=6.0
+
+# Logging and monitoring
+loguru>=0.7.0
+
+# Testing
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+
+# Development
+black>=23.0.0
+flake8>=6.0.0
+mypy>=1.5.0

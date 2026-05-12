@@ -1,0 +1,24 @@
+# CODEOWNERS — reviewers required for protected paths.
+#
+# Primary goal (MAINNET_BLOCKERS P0-10): any change to the deploy pipeline
+# or contract code must be reviewed by a maintainer before merging. The
+# `require_code_owner_review` branch protection rule on `main` reads this
+# file to enforce that.
+
+# Deploy / release trust root: ipfs-mirror workflow, pin scripts, CI.
+/.github/workflows/           @pmaymin
+/.github/dependabot.yml       @pmaymin
+/scripts/pin-*.mjs            @pmaymin
+/scripts/update-dnslink.mjs   @pmaymin
+/docs/runbooks/               @pmaymin
+
+# Protocol trust root: Solidity contracts + deployment scripts.
+/contracts/                   @pmaymin
+/scripts/deploy_*             @pmaymin
+/scripts/execute-*            @pmaymin
+
+# Canonical design documents.
+/docs/whitepaper.md           @pmaymin
+/DEVIATIONS.md                @pmaymin
+/MAINNET_BLOCKERS.md          @pmaymin
+/CLAUDE.md                    @pmaymin

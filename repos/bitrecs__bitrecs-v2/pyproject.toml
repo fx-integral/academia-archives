@@ -1,0 +1,48 @@
+[project]
+name = "Bitrecs_V2"
+version = "2.0"
+description = "Bitrecs V2 - Prompt Evolution Subnet"
+readme = "README.md"
+requires-python = ">=3.13, <3.14"
+dependencies = [
+    "bittensor==10.2.0",
+    "bittensor-cli==9.20.0",
+    "bittensor-wallet==4.0.1",    
+    "cryptography>=46.0.6",
+    "async-substrate-interface==1.6.3",
+    "affinetes>=0.2.0",
+    "python-dotenv>=1.2.2",
+    "fastapi>=0.135.3",
+    "slowapi>=0.1.9",
+    "httpx>=0.28.1",
+    "openai>=2.30.0",
+    "tiktoken>=0.12.0",
+    "uvicorn>=0.42.0",
+    "pytest>=8.4.2",
+    "pytest-asyncio>=1.2.0",
+    "numpy>=2.4.3",
+    "psycopg[binary]>=3.2.12",
+    "asyncpg>=0.31.0",
+    "jinja2>=3.1.6",
+    "aioboto3>=15.5.0",
+    "python-multipart>=0.0.22",
+    "rich>=14.3.3",
+    "click>=8.3.1",
+    "pandas>=3.0.1",
+    "psutil>=7.2.2",
+    "docker>=7.1.0",
+    "aiocache>=0.12.3",
+    "cachetools>=7.0.5",
+]
+
+[tool.uv]
+override-dependencies = [
+    "aiohttp>=3.13.5",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = [
+  "."
+]
+testpaths = ["tests"]

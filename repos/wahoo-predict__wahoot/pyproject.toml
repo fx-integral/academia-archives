@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wahoo"
+version = "0.1.0"
+description = "WAHOO Predict Bittensor Validator"
+authors = [
+    {name = "WAHOO Team"}
+]
+readme = "README.md"
+requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+# Runtime dependencies only (excludes dev dependencies)
+dependencies = [
+    "bittensor>=7.0.0",
+    "bittensor-cli>=9.15.0",
+    "httpx>=0.25.0",
+    "torch>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "alembic>=1.13.0",
+    "sqlalchemy>=2.0.0",
+    "pandas>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "black>=23.0.0",
+    "flake8>=7.0.0",
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+]
+
+[project.scripts]
+wahoo-validator-init = "wahoo.validator.init:main"
+wahoo-validator = "wahoo.entrypoints.validator:main"
+wahoo-db-query = "wahoo.entrypoints.db_query:main"
+
+[tool.setuptools]
+packages = ["wahoo"]
+
+[tool.black]
+line-length = 88
+target-version = ['py310', 'py311', 'py312']
+
+

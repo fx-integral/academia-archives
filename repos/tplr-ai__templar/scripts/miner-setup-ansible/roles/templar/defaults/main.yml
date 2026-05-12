@@ -1,0 +1,69 @@
+---
+env_vars:
+  WANDB_API_KEY: ""
+  INFLUXDB_TOKEN: ""  # Optional, falls back to default if not provided
+  R2_ACCOUNT_ID: ""
+  R2_GRADIENTS_ACCOUNT_ID: ""
+  R2_GRADIENTS_BUCKET_NAME: ""
+  R2_READ_ACCESS_KEY_ID: ""
+  R2_READ_SECRET_ACCESS_KEY: ""
+  R2_GRADIENTS_READ_ACCESS_KEY_ID: ""
+  R2_GRADIENTS_READ_SECRET_ACCESS_KEY: ""
+  R2_WRITE_ACCESS_KEY_ID: ""
+  R2_WRITE_SECRET_ACCESS_KEY: ""
+  R2_GRADIENTS_WRITE_ACCESS_KEY_ID: ""
+  R2_GRADIENTS_WRITE_SECRET_ACCESS_KEY: ""
+  R2_DATASET_WRITE_ACCESS_KEY_ID: ""
+  R2_DATASET_WRITE_SECRET_ACCESS_KEY: ""
+  R2_DATASET_ACCOUNT_ID: ""
+  R2_DATASET_BUCKET_NAME: ""
+  R2_DATASET_READ_ACCESS_KEY_ID: ""
+  R2_DATASET_READ_SECRET_ACCESS_KEY: ""
+  R2_AGGREGATOR_ACCOUNT_ID: "8af7f92a8a0661cf7f1ac0420c932980"
+  R2_AGGREGATOR_BUCKET_NAME: "aggregator"
+  R2_AGGREGATOR_READ_ACCESS_KEY_ID: "bb4b9f02a64dacead181786b8f353b67"
+  R2_AGGREGATOR_READ_SECRET_ACCESS_KEY: "f50761d0fbb0773c55f61debdf87439735c32c096fe4b1ab6aa6bfb7f52aa30b"
+ 
+  WALLET_NAME: ""
+  NETWORK: "finney"
+  NETUID: "3"
+  DEBUG: "false"
+  GITHUB_USER: ""
+  # CUDA_DEVICE: ""
+  # WALLET_HOTKEY: ""
+
+# Whether to use Systemd or not
+use_systemd: false
+
+# Miner cli parameters
+actual_batch_size: 5
+netuid: "3"
+subtensor_network: "finney"
+wallet_name: ""
+
+# device: "cuda"
+# wallet_hotkey: ""
+cuda_devices: ["cuda:0"]
+wallet_hotkeys: ["miner_0"]
+
+apt_packages:
+  - less
+  - vim
+  - nvtop
+  - htop
+  - rsync
+  - git
+  - python3-pip
+  - python3-venv
+  - zsh
+
+additional_apt_packages: []
+
+# Global pip packages to install (via pip3)
+essential_pip_packages:
+  - uv
+
+additional_pip_packages: []
+
+# Pip packages to install in .venv with `uv pip`.
+additional_uv_pip_packages: []

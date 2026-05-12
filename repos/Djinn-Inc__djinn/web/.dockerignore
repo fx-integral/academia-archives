@@ -1,0 +1,11 @@
+node_modules/
+.next/
+.env
+.env.*
+.git/
+.gitignore
+*.md
+coverage/
+.turbo/
+tsconfig.tsbuildinfo
+lib/__tests__/

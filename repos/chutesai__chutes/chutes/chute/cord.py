@@ -1,0 +1,947 @@
+import os
+import re
+import uuid
+import gzip
+import time
+import pickle
+import base64
+import inspect
+import functools
+import aiohttp
+import asyncio
+import backoff
+import orjson as json
+from concurrent.futures import ThreadPoolExecutor
+from pydantic import BaseModel, ValidationError
+from typing import Optional, Dict, Any
+from fastapi import Request, HTTPException, status
+from loguru import logger
+from contextlib import asynccontextmanager
+from starlette.responses import StreamingResponse
+from chutes.exception import InvalidPath, DuplicatePath, StillProvisioning
+from chutes.util.context import is_local
+from chutes.util.auth import sign_request
+from chutes.util.schema import SchemaExtractor
+from chutes.config import get_config
+from chutes.constants import CHUTEID_HEADER, FUNCTION_HEADER
+from chutes.chute.base import Chute
+import chutes.metrics as metrics
+
+# Simple regex to check for custom path overrides.
+PATH_RE = re.compile(r"^(/[a-z0-9_]+[a-z0-9-_]*)+$")
+
+# Dedicated thread pool for running ALL user code (sync or async) so that
+# long-running or blocking work never starves the main asyncio event loop.
+# This keeps health-check / ping endpoints responsive even when user code
+# blocks for minutes — including "async def" functions that never actually
+# await anything (a common pattern in ML inference code).
+#
+# Initialized lazily via init_user_code_executor() once the chute's
+# concurrency value is known.
+_user_code_executor: ThreadPoolExecutor | None = None
+
+
+def init_user_code_executor(concurrency: int):
+    """Create the user-code thread pool sized to the chute's concurrency."""
+    global _user_code_executor
+    max_workers = max(4, concurrency + 1)
+    _user_code_executor = ThreadPoolExecutor(
+        max_workers=max_workers,
+        thread_name_prefix="chute-user",
+    )
+    logger.info(f"Initialized user-code thread pool with {max_workers} workers")
+
+
+def _is_async(func) -> bool:
+    """Return True when *func* is a coroutine function or async generator."""
+    return inspect.iscoroutinefunction(func) or inspect.isasyncgenfunction(func)
+
+
+class _CancelHandle:
+    """Allow the main event loop to cancel a user coroutine running in a worker thread.
+
+    The handle is populated by ``_run_user_coro`` once the inner event loop and
+    task are available.  Calling :meth:`cancel` from *any* thread injects a
+    ``CancelledError`` into the coroutine at its next ``await`` point (e.g.
+    an aiohttp download).  Blocking C/CUDA calls will finish their current
+    invocation before the cancellation takes effect — that is an inherent
+    limitation of Python threads.
+    """
+
+    __slots__ = ("_inner_loop", "_inner_task")
+
+    def __init__(self):
+        self._inner_loop: asyncio.AbstractEventLoop | None = None
+        self._inner_task: asyncio.Task | None = None
+
+    def cancel(self):
+        loop = self._inner_loop
+        task = self._inner_task
+        if loop is not None and task is not None:
+            try:
+                loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                pass  # loop already closed
+
+
+def _run_user_coro(coro, cancel_handle=None):
+    """Run an async user coroutine in a *new* event loop on the current (worker) thread.
+
+    This is called from within the thread pool so the main event loop is never
+    touched.  A fresh loop is created and destroyed per call — cheap relative to
+    the minutes-long inference workloads this is designed for.
+
+    If *cancel_handle* is provided it is populated with references to the inner
+    loop and task so the caller can cancel the coroutine from the main thread.
+    """
+    loop = asyncio.new_event_loop()
+    if cancel_handle is not None:
+        cancel_handle._inner_loop = loop
+    try:
+        if cancel_handle is not None:
+
+            async def _wrapper():
+                cancel_handle._inner_task = asyncio.current_task()
+                return await coro
+
+            return loop.run_until_complete(_wrapper())
+        return loop.run_until_complete(coro)
+    finally:
+        try:
+            # Properly clean up async generators and pending tasks (e.g.
+            # aiohttp connector cleanup callbacks) before closing the loop.
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        except Exception:
+            pass
+        loop.close()
+
+
+def _resolve_schema(schema, minimal: bool = False):
+    """Convert a schema argument to a JSON-serializable dict.
+
+    If *schema* is a Pydantic BaseModel class it is converted via
+    ``SchemaExtractor.get_minimal_schema`` (when *minimal* is True) or
+    ``model_json_schema``.  Plain dicts are passed through as-is.
+    """
+    if schema is None:
+        return None
+    if inspect.isclass(schema) and issubclass(schema, BaseModel):
+        if minimal:
+            return SchemaExtractor.get_minimal_schema(schema)
+        return schema.model_json_schema()
+    if isinstance(schema, dict):
+        return schema
+    raise TypeError(
+        f"Schema must be a Pydantic BaseModel class or a dict, got {type(schema).__name__}"
+    )
+
+
+class Cord:
+    def __init__(
+        self,
+        app: Chute,
+        stream: bool = False,
+        path: str = None,
+        passthrough_path: str = None,
+        passthrough: bool = False,
+        passthrough_port: int = None,
+        public_api_path: str = None,
+        public_api_method: str = "POST",
+        method: str = "POST",
+        provision_timeout: int = 180,
+        input_schema: Optional[Any] = None,
+        minimal_input_schema: Optional[Any] = None,
+        output_content_type: Optional[str] = None,
+        output_schema: Optional[Dict] = None,
+        sglang_passthrough: bool = False,
+        **session_kwargs,
+    ):
+        """
+        Constructor.
+        """
+        self._app = app
+        self._path = None
+        if path:
+            self.path = path
+        self._passthrough_path = None
+        if passthrough_path:
+            self.passthrough_path = passthrough_path
+        self._public_api_path = None
+        if public_api_path:
+            self.public_api_path = public_api_path
+        self._public_api_method = public_api_method
+        self._passthrough_port = passthrough_port
+        self._stream = stream
+        self._passthrough = passthrough
+        self._method = method
+        self._session_kwargs = session_kwargs
+        self._provision_timeout = provision_timeout
+        self._config = None
+        self._sglang_passthrough = sglang_passthrough
+        self.input_models = (
+            [input_schema]
+            if input_schema
+            and inspect.isclass(input_schema)
+            and issubclass(input_schema, BaseModel)
+            else None
+        )
+        self.input_schema = _resolve_schema(input_schema, minimal=True)
+        self.minimal_input_schema = _resolve_schema(minimal_input_schema, minimal=True)
+        self.output_content_type = output_content_type
+        self.output_schema = _resolve_schema(output_schema)
+
+    @property
+    def path(self):
+        """
+        URL path getter.
+        """
+        return self._path
+
+    @property
+    def config(self):
+        """
+        Lazy config getter.
+        """
+        if self._config:
+            return self._config
+        self._config = get_config()
+        return self._config
+
+    @path.setter
+    def path(self, path: str):
+        """
+        URL path setter with some basic validation.
+
+        :param path: The path to use for the new endpoint.
+        :type path: str
+
+        """
+        path = "/" + path.lstrip("/").rstrip("/")
+        if "//" in path or not PATH_RE.match(path):
+            raise InvalidPath(path)
+        if any([cord.path == path for cord in self._app.cords]):
+            raise DuplicatePath(path)
+        self._path = path
+
+    @property
+    def passthrough_path(self):
+        """
+        Passthrough/upstream URL path getter.
+        """
+        return self._passthrough_path
+
+    @passthrough_path.setter
+    def passthrough_path(self, path: str):
+        """
+        Passthrough/usptream path setter with some basic validation.
+
+        :param path: The path to use for the upstream endpoint.
+        :type path: str
+
+        """
+        path = "/" + path.lstrip("/").rstrip("/")
+        if "//" in path or not PATH_RE.match(path):
+            raise InvalidPath(path)
+        self._passthrough_path = path
+
+    @property
+    def public_api_path(self):
+        """
+        API path when using the hostname based invocation API calls.
+        """
+        return self._public_api_path
+
+    @public_api_path.setter
+    def public_api_path(self, path: str):
+        """
+        API path setter with basic validation.
+
+        :param path: The path to use for the upstream endpoint.
+        :type path: str
+
+        """
+        path = "/" + path.lstrip("/").rstrip("/")
+        if "//" in path or not PATH_RE.match(path):
+            raise InvalidPath(path)
+        self._public_api_path = path
+
+    def _is_sglang_passthrough(self) -> bool:
+        return self._passthrough and self._sglang_passthrough
+
+    @asynccontextmanager
+    async def _local_call_base(self, *args, **kwargs):
+        """
+        Invoke the function from within the local/client side context, meaning
+        we're actually just calling the chutes API.
+        """
+        logger.debug(f"Invoking remote function {self._func.__name__} via HTTP...")
+
+        @backoff.on_exception(
+            backoff.constant,
+            (StillProvisioning,),
+            jitter=None,
+            interval=1,
+            max_time=self._provision_timeout,
+        )
+        @asynccontextmanager
+        async def _call():
+            request_payload = {
+                "args": base64.b64encode(gzip.compress(pickle.dumps(args))).decode(),
+                "kwargs": base64.b64encode(gzip.compress(pickle.dumps(kwargs))).decode(),
+            }
+            dev_url = os.getenv("CHUTES_DEV_URL")
+            headers, payload_string = {}, None
+            if dev_url:
+                payload_string = json.dumps(request_payload)
+            else:
+                headers, payload_string = sign_request(payload=request_payload)
+            headers.update(
+                {
+                    CHUTEID_HEADER: self._app.uid,
+                    FUNCTION_HEADER: self._func.__name__,
+                }
+            )
+            base_url = dev_url or self.config.generic.api_base_url
+            path = f"/chutes/{self._app.uid}{self.path}" if not dev_url else self.path
+            async with aiohttp.ClientSession(base_url=base_url, **self._session_kwargs) as session:
+                async with session.post(
+                    path,
+                    data=payload_string,
+                    headers=headers,
+                ) as response:
+                    if response.status == 503:
+                        logger.warning(f"Function {self._func.__name__} is still provisioning...")
+                        raise StillProvisioning(await response.text())
+                    elif response.status != 200:
+                        logger.error(
+                            f"Error invoking {self._func.__name__} [status={response.status}]"
+                        )
+                        raise Exception(
+                            f"Error invoking {self._func.__name__} [status={response.status}]"
+                        )
+                    yield response
+
+        started_at = time.time()
+        async with _call() as response:
+            yield response
+        logger.debug(
+            f"Completed remote invocation [{self._func.__name__} passthrough={self._passthrough}] in {time.time() - started_at} seconds"
+        )
+
+    async def _local_call(self, *args, **kwargs):
+        """
+        Call the function from the local context, i.e. make an API request.
+        """
+        if os.getenv("CHUTES_DEV_URL"):
+            async with self._local_call_base(*args, **kwargs) as response:
+                return await response.read()
+        result = None
+        async for item in self._local_stream_call(*args, **kwargs):
+            result = item
+        return result
+
+    async def _local_stream_call(self, *args, **kwargs):
+        """
+        Call the function from the local context, i.e. make an API request, but
+        instead of just returning the response JSON, we're using a streaming
+        response.
+        """
+        async with self._local_call_base(*args, **kwargs) as response:
+            async for encoded_content in response.content:
+                if (
+                    not encoded_content
+                    or not encoded_content.strip()
+                    or not encoded_content.startswith(b"data: {")
+                ):
+                    continue
+                content = encoded_content.decode()
+                data = json.loads(content[6:])
+                if data.get("trace"):
+                    message = "".join(
+                        [
+                            data["trace"]["timestamp"],
+                            " ["
+                            + " ".join(
+                                [
+                                    f"{key}={value}"
+                                    for key, value in data["trace"].items()
+                                    if key not in ("timestamp", "message")
+                                ]
+                            ),
+                            f"]: {data['trace']['message']}",
+                        ]
+                    )
+                    logger.debug(message)
+                elif data.get("error"):
+                    logger.error(f"Error in streaming response for {self._func.__name__}")
+                    raise Exception(data["error"])
+                elif data.get("result"):
+                    if self._passthrough:
+                        yield await self._func(data["result"])
+                    else:
+                        yield data["result"]
+
+    @asynccontextmanager
+    async def _passthrough_call(self, request: Request, **kwargs):
+        """
+        Call a passthrough endpoint.
+        """
+        logger.debug(
+            f"Received passthrough call, passing along to {self.passthrough_path} via {self._method}"
+        )
+        headers = kwargs.pop("headers", {}) or {}
+        if self._app.passthrough_headers:
+            headers.update(self._app.passthrough_headers)
+        kwargs["headers"] = headers
+
+        # Set (if needed) timeout.
+        timeout = None
+        if self._is_sglang_passthrough():
+            timeout = aiohttp.ClientTimeout(connect=30.0, total=None)
+        else:
+            total_timeout = kwargs.pop("timeout", 1800)
+            timeout = aiohttp.ClientTimeout(connect=5.0, total=total_timeout)
+
+        ssl_ctx = getattr(self._app, "passthrough_ssl_context", None)
+        scheme = "https" if ssl_ctx else "http"
+        connector = aiohttp.TCPConnector(ssl=ssl_ctx) if ssl_ctx else None
+        async with aiohttp.ClientSession(
+            timeout=timeout,
+            read_bufsize=8 * 1024 * 1024,
+            connector=connector,
+            base_url=f"{scheme}://127.0.0.1:{self._passthrough_port or 8000}",
+        ) as session:
+            async with getattr(session, self._method.lower())(
+                self.passthrough_path, **kwargs
+            ) as response:
+                yield response
+
+    async def _run_in_thread(self, *args, _cancel_handle=None, **kwargs):
+        """Run user function (sync *or* async) in the dedicated thread pool.
+
+        Sync functions are called directly in the worker thread.  Async
+        functions get a fresh event loop in the worker thread so even a
+        badly-written ``async def`` that blocks for minutes cannot starve
+        the main loop.
+
+        If *_cancel_handle* is supplied (async path only) it is threaded
+        through to ``_run_user_coro`` so the caller can cancel the inner
+        coroutine from the main event loop.
+        """
+        loop = asyncio.get_running_loop()
+        if _is_async(self._func):
+            return await loop.run_in_executor(
+                _user_code_executor,
+                functools.partial(
+                    _run_user_coro,
+                    self._func(self._app, *args, **kwargs),
+                    _cancel_handle,
+                ),
+            )
+        return await loop.run_in_executor(
+            _user_code_executor,
+            functools.partial(self._func, self._app, *args, **kwargs),
+        )
+
+    async def _iter_generator_in_thread(self, *args, **kwargs):
+        """
+        Bridge a user generator (sync *or* async) to an async generator by
+        running it in a dedicated thread.  Items are passed back to the main
+        event loop via an asyncio.Queue so health-check endpoints stay
+        responsive between yields.
+        """
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue(maxsize=64)
+        _SENTINEL = object()
+
+        def _produce_sync():
+            try:
+                for item in self._func(self._app, *args, **kwargs):
+                    asyncio.run_coroutine_threadsafe(queue.put(item), loop).result()
+            except Exception as exc:
+                asyncio.run_coroutine_threadsafe(queue.put(exc), loop).result()
+            finally:
+                asyncio.run_coroutine_threadsafe(queue.put(_SENTINEL), loop).result()
+
+        def _produce_async():
+            inner_loop = asyncio.new_event_loop()
+            try:
+                agen = self._func(self._app, *args, **kwargs)
+
+                async def _drain():
+                    try:
+                        async for item in agen:
+                            asyncio.run_coroutine_threadsafe(queue.put(item), loop).result()
+                    except Exception as exc:
+                        asyncio.run_coroutine_threadsafe(queue.put(exc), loop).result()
+                    finally:
+                        asyncio.run_coroutine_threadsafe(queue.put(_SENTINEL), loop).result()
+
+                inner_loop.run_until_complete(_drain())
+            finally:
+                inner_loop.close()
+
+        if inspect.isasyncgenfunction(self._func):
+            producer = _produce_async
+        else:
+            producer = _produce_sync
+
+        loop.run_in_executor(_user_code_executor, producer)
+
+        while True:
+            item = await queue.get()
+            if item is _SENTINEL:
+                break
+            if isinstance(item, Exception):
+                raise item
+            yield item
+
+    async def _remote_call(self, request: Request, *args, **kwargs):
+        """
+        Function call from within the remote context, that is, the code that actually
+        runs on the miner's deployment.
+        """
+        logger.info(
+            f"Received invocation request [{self._func.__name__} passthrough={self._passthrough}]"
+        )
+        started_at = time.time()
+        status = 200
+        metrics.last_request_timestamp.labels(
+            chute_id=self._app.uid,
+            function=self._func.__name__,
+        ).set_to_current_time()
+        encrypt = getattr(request.state, "_encrypt", None)
+
+        try:
+            if self._passthrough:
+                rid = getattr(request.state, "sglang_rid", None)
+
+                # Run upstream call and disconnect watcher in parallel for all passthroughs.
+                is_sglang = self._is_sglang_passthrough()
+
+                async def call_upstream():
+                    async with self._passthrough_call(request, **kwargs) as response:
+                        if not 200 <= response.status < 300:
+                            try:
+                                error_detail = await response.json()
+                            except Exception:
+                                error_detail = await response.text()
+                            logger.error(
+                                f"Failed to generate response from func={self._func.__name__}: {response.status=}"
+                            )
+                            raise HTTPException(
+                                status_code=response.status,
+                                detail=error_detail,
+                            )
+                        if encrypt:
+                            raw = await response.read()
+                            return {"json": encrypt(raw)}
+                        return await response.json()
+
+                async def watch_disconnect():
+                    try:
+                        while True:
+                            message = await request._receive()
+                            if message.get("type") == "http.disconnect":
+                                logger.info(
+                                    f"[{self._func.__name__}] Received http.disconnect, "
+                                    f"aborting upstream request (rid={rid}, sglang={is_sglang})"
+                                )
+                                if is_sglang:
+                                    try:
+                                        await self._abort_sglang_request(rid)
+                                    except Exception as exc:
+                                        logger.warning(
+                                            f"Error while sending abort_request for rid={rid}: {exc}"
+                                        )
+                                raise HTTPException(
+                                    status_code=499,
+                                    detail="Client disconnected during upstream request",
+                                )
+                    except HTTPException:
+                        raise
+                    except Exception as exc:
+                        logger.warning(f"watch_disconnect error: {exc}")
+                        raise HTTPException(
+                            status_code=499,
+                            detail="Client disconnected during upstream request",
+                        )
+
+                upstream_task = asyncio.create_task(call_upstream())
+                watcher_task = asyncio.create_task(watch_disconnect())
+
+                done, pending = await asyncio.wait(
+                    {upstream_task, watcher_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in pending:
+                    task.cancel()
+                    try:
+                        await task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+
+                if watcher_task in done:
+                    exc = watcher_task.exception()
+
+                    if exc:
+                        raise exc
+                    raise HTTPException(
+                        status_code=499,
+                        detail="Client disconnected during upstream request",
+                    )
+                result = upstream_task.result()
+                logger.success(
+                    f"Completed request [{self._func.__name__} passthrough={self._passthrough}] "
+                    f"in {time.time() - started_at} seconds"
+                )
+                return result
+
+            # Non-passthrough call (local Python function).
+            # ALL user code is offloaded to a dedicated thread pool so that
+            # long-running or blocking work (including "async def" functions
+            # that never truly await) cannot starve the event loop and prevent
+            # health-check pings from responding.
+            #
+            # Run a disconnect watcher in parallel so we detect client
+            # disconnects early and:
+            #   1. Return a clean 499 before the middleware tries to drain
+            #      the response body on a dead H2 stream (the primary
+            #      "RuntimeError: session closed" vector).
+            #   2. Cancel the user coroutine's inner task so it stops at
+            #      the next await point (e.g. mid-download).  Blocking
+            #      C/CUDA calls will finish their current invocation
+            #      before the cancellation takes effect.
+            cancel_handle = _CancelHandle() if _is_async(self._func) else None
+
+            async def _run_user_code():
+                try:
+                    return await asyncio.wait_for(
+                        self._run_in_thread(*args, _cancel_handle=cancel_handle, **kwargs),
+                        1800,
+                    )
+                except asyncio.TimeoutError:
+                    # wait_for cancels the asyncio future but the thread-pool
+                    # job keeps running.  Cancel the inner coroutine too.
+                    if cancel_handle is not None:
+                        cancel_handle.cancel()
+                    raise
+
+            async def _watch_user_disconnect():
+                try:
+                    while True:
+                        message = await request._receive()
+                        if message.get("type") == "http.disconnect":
+                            logger.info(
+                                f"[{self._func.__name__}] Client disconnected during "
+                                f"non-passthrough execution, cancelling worker"
+                            )
+                            if cancel_handle is not None:
+                                cancel_handle.cancel()
+                            raise HTTPException(
+                                status_code=499,
+                                detail="Client disconnected",
+                            )
+                except HTTPException:
+                    raise
+                except (
+                    ConnectionError,
+                    asyncio.IncompleteReadError,
+                ) as exc:
+                    # Transport-level teardown — treat as a disconnect.
+                    logger.info(f"watch_disconnect transport error (non-passthrough): {exc}")
+                    if cancel_handle is not None:
+                        cancel_handle.cancel()
+                    raise HTTPException(
+                        status_code=499,
+                        detail="Client disconnected",
+                    )
+                except Exception as exc:
+                    logger.error(
+                        f"Unexpected error in watch_disconnect (non-passthrough): "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    if cancel_handle is not None:
+                        cancel_handle.cancel()
+                    raise
+
+            user_task = asyncio.create_task(_run_user_code())
+            watcher_task = asyncio.create_task(_watch_user_disconnect())
+
+            done, pending = await asyncio.wait(
+                {user_task, watcher_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+            if watcher_task in done:
+                exc = watcher_task.exception()
+                if exc:
+                    raise exc
+                raise HTTPException(
+                    status_code=499,
+                    detail="Client disconnected",
+                )
+
+            response = user_task.result()
+            logger.success(
+                f"Completed request [{self._func.__name__} passthrough={self._passthrough}] "
+                f"in {time.time() - started_at} seconds"
+            )
+            if hasattr(response, "body"):
+                if encrypt:
+                    return {
+                        "type": response.__class__.__name__,
+                        "status_code": response.status_code,
+                        "headers": dict(response.headers),
+                        "media_type": response.media_type,
+                        "body": encrypt(response.body),
+                    }
+                else:
+                    return response
+            if encrypt:
+                return {"json": encrypt(json.dumps(response))}
+            return response
+        except asyncio.CancelledError:
+            rid = getattr(request.state, "sglang_rid", None)
+            if self._is_sglang_passthrough():
+                logger.info(
+                    f"Non-stream request for {self._func.__name__} cancelled "
+                    f"(likely client disconnect), aborting SGLang rid={rid}"
+                )
+                try:
+                    await self._abort_sglang_request(rid)
+                except Exception as exc:
+                    logger.warning(f"Error while sending abort_request for rid={rid}: {exc}")
+            elif self._passthrough:
+                logger.info(
+                    f"Non-stream request for {self._func.__name__} cancelled "
+                    f"(likely client disconnect), closing upstream connection"
+                )
+            status = 499
+            raise
+        except Exception as exc:
+            logger.error(
+                f"Error performing non-streamed call for {self._func.__name__}: {type(exc).__name__}"
+            )
+            status = 500
+            raise
+        finally:
+            metrics.total_requests.labels(
+                chute_id=self._app.uid,
+                function=self._func.__name__,
+                status=status,
+            ).inc()
+            metrics.request_duration.labels(
+                chute_id=self._app.uid,
+                function=self._func.__name__,
+                status=status,
+            ).observe(time.time() - started_at)
+
+    async def _remote_stream_call(self, request: Request, *args, **kwargs):
+        """
+        Function call from within the remote context, that is, the code that actually
+        runs on the miner's deployment.
+        """
+        logger.info(f"Received streaming invocation request [{self._func.__name__}]")
+        status = 200
+        started_at = time.time()
+        metrics.last_request_timestamp.labels(
+            chute_id=self._app.uid,
+            function=self._func.__name__,
+        ).set_to_current_time()
+        encrypt = getattr(request.state, "_encrypt", None)
+        try:
+            if self._passthrough:
+                rid = getattr(request.state, "sglang_rid", None)
+
+                async with self._passthrough_call(request, **kwargs) as response:
+                    if not 200 <= response.status < 300:
+                        try:
+                            error_detail = await response.json()
+                        except Exception:
+                            error_detail = await response.text()
+                        logger.error(
+                            f"Failed to generate response from func={self._func.__name__}: {response.status=}"
+                        )
+                        raise HTTPException(
+                            status_code=response.status,
+                            detail=error_detail,
+                        )
+                    async for content in response.content:
+                        if await request.is_disconnected():
+                            logger.info(
+                                f"Client disconnected for {self._func.__name__}, aborting upstream (rid={rid})"
+                            )
+                            if self._is_sglang_passthrough():
+                                await self._abort_sglang_request(rid)
+                            await response.release()
+                            break
+
+                        if encrypt:
+                            yield encrypt(content) + "\n"
+                        else:
+                            yield content
+                logger.success(
+                    f"Completed request [{self._func.__name__} (passthrough)] in {time.time() - started_at} seconds"
+                )
+                return
+
+            # ALL user generators (sync and async) are bridged through a
+            # dedicated thread so the event loop stays responsive.
+            async for data in self._iter_generator_in_thread(*args, **kwargs):
+                if encrypt:
+                    yield encrypt(data) + "\n"
+                else:
+                    yield data
+            logger.success(
+                f"Completed request [{self._func.__name__}] in {time.time() - started_at} seconds"
+            )
+        except asyncio.CancelledError:
+            rid = getattr(request.state, "sglang_rid", None)
+            if self._is_sglang_passthrough():
+                logger.info(
+                    f"Streaming cancelled for {self._func.__name__} "
+                    f"(likely client disconnect), aborting SGLang rid={rid}"
+                )
+                try:
+                    await self._abort_sglang_request(rid)
+                except Exception as exc:
+                    logger.warning(f"Error while sending abort_request for rid={rid}: {exc}")
+            elif self._passthrough:
+                logger.info(
+                    f"Streaming cancelled for {self._func.__name__} "
+                    f"(likely client disconnect), closing upstream connection"
+                )
+            status = 499
+            raise
+
+        except Exception as exc:
+            logger.error(
+                f"Error performing stream call for {self._func.__name__}: {type(exc).__name__}"
+            )
+            status = 500
+            raise
+        finally:
+            metrics.total_requests.labels(
+                chute_id=self._app.uid,
+                function=self._func.__name__,
+                status=status,
+            ).inc()
+            metrics.request_duration.labels(
+                chute_id=self._app.uid,
+                function=self._func.__name__,
+                status=status,
+            ).observe(time.time() - started_at)
+
+    async def _abort_sglang_request(self, rid: Optional[str]):
+        if not rid or not self._is_sglang_passthrough():
+            return
+        try:
+            ssl_ctx = getattr(self._app, "passthrough_ssl_context", None)
+            scheme = "https" if ssl_ctx else "http"
+            connector = aiohttp.TCPConnector(ssl=ssl_ctx) if ssl_ctx else None
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(connect=5.0, total=15.0),
+                connector=connector,
+                base_url=f"{scheme}://127.0.0.1:{self._passthrough_port or 8000}",
+                headers=self._app.passthrough_headers or {},
+            ) as session:
+                logger.warning(f"Aborting SGLang request {rid=}")
+                await session.post("/abort_request", json={"rid": rid})
+                logger.success(f"Sent SGLang abort_request for rid={rid}")
+        except Exception as exc:
+            logger.warning(f"Failed to send abort_request for rid={rid}: {exc}")
+
+    async def _request_handler(self, request: Request):
+        """
+        Decode/deserialize incoming request and call the appropriate function.
+        """
+        if self._passthrough_port is None:
+            self._passthrough_port = 8000
+        args, kwargs = None, None
+        if not self._passthrough:
+            args = [request.state.decrypted] if request.state.decrypted else []
+            kwargs = {}
+        else:
+            decrypted = request.state.decrypted
+            if isinstance(decrypted, dict) and "json" in decrypted and "params" in decrypted:
+                kwargs = decrypted  # Already wrapped for passthrough
+            else:
+                kwargs = {"json": decrypted} if decrypted else {}
+            args = []
+
+        # Set a custom request ID for SGLang passthroughs.
+        if self._is_sglang_passthrough() and isinstance(kwargs.get("json"), dict):
+            rid = uuid.uuid4().hex
+            kwargs["json"].setdefault("rid", rid)
+            request.state.sglang_rid = rid
+
+        if not self._passthrough:
+            if self.input_models and all([isinstance(args[idx], dict) for idx in range(len(args))]):
+                try:
+                    args = [
+                        self.input_models[idx](**args[idx]) for idx in range(len(self.input_models))
+                    ]
+                except ValidationError:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Invalid input parameters",
+                    )
+
+        if self._stream:
+            # Wait for the first chunk before returning StreamingResponse
+            # to avoid returning 200 for requests that fail immediately
+            try:
+                generator = self._remote_stream_call(request, *args, **kwargs)
+                first_chunk = await generator.__anext__()
+
+                async def _stream_with_first_chunk():
+                    yield first_chunk
+                    async for chunk in generator:
+                        yield chunk
+
+                return StreamingResponse(_stream_with_first_chunk())
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"Failed to initialize stream: {type(e).__name__}")
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Error initializing stream",
+                )
+
+        return await self._remote_call(request, *args, **kwargs)
+
+    def __call__(self, func):
+        self._func = func
+        if not self._path:
+            self.path = func.__name__
+        if not self._passthrough_path:
+            self.passthrough_path = func.__name__
+        if not self.input_models:
+            self.input_models = SchemaExtractor.extract_models(func)
+        in_schema, out_schema = SchemaExtractor.extract_schemas(func)
+        if not self.input_schema:
+            self.input_schema = in_schema
+        if not self.output_schema:
+            self.output_schema = out_schema
+        if not self.output_content_type:
+            if isinstance(out_schema, dict):
+                if out_schema.get("type") == "object":
+                    self.output_content_type = "application/json"
+                else:
+                    self.output_content_type = "text/plain"
+        if is_local():
+            return self._local_call if not self._stream else self._local_stream_call
+        return self._remote_call if not self._stream else self._remote_stream_call

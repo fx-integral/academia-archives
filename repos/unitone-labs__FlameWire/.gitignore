@@ -1,0 +1,6 @@
+flamewire.egg-info
+__pycache__
+state.npz
+.env
+wandb/
+venv/

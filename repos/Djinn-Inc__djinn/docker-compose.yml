@@ -1,0 +1,148 @@
+# Djinn Protocol — full local development stack
+#
+# Services:
+#   anvil       — Local Ethereum node (Foundry)
+#   validator   — Bittensor validator API (port 8421)
+#   miner       — Bittensor miner API (port 8422)
+#   web         — Next.js web client (port 3000)
+#
+# Usage:
+#   docker compose up              — Start all services
+#   docker compose up -d           — Start in background
+#   docker compose logs -f miner   — Follow logs for a service
+#
+# Before first run:
+#   1. Copy .env.example files and configure
+#   2. Deploy contracts to Anvil (see scripts/deploy_local.sh)
+#   3. Update contract addresses in env files
+#   4. Ensure ~/.bittensor/wallets contains your coldkey/hotkey. The miner
+#      and validator mount this read-only into the container. Override the
+#      host path with BITTENSOR_WALLETS=/custom/path if your keys live
+#      elsewhere. Wallet/hotkey names come from BT_WALLET_NAME/BT_WALLET_HOTKEY
+#      in the service .env files (both default to "default").
+
+services:
+  anvil:
+    image: ghcr.io/foundry-rs/foundry:latest
+    entrypoint: ["anvil", "--host", "0.0.0.0", "--port", "8545", "--chain-id", "31337"]
+    ports:
+      - "127.0.0.1:8545:8545"
+    healthcheck:
+      test: ["CMD", "cast", "block-number", "--rpc-url", "http://localhost:8545"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.5"
+
+  validator:
+    build:
+      context: ./validator
+      dockerfile: Dockerfile
+    ports:
+      - "127.0.0.1:8421:8421"
+    env_file:
+      - ./validator/.env
+    environment:
+      - API_HOST=0.0.0.0
+      - API_PORT=8421
+      - BASE_RPC_URL=http://anvil:8545
+      - BT_NETWORK=local
+      - LOG_FORMAT=json
+    volumes:
+      - ${BITTENSOR_WALLETS:-~/.bittensor/wallets}:/home/appuser/.bittensor/wallets:ro
+    depends_on:
+      anvil:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8421/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - backend
+      - frontend
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "1.0"
+
+  miner:
+    build:
+      context: ./miner
+      dockerfile: Dockerfile
+    ports:
+      - "127.0.0.1:8422:8422"
+    env_file:
+      - ./miner/.env
+    environment:
+      - API_HOST=0.0.0.0
+      - API_PORT=8422
+      - BT_NETWORK=local
+      - LOG_FORMAT=json
+    volumes:
+      - ${BITTENSOR_WALLETS:-~/.bittensor/wallets}:/home/appuser/.bittensor/wallets:ro
+    depends_on:
+      anvil:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8422/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - backend
+      - frontend
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.5"
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    ports:
+      - "127.0.0.1:3000:3000"
+    env_file:
+      - ./web/.env
+    environment:
+      - NEXT_PUBLIC_BASE_RPC_URL=http://localhost:8545
+      - NEXT_PUBLIC_VALIDATOR_URL=http://localhost:8421
+      - NEXT_PUBLIC_MINER_URL=http://localhost:8422
+    depends_on:
+      validator:
+        condition: service_healthy
+      miner:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - frontend
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.5"
+
+networks:
+  backend:
+    driver: bridge
+  frontend:
+    driver: bridge

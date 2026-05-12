@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  sn92-validator:
+    image: storynetai/validator:latest
+    container_name: sn92-validator
+    restart: unless-stopped
+    env_file:
+      - .env     
+    environment:
+      - PYTHONPATH=/app
+      - PYTHONUNBUFFERED=1
+      # - WALLET_NAME=my_wallet
+      # - HOTKEY_NAME=my_hotkey
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"      
+    volumes:
+      - ~/.bittensor:/root/.bittensor  
+    ports:
+      - "19292:19292"                      
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "19292"]
+      interval: 30s
+      timeout: 10s
+      start_period: 5s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --interval 300 --cleanup --label-enable
+    environment:
+      - WATCHTOWER_POLL_INTERVAL=300
+      - WATCHTOWER_INCLUDE_RESTARTING=true
+      - WATCHTOWER_CLEANUP=true
+      - DOCKER_API_VERSION=1.49
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

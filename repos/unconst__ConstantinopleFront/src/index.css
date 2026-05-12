@@ -1,0 +1,95 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0 0% 10%;
+    --foreground: 40 10% 96%;
+    --card: 0 0% 10%;
+    --card-foreground: 40 10% 96%;
+    --popover: 0 0% 10%;
+    --popover-foreground: 40 10% 96%;
+    --primary: 40 10% 96%;
+    --primary-foreground: 0 0% 10%;
+    --secondary: 0 0% 15%;
+    --secondary-foreground: 40 10% 96%;
+    --muted: 0 0% 15%;
+    --muted-foreground: 40 5% 60%;
+    --accent: 43 40% 59%;
+    --accent-foreground: 0 0% 10%;
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 0 0% 20%;
+    --input: 0 0% 20%;
+    --ring: 40 10% 96%;
+    --radius: 0.625rem;
+    --sidebar-background: 0 0% 10%;
+    --sidebar-foreground: 40 10% 96%;
+    --sidebar-primary: 43 40% 59%;
+    --sidebar-primary-foreground: 0 0% 10%;
+    --sidebar-accent: 0 0% 15%;
+    --sidebar-accent-foreground: 40 10% 96%;
+    --sidebar-border: 0 0% 20%;
+    --sidebar-ring: 40 10% 96%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  html {
+    scroll-behavior: smooth;
+  }
+  body {
+    @apply bg-g3-bg text-g3-text font-sans antialiased;
+  }
+}
+
+.hero-video,
+.hero-poster {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: center;
+}
+
+.hero-video {
+  filter: blur(10px) brightness(0.6);
+  opacity: 1;
+  transform: scale(1.08);
+  transition: filter 1.8s cubic-bezier(0.22, 1, 0.36, 1),
+              opacity 2s ease;
+  animation: cloud-drift 40s linear infinite alternate;
+  will-change: filter, transform, opacity;
+}
+
+.hero-video.loaded {
+  filter: blur(0) brightness(0.6);
+}
+
+.hero-video.hero-video-out {
+  opacity: 0;
+}
+
+.hero-poster {
+  filter: brightness(0.6);
+}
+
+@keyframes cloud-drift {
+  from { transform: scale(1.08) translateY(-0.8%); }
+  to   { transform: scale(1.08) translateY(0.8%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hero-video {
+    animation: none;
+    transform: scale(1.02);
+  }
+  .hero-video.loaded {
+    transform: scale(1.02);
+  }
+}

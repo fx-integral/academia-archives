@@ -1,0 +1,56 @@
+{
+  "netuid": 97,
+  "teacher": {
+    "model": "moonshotai/Kimi-K2.6",
+    "architecture": "kimi_k2",
+    "totalParams": 1000000000000,
+    "activeParams": 32000000000,
+    "vocabSize": 163840,
+    "configVocabSize": 163840,
+    "maxStudentParams": 33000000000,
+    "studentArchAllowlist": [
+      {"model_type": "deepseek_v3", "architecture": "DeepseekV3ForCausalLM"}
+    ],
+    "rolloutNotes": "Hard cutover from Qwen3.6-35B-A3B to Kimi K2.6 on 2026-05-02. Teacher is the multimodal wrapper (model_type=kimi_k25) whose text inner is DeepSeek V3 MoE (61 layers, 384 experts, 8 active, ~32B active / ~1T total). Students must match the Kimi tokenizer (BPE vocab 163,840) and use the text-only DeepseekV3ForCausalLM architecture with model_type=deepseek_v3 (transformers built-in, no custom code required). Student size cap is 33B total params (was 40B). 2026-05-04: removed model_type=kimi_k2 and KimiK25ForConditionalGeneration from the student allowlist \u2014 both require shipping custom modeling code which our trust_remote_code policy forbids; students kept getting silently DQ\u2019d on the eval pod with \"Transformers does not recognize this architecture\". Teacher-side cross-tokenizer (Path A) is disabled because student and teacher now share the Kimi tokenizer."
+  },
+  "previousTeacher": {
+    "model": "Qwen/Qwen3.6-35B-A3B",
+    "architecture": "qwen3_6_moe",
+    "totalParams": 35000000000,
+    "activeParams": 3000000000,
+    "vocabSize": 248044,
+    "configVocabSize": 248320,
+    "maxStudentParams": 40000000000,
+    "retiredAt": "2026-05-02"
+  },
+  "validator": {
+    "maxKlThreshold": 2.0,
+    "maxNewTokens": 8192,
+    "maxPromptTokens": 1024,
+    "evalPromptsFull": 60,
+    "evalPromptsH2h": 300,
+    "vllmConcurrency": 48,
+    "epsilon": 0.03,
+    "pairedTestAlpha": 0.03,
+    "staleH2hEpochs": 50,
+    "topNAlwaysInclude": 7,
+    "referenceModel": "Qwen/Qwen3.5-4B",
+    "referenceUid": -1,
+    "activationCopyThreshold": 0.99999,
+    "distilRoleId": "1482026585358991571"
+  },
+  "chat": {
+    "appPort": 8100
+  },
+  "api": {
+    "cacheTtl": 60,
+    "publicUrl": "https://api.arbos.life",
+    "dashboardUrl": "https://distil.arbos.life",
+    "allowedOrigins": [
+      "https://distil.arbos.life",
+      "http://localhost:3000",
+      "http://localhost:5173"
+    ],
+    "tmcBase": "https://api.taomarketcap.com"
+  }
+}

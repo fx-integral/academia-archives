@@ -1,0 +1,465 @@
+"""Shared pytest fixtures and configuration for validation service tests.
+
+This module provides reusable fixtures for testing the validation service layer.
+Fixtures follow pytest best practices with proper scoping and dependency injection.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import pathlib
+import sys
+from collections import Counter
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+if TYPE_CHECKING:
+    from accelerate import Accelerator
+
+from .proof_test_utils import generate_realistic_sat_prompt
+
+# ============================================================================
+# Test Constants
+# ============================================================================
+
+TEST_MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
+
+# Skip test files for features not yet merged or requiring Linux sandbox
+collect_ignore_glob = [
+    "unit/environments/test_basilica_backend.py",
+    "unit/infrastructure/test_io_pipeline.py",
+    "unit/environments/test_execution_unit.py",
+]
+
+# ============================================================================
+# Test Environment Setup
+# ============================================================================
+
+# grail/__init__.py calls load_dotenv(override=True) on import, which can set
+# HF_HOME to a server-specific path (e.g. /ephemeral/huggingface). Remove it
+# at module level so session-scoped fixtures (which run before monkeypatch)
+# use the default local HuggingFace cache.
+_SERVER_ENV_VARS = ("HF_HOME", "HF_HUB_CACHE", "TRANSFORMERS_CACHE")
+for _var in _SERVER_ENV_VARS:
+    os.environ.pop(_var, None)
+
+
+@pytest.fixture(autouse=True)
+def _set_test_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Provide safe default environment for tests.
+
+    Keeps tests deterministic and avoids accidental network/monitoring.
+    """
+    monkeypatch.setenv("WANDB_MODE", "disabled")
+    monkeypatch.setenv("GRAIL_MONITORING_BACKEND", "null")
+    monkeypatch.setenv("BT_NETWORK", "test")
+    monkeypatch.setenv("NETUID", "1")
+    # Ensure server-specific HF paths from .env don't leak into tests
+    for var in _SERVER_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    # Ensure project root is on path when running from different CWDs
+    root = str(pathlib.Path(__file__).resolve().parents[1])
+    if root not in sys.path:
+        sys.path.insert(0, root)
+
+
+# ============================================================================
+# Mock Objects - Reusable across tests
+# ============================================================================
+
+
+@pytest.fixture
+def mock_subtensor() -> AsyncMock:
+    """Mock bittensor subtensor for testing."""
+    subtensor = AsyncMock()
+    subtensor.get_current_block = AsyncMock(return_value=1000)
+    subtensor.get_block_hash = AsyncMock(
+        return_value="0x" + hashlib.sha256(b"block_1000").hexdigest()
+    )
+    subtensor.metagraph = AsyncMock()
+    subtensor.set_weights = AsyncMock()
+    return subtensor
+
+
+@pytest.fixture
+def mock_metagraph() -> MagicMock:
+    """Mock bittensor metagraph with sample miners."""
+    metagraph = MagicMock()
+    metagraph.hotkeys = [f"hotkey_{i}" for i in range(20)]
+    metagraph.uids = list(range(20))
+    return metagraph
+
+
+@pytest.fixture
+def mock_chain_manager() -> MagicMock:
+    """Mock GrailChainManager for credential access."""
+    manager = MagicMock()
+    manager.get_bucket = MagicMock(return_value=None)
+    manager.stop = MagicMock()
+    return manager
+
+
+@pytest.fixture
+def mock_credentials() -> MagicMock:
+    """Mock bucket credentials."""
+    credentials = MagicMock()
+    credentials.access_key = "test_key"
+    credentials.secret_key = "test_secret"
+    return credentials
+
+
+@pytest.fixture
+def mock_wallet() -> MagicMock:
+    """Mock bittensor wallet."""
+    wallet = MagicMock()
+    wallet.hotkey.ss58_address = "validator_hotkey_test"
+    return wallet
+
+
+@pytest.fixture
+def mock_monitor() -> AsyncMock:
+    """Mock monitoring client."""
+    monitor = AsyncMock()
+    monitor.log_gauge = AsyncMock()
+    monitor.timer = MagicMock()
+    monitor.set_block_context = MagicMock()
+    return monitor
+
+
+# ============================================================================
+# Test Data - Sample validation data
+# ============================================================================
+
+
+@pytest.fixture
+def sample_window_data() -> dict[str, str | int]:
+    """Sample window metadata."""
+    return {
+        "window": 1000,
+        "window_hash": "0x" + hashlib.sha256(b"window_1000").hexdigest(),
+        "window_rand": "0x" + hashlib.sha256(b"rand_1000").hexdigest(),
+    }
+
+
+@pytest.fixture
+def sample_miner_rollouts() -> list[dict[str, str | int | float]]:
+    """Sample rollouts for a miner."""
+    return [
+        {
+            "completion_digest": f"digest_{i}",
+            "hotkey": "miner_1",
+            "problem_id": i // 4,  # 4 rollouts per problem
+            "advantage": 0.1 * (i % 4 - 1.5),  # Sum to ~0 per group
+            "reward": 0.5 + 0.1 * i,
+        }
+        for i in range(20)
+    ]
+
+
+@pytest.fixture
+def sample_validation_metrics() -> dict[str, dict[str, int]]:
+    """Sample validation metrics for multiple miners."""
+    return {
+        "miner_1": {"valid": 10, "checked": 12, "total": 20, "successful": 8, "unique": 10},
+        "miner_2": {"valid": 8, "checked": 10, "total": 15, "successful": 6, "unique": 8},
+        "miner_3": {"valid": 5, "checked": 8, "total": 10, "successful": 3, "unique": 5},
+    }
+
+
+@pytest.fixture
+def sample_rollout_counters() -> dict[str, Counter[str]]:
+    """Sample rollout counters for copycat detection."""
+    return {
+        "miner_1": Counter(["digest_1", "digest_2", "digest_3", "digest_4", "digest_5"]),
+        "miner_2": Counter(["digest_1", "digest_2", "digest_6", "digest_7"]),  # Copies 2
+        "miner_3": Counter(["digest_8", "digest_9", "digest_10"]),  # Unique
+    }
+
+
+# ============================================================================
+# Parametrized Test Data
+# ============================================================================
+
+
+@pytest.fixture(
+    params=[
+        (10, 0.2, 5, None, 5),  # (active, rate, min, max, expected)
+        (100, 0.2, 5, 50, 20),
+        (200, 0.2, 5, 20, 20),  # Hits max
+        (0, 0.2, 5, None, 0),  # No active miners
+        (5, 0.2, 10, None, 10),  # Hits min
+    ]
+)
+def sample_size_cases(request: pytest.FixtureRequest) -> tuple[int, float, int, int | None, int]:
+    """Parametrized test cases for sample size calculation."""
+    return request.param
+
+
+# ============================================================================
+# SAT Prompts for Proof Tests (Original fixtures)
+# ============================================================================
+
+
+@pytest.fixture(scope="session")
+def sat_prompts(tmp_path_factory: pytest.TempPathFactory) -> list[str]:
+    """Pregenerated realistic SAT prompts for proof tests.
+
+    Uses deterministic seeds and production chat templates to ensure
+    prompts match actual mining scenarios. Filelock prevents concurrent
+    HuggingFace cache corruption under pytest-xdist.
+    """
+    from filelock import FileLock
+    from transformers import AutoTokenizer
+
+    # Serialize model downloads across xdist workers
+    lock_path = tmp_path_factory.getbasetemp().parent / "hf_download.lock"
+    with FileLock(str(lock_path)):
+        tokenizer = AutoTokenizer.from_pretrained(TEST_MODEL_ID)
+
+    seeds = [
+        "test_seed_easy_01",
+        "test_seed_medium_02",
+        "test_seed_hard_03",
+        "test_seed_compact_04",
+        "test_seed_large_05",
+    ]
+    difficulties = [0.3, 0.5, 0.7, 0.5, 0.8]
+    return [
+        generate_realistic_sat_prompt(seed, diff, tokenizer)
+        for seed, diff in zip(seeds, difficulties, strict=False)
+    ]
+
+
+@pytest.fixture
+def sat_prompt_tokens(sat_prompts: list[str]) -> list[int]:
+    """Tokenized SAT prompts for testing."""
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(TEST_MODEL_ID)
+    return [tokenizer.encode(prompt, add_special_tokens=False) for prompt in sat_prompts]
+
+
+# ============================================================================
+# TRAINER-SPECIFIC FIXTURES
+# ============================================================================
+
+
+@pytest.fixture
+def seeded_torch_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Set all random seeds for reproducibility and force CPU execution.
+
+    Enables deterministic behavior in torch on CPU and ensures tests run on CPU
+    for consistent results across runs. Avoids CUBLAS determinism issues by
+    keeping deterministic disabled for CUDA-using code.
+    """
+    import random
+
+    import numpy as np
+    import torch
+
+    # Set Python random seed
+    random.seed(42)
+    # Set NumPy seed
+    np.random.seed(42)
+    # Set torch seed on CPU
+    torch.manual_seed(42)
+
+    # Force CPU execution BEFORE any cuda calls
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+    # Disable CUDA to force CPU usage
+    if torch.cuda.is_available():
+        torch.cuda.is_available = lambda: False
+
+    # Enable deterministic algorithms in torch (CPU-safe only)
+    try:
+        torch.use_deterministic_algorithms(False)  # Disable to avoid CUBLAS issues
+    except Exception:
+        pass
+    torch.backends.cudnn.deterministic = True
+
+
+@pytest.fixture(scope="session")
+def _cached_qwen_model_and_tokenizer(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> tuple[Any, Any]:
+    """Session-scoped: build a random-init tiny Qwen2 model and load the real tokenizer.
+
+    The model is a Qwen2ForCausalLM constructed from a small Qwen2Config (hidden_size
+    64, 2 layers, 2 heads) rather than the 1.5B pretrained checkpoint. This keeps the
+    HF architecture surface the tests exercise (`.model`, `.lm_head`, chunked-logit
+    path, attention mask handling) while dropping memory from ~3 GB to ~40 MB per
+    worker, which is what allows CI to run the trainer tests under pytest-xdist on
+    7 GB GitHub-hosted runners without OOMing. Vocab size matches the tokenizer so
+    real pad/eos token ids stay in-range when they flow through the training batch
+    preparation path.
+
+    The real Qwen2.5 tokenizer is still downloaded (it's small and fast) because the
+    trainer reads `pad_token_id` and `eos_token_id` from it and may call `decode()`
+    in debug branches. The filelock serializes concurrent downloads across xdist
+    workers to avoid HF cache corruption.
+    """
+    import torch
+    from filelock import FileLock
+    from transformers import AutoTokenizer, Qwen2Config, Qwen2ForCausalLM
+
+    tokenizer_name = "Qwen/Qwen2.5-1.5B"
+
+    # Serialize tokenizer downloads across xdist workers.
+    lock_path = tmp_path_factory.getbasetemp().parent / "hf_download.lock"
+    with FileLock(str(lock_path)):
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    # Use len(tokenizer) rather than tokenizer.vocab_size: the Qwen2.5 tokenizer
+    # reports vocab_size=151643 but eos/pad_token_id=151643 itself, which lives in
+    # the added-tokens range (len == 151665). Matching len(tokenizer) ensures real
+    # pad/eos ids index cleanly into the model's embedding table.
+    model_vocab_size = len(tokenizer)
+    config = Qwen2Config(
+        vocab_size=model_vocab_size,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        max_position_embeddings=512,
+        tie_word_embeddings=True,
+        torch_dtype="float32",
+    )
+    torch.manual_seed(0)
+    model = Qwen2ForCausalLM(config)
+    model.eval()
+
+    return model, tokenizer
+
+
+@pytest.fixture
+def tiny_qwen_model_and_tokenizer(
+    _cached_qwen_model_and_tokenizer: tuple[Any, Any],
+) -> tuple[Any, Any]:
+    """Per-test: return a deep copy of the cached tiny model so tests can't leak state.
+
+    The tokenizer is immutable so it's shared directly. The model is a tiny
+    random-init Qwen2 (~40 MB) so deepcopy is effectively free.
+    """
+    import copy
+
+    model, tokenizer = _cached_qwen_model_and_tokenizer
+    return copy.deepcopy(model), tokenizer
+
+
+@pytest.fixture
+def monkeypatch_trainer_constants(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Override trainer constants for fast tests.
+
+    Shrinks batch size, max length, and gradient accumulation steps
+    to speed up test execution while maintaining correctness.
+    """
+    import grail.protocol.constants as proto_constants
+    import grail.shared.config as config_constants
+
+    monkeypatch.setattr(config_constants, "TRAINER_MAX_LENGTH", 256)
+    monkeypatch.setattr(config_constants, "TRAINER_MICRO_BATCH_SIZE", 4)
+    monkeypatch.setattr(config_constants, "TRAINER_GRAD_ACCUM_STEPS", 2)
+    monkeypatch.setattr(proto_constants, "ROLLOUTS_PER_PROBLEM", 4)
+
+
+@pytest.fixture
+def accelerator_cpu() -> Accelerator:
+    """Create Accelerator instance configured for CPU execution.
+
+    Returns a deterministic, CPU-based accelerator suitable for testing.
+    """
+    import torch
+    from accelerate import Accelerator
+
+    # Disable CUDA to force CPU
+    torch.cuda.is_available = lambda: False
+
+    acc = Accelerator(
+        mixed_precision="no",
+        device_placement=True,  # Enable device placement to ensure CPU is used
+        cpu=True,  # Explicitly request CPU device
+    )
+    return acc
+
+
+@pytest.fixture
+def gsm8k_env_factory() -> Callable[[], Any]:
+    """Factory function for creating GSM8KEnv instances.
+
+    Returns a callable that creates fresh GSM8KEnv instances for tests.
+    """
+    from grail.environments.gsm8k_env import GSM8KEnv
+
+    def _make_env() -> Any:
+        return GSM8KEnv()
+
+    return _make_env
+
+
+@pytest.fixture
+def run_grpo_epoch() -> Callable[..., Any]:
+    """Helper fixture to run a GRPO training epoch.
+
+    Encapsulates the pattern of creating GRPOAlgorithm, TrainingConfig,
+    and calling train_epoch to reduce code duplication across tests.
+
+    Returns:
+        A callable that runs one GRPO epoch and returns metrics.
+
+    Usage:
+        metrics = await run_grpo_epoch(
+            model, ref_model, tokenizer, groups, optimizer, accelerator
+        )
+    """
+    from grail.trainer.algorithms.grpo import GRPOAlgorithm
+    from grail.trainer.config import TrainingConfig
+
+    async def _run_epoch(
+        model: Any,
+        ref_model: Any,
+        tokenizer: Any,
+        groups: list[Any],
+        optimizer: Any,
+        accelerator: Any,
+        monitor: Any | None = None,
+        window: int = 0,
+    ) -> dict[str, float]:
+        """Run one GRPO training epoch.
+
+        Args:
+            model: The training model.
+            ref_model: The reference model for KL divergence.
+            tokenizer: The tokenizer.
+            groups: List of GRPO groups for training.
+            optimizer: The optimizer.
+            accelerator: The accelerator for distributed training.
+            monitor: Optional monitor for metrics logging.
+            window: The training window number (default 0 for tests).
+
+        Returns:
+            Dictionary of training metrics for the epoch.
+        """
+        algorithm = GRPOAlgorithm()
+        config = TrainingConfig()
+        return await algorithm.train_epoch(
+            model,
+            ref_model,
+            tokenizer,
+            groups,
+            optimizer,
+            accelerator,
+            monitor,
+            window,
+            config,
+        )
+
+    return _run_epoch

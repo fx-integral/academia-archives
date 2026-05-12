@@ -1,0 +1,18 @@
+from pathlib import Path
+
+BLOCK_TIME = 12  # Seconds per block
+
+MAIN_PATH = Path("~", ".bittensor", "taohash").expanduser()
+
+VERSION_KEY = 36  # For validators
+U16_MAX = 65535
+
+OWNER_TAKE = 0.18
+SPLIT_WITH_MINERS = 0.5
+
+PAYOUT_FACTOR = 0.015
+
+BLOCK_REWARDS = {
+    "btc": 3.125,
+    "bch": 3.125,
+}

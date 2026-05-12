@@ -1,0 +1,48 @@
+name: Tests
+
+# Scope: Python package tests only. Contract (Foundry) tests live alongside
+# the contracts in subnet112/minotaur_contracts and are exercised by that
+# repo's own CI. Anvil/Docker-bound emulation and fork suites still live in
+# the dev tree but aren't gated here — GitHub-hosted runners don't have the
+# fork RPC creds or the running containers those suites assume.
+
+on:
+  push:
+    branches: [main, crosschain]
+  pull_request:
+    branches: [main]
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Create virtualenv and install dependencies
+        run: |
+          python -m venv .venv
+          ./.venv/bin/pip install --upgrade pip
+          ./.venv/bin/pip install -r requirements.txt
+      - name: Unit tests
+        run: make test-unit
+
+  cross-chain-tests:
+    # Dev-track lane: exercises minotaur_subnet/bridge/* and the multi-leg
+    # path that is gated behind CROSS_CHAIN_ENABLED=0 in beta. Runs on every
+    # PR so the code stays compiling even while the runtime flag is off.
+    runs-on: ubuntu-latest
+    needs: [unit-tests]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Create virtualenv and install dependencies
+        run: |
+          python -m venv .venv
+          ./.venv/bin/pip install --upgrade pip
+          ./.venv/bin/pip install -r requirements.txt
+      - name: Cross-chain tests (dev-track)
+        run: make test-cross-chain

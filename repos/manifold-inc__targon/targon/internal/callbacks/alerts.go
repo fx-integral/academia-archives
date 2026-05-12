@@ -1,0 +1,171 @@
+package callbacks
+
+import (
+	"fmt"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+
+	"targon/internal/discord"
+	"targon/internal/setup"
+	"targon/internal/targon"
+
+	"github.com/centrifuge/go-substrate-rpc-client/v4/types"
+)
+
+type minerStats struct {
+	gpuCount  int
+	gpuTypes  map[string]int
+	cpuTypes  map[string]int
+	cpuCount  int
+	uid       int
+	incentive float64
+}
+
+func sendIntervalSummary(c *targon.Core, h types.Header, uids, scores []uint16) error {
+	stats := make(map[int]*minerStats)
+	totalGPUs := 0
+	totalCPUs := 0
+	activeNodes := 0
+
+	for uidstr, nodes := range c.VerifiedNodes {
+		uid, _ := strconv.Atoi(uidstr)
+		if stats[uid] == nil {
+			stats[uid] = &minerStats{
+				gpuTypes: make(map[string]int),
+				cpuTypes: make(map[string]int),
+				uid:      uid,
+			}
+		}
+
+		for _, node := range nodes {
+			if node == nil {
+				continue
+			}
+			activeNodes++
+			for _, gpu := range *node.GPUCards {
+				gpuLower := strings.ToLower(gpu)
+				totalGPUs++
+				stats[uid].gpuCount++
+				stats[uid].gpuTypes[gpuLower]++
+			}
+			for _, cpu := range *node.CPUCards {
+				cpuLower := strings.ToLower(cpu)
+				totalCPUs++
+				stats[uid].cpuCount++
+				stats[uid].cpuTypes[cpuLower]++
+			}
+		}
+	}
+
+	for i, uid := range uids {
+		if val, ok := stats[int(uid)]; ok {
+			val.incentive = float64(scores[i]) / float64(setup.U16MAX)
+		}
+	}
+
+	// Aggregate GPU types across all miners
+	gpuTypes := make(map[string]int)
+	cpuTypes := make(map[string]int)
+	statsarr := []*minerStats{}
+	for _, miner := range stats {
+		statsarr = append(statsarr, miner)
+		for gpu, count := range miner.gpuTypes {
+			gpuTypes[gpu] += count
+		}
+		for cpu, count := range miner.cpuTypes {
+			cpuTypes[cpu] += count
+		}
+	}
+
+	sort.Slice(statsarr, func(i, j int) bool {
+		return statsarr[i].uid < statsarr[j].uid
+	})
+
+	burned := 0.0
+	for i, uid := range uids {
+		if slices.Contains(burnKeys, int(uid)) {
+			burned += float64(scores[i]) / float64(setup.U16MAX)
+		}
+	}
+
+	color := "5763719"
+	title := fmt.Sprintf("Daily GPU Summary at block %v", h.Number)
+	if c.Deps.Env.Debug {
+		title = fmt.Sprintf("[DEBUG] %s", title)
+		color = "15105570"
+	}
+	desc := fmt.Sprintf(
+		"Total Attested GPUs: %d\n"+
+			"Total Attested CPUs: %d\n"+
+			"Active CVM Nodes: %d\n"+
+			"Emission Pool: $%.2f\n"+
+			"Burned: %.2f%%\n"+
+			"GPU Type Breakdown:\n%s\n"+
+			"CPU Type Breakdown:\n%s\n"+
+			"Per Miner Breakdown:\n%s",
+		totalGPUs,
+		totalCPUs,
+		activeNodes,
+		*c.EmissionPool,
+		burned*100,
+		formatGPUBreakdown(gpuTypes),
+		formatCPUBreakdown(cpuTypes),
+		formatMinerBreakdown(statsarr),
+	)
+
+	uname := "GPU Monitor"
+	msg := discord.Message{
+		Username: &uname,
+		Embeds: &[]discord.Embed{{
+			Title:       &title,
+			Description: &desc,
+			Color:       &color,
+		}},
+	}
+	err := discord.SendDiscordMessage(c.Deps.Env.DiscordURL, msg)
+	c.Deps.Log.Infow("Sent daily GPU summary",
+		"total_gpus", totalGPUs,
+		"total_cpus", totalCPUs,
+		"active_nodes", activeNodes,
+		"gpu_types", gpuTypes,
+		"cpu_types", cpuTypes,
+	)
+	return err
+}
+
+func formatGPUBreakdown(gpuTypes map[string]int) string {
+	var sb strings.Builder
+	for gpu, count := range gpuTypes {
+		sb.WriteString(fmt.Sprintf("- %s: %d\n", gpu, count))
+	}
+	return sb.String()
+}
+
+func formatCPUBreakdown(cpuTypes map[string]int) string {
+	var sb strings.Builder
+	for cpu, count := range cpuTypes {
+		sb.WriteString(fmt.Sprintf("- %s: %d\n", cpu, count))
+	}
+	return sb.String()
+}
+
+func formatMinerBreakdown(stats []*minerStats) string {
+	var sb strings.Builder
+	for _, miner := range stats {
+		if miner.gpuCount == 0 && miner.cpuCount == 0 {
+			continue
+		}
+		var parts []string
+		if miner.gpuCount > 0 {
+			parts = append(parts, fmt.Sprintf("%d GPUs", miner.gpuCount))
+		}
+		if miner.cpuCount > 0 {
+			parts = append(parts, fmt.Sprintf("%d CPUs", miner.cpuCount))
+		}
+		details := strings.Join(parts, ", ")
+		sb.WriteString(fmt.Sprintf("- Miner %d: %s, %.2f%%\n", miner.uid, details, miner.incentive*100))
+	}
+	return sb.String()
+}

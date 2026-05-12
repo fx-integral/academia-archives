@@ -1,0 +1,40 @@
+[project]
+name = "quasar"
+version = "0.8.0"
+description = "Quasar SN24 - Bittensor subnet built to crush the long-context barrier"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "accelerate==1.13.0",
+    "async-substrate-interface==1.6.4",
+    "boto3",
+    "bittensor==9.12.0",
+    "click",
+    "datasets",
+    "fastapi",
+    "huggingface-hub",
+    "httpx",
+    "lium.io==0.0.8",
+    "numpy",
+    "pydantic",
+    "requests",
+    "rich",
+    "safetensors",
+    "starlette",
+    "torch",
+    "transformers",
+    "uvicorn",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+gpu = [
+    "flash-linear-attention @ git+https://github.com/SILX-LABS/quasar-flash-linear-attention.git@84ad1cc5a7428609d7e0e56d4041a775cd19b7bb",
+]
+
+[tool.setuptools.packages.find]
+include = ["eval*", "api*"]
+exclude = ["state*", "scripts*", "neurons*"]

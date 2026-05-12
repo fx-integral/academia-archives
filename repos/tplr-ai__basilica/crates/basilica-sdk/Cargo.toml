@@ -1,0 +1,44 @@
+[package]
+name = "basilica-sdk"
+version = "0.29.0"
+edition = "2021"
+authors = ["Basilica Team"]
+description = "SDK for interacting with the Basilica GPU rental network"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# HTTP client
+reqwest = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+chrono = { workspace = true }
+
+
+# Auth dependencies (moved from CLI)
+oauth2 = { workspace = true }
+base64 = { workspace = true }
+etcetera = { workspace = true }
+
+# Internal dependencies
+basilica-common = { path = "../basilica-common" }
+basilica-validator = { path = "../basilica-validator", features = ["client"] }
+urlencoding = { workspace = true }
+
+[dev-dependencies]
+wiremock = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }
+
+[features]
+default = []
+client = []

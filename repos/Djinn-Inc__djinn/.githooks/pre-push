@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+#
+# Pre-push hook: run syntax checks on changed Python files.
+# Catches import/syntax errors before they reach validators.
+#
+set -euo pipefail
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+NC='\033[0m'
+
+# Find which components have changes since the remote
+REMOTE_REF=$(git rev-parse @{u} 2>/dev/null || echo "HEAD~1")
+CHANGED=$(git diff --name-only "$REMOTE_REF"..HEAD 2>/dev/null || git diff --name-only HEAD~1..HEAD)
+
+check_syntax() {
+    local module="$1"
+    local dir="$2"
+    if echo "$CHANGED" | grep -q "^${dir}/"; then
+        echo -n "  Checking ${module}... "
+        cd "$dir"
+        if python3 -c "import ${module}" 2>&1; then
+            echo -e "${GREEN}OK${NC}"
+        else
+            echo -e "${RED}SYNTAX ERROR${NC}"
+            echo -e "${RED}=== BLOCKED: ${module} has syntax errors. Fix before pushing. ===${NC}"
+            cd - > /dev/null
+            exit 1
+        fi
+        cd - > /dev/null
+    fi
+}
+
+echo "Running pre-push syntax checks..."
+
+# Check validator
+if echo "$CHANGED" | grep -q "^validator/"; then
+    echo -n "  Checking validator... "
+    (cd /home/user/djinn/validator && python3 -c "import djinn_validator.api.server" 2>&1) && echo -e "${GREEN}OK${NC}" || {
+        echo -e "${RED}SYNTAX ERROR in validator${NC}"
+        echo -e "${RED}=== BLOCKED: Fix syntax errors before pushing. ===${NC}"
+        exit 1
+    }
+fi
+
+# Check miner
+if echo "$CHANGED" | grep -q "^miner/"; then
+    echo -n "  Checking miner... "
+    (cd /home/user/djinn/miner && python3 -c "import djinn_miner.api.server" 2>&1) && echo -e "${GREEN}OK${NC}" || {
+        echo -e "${RED}SYNTAX ERROR in miner${NC}"
+        echo -e "${RED}=== BLOCKED: Fix syntax errors before pushing. ===${NC}"
+        exit 1
+    }
+fi
+
+# Check shield
+if echo "$CHANGED" | grep -q "^shield/"; then
+    echo -n "  Checking shield... "
+    (cd /home/user/djinn/shield && PYTHONPATH=. python3 -c "import djinn_tunnel_shield" 2>&1) && echo -e "${GREEN}OK${NC}" || {
+        echo -e "${RED}SYNTAX ERROR in shield${NC}"
+        echo -e "${RED}=== BLOCKED: Fix syntax errors before pushing. ===${NC}"
+        exit 1
+    }
+fi
+
+
+# VERSION drift check — non-git operators (e.g. UID 213) read the
+# committed VERSION file as the authoritative version, so it must not
+# fall behind the latest vNNNN tag when validator code is in the push.
+if echo "$CHANGED" | grep -q "^validator/"; then
+    LATEST_TAG_NUM=$(git tag --list 'v[0-9]*' --sort=-v:refname | head -1 | sed 's/^v//')
+    VERSION_FILE_NUM=$(cat validator/djinn_validator/VERSION 2>/dev/null | tr -d '[:space:]')
+    if [ -n "$LATEST_TAG_NUM" ] && [ -n "$VERSION_FILE_NUM" ] && [ "$VERSION_FILE_NUM" -lt "$LATEST_TAG_NUM" ]; then
+        echo -e "${RED}=== BLOCKED: validator/djinn_validator/VERSION ($VERSION_FILE_NUM) < latest tag (v$LATEST_TAG_NUM). ===${NC}"
+        echo -e "${RED}    Run: scripts/bump-validator-version.sh $LATEST_TAG_NUM && git add validator/djinn_validator/VERSION && git commit --amend --no-edit"
+        echo -e "${RED}    Or: scripts/bump-validator-version.sh && git add ... && git commit -m 'release: bump committed VERSION to ...'${NC}"
+        echo -e "${RED}    Why: UID 213 (and any other non-git operator) reads VERSION via fallback when git describe fails.${NC}"
+        exit 1
+    fi
+fi
+
+echo "All checks passed."

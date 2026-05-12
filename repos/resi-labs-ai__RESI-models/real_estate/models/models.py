@@ -1,0 +1,119 @@
+"""Data models for model management module."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+
+@dataclass(frozen=True)
+class CachedModelMetadata:
+    """
+    Minimal metadata stored alongside cached model file.
+
+    Only stores what's needed for cache invalidation, disk tracking,
+    and tie-breaking (commit block).
+    """
+
+    hash: str  # SHA-256 hash (64 chars) - compared with chain commitment
+    size_bytes: int  # For disk space tracking
+    commit_block: int  # Block number when committed (from Pylon, for tie-breaking)
+    feature_config: dict | None = None  # Raw JSON dict from feature_config.json
+    license_type: str | None = None  # License type verified at download time
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for JSON serialization."""
+        d = {
+            "hash": self.hash,
+            "size_bytes": self.size_bytes,
+            "commit_block": self.commit_block,
+        }
+        if self.feature_config is not None:
+            d["feature_config"] = self.feature_config
+        if self.license_type is not None:
+            d["license_type"] = self.license_type
+        return d
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CachedModelMetadata:
+        """Create from dictionary (JSON deserialization)."""
+        return cls(
+            hash=data["hash"],
+            size_bytes=data["size_bytes"],
+            commit_block=data["commit_block"],
+            feature_config=data.get("feature_config"),
+            license_type=data.get("license_type"),
+        )
+
+
+@dataclass(frozen=True)
+class CachedModel:
+    """
+    A cached model with its metadata.
+
+    Returned from cache lookup operations.
+    """
+
+    path: Path
+    metadata: CachedModelMetadata
+
+
+@dataclass(frozen=True)
+class ExtrinsicRecord:
+    """
+    Parsed extrinsic_record.json from HuggingFace repo.
+
+    This file must be created by the miner after submitting their model
+    commitment on-chain. Contains hotkey and extrinsic ID for verification.
+    """
+
+    hotkey: str
+    extrinsic: str  # Format: "{block}-{index}"
+
+    @property
+    def block_number(self) -> int:
+        """Extract block number from extrinsic ID."""
+        return int(self.extrinsic.split("-")[0])
+
+    @property
+    def extrinsic_index(self) -> int:
+        """
+        Extract extrinsic index from extrinsic ID.
+
+        Handles both decimal and hex formats (0x prefix).
+        """
+        idx_str = self.extrinsic.split("-")[1]
+        base = 16 if idx_str.lower().startswith("0x") else 10
+        return int(idx_str, base)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> ExtrinsicRecord:
+        """Create from dictionary (JSON from HF repo)."""
+        return cls(
+            hotkey=data["hotkey"],
+            extrinsic=data["extrinsic"],
+        )
+
+
+@dataclass
+class DownloadResult:
+    """
+    Result of a model download attempt.
+
+    Used by scheduler to track download outcomes.
+    """
+
+    hotkey: str
+    success: bool
+    path: Path | None = None
+    error: Exception | None = None
+
+    @property
+    def error_message(self) -> str | None:
+        """Get error message if failed (truncated to 50 chars)."""
+        if self.error:
+            msg = f"{type(self.error).__name__}: {self.error}"
+            if len(msg) > 50:
+                return msg[:47] + "..."
+            return msg
+        return None

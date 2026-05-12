@@ -1,0 +1,462 @@
+from __future__ import annotations
+
+import subprocess
+from dataclasses import dataclass
+from subprocess import CompletedProcess
+
+import pytest
+
+import harnyx_commons.sandbox.docker as docker_module
+from harnyx_commons.sandbox.docker import (
+    DockerSandboxManager,
+    HttpSandboxClient,
+    SandboxOptions,
+    resolve_sandbox_host_container_url,
+)
+from harnyx_commons.sandbox.manager import SandboxDeployment
+
+_HOST_CONTAINER_URL = "http://127.0.0.1:1"
+
+
+@dataclass
+class DummyClient:
+    base_url: str
+    host_container_url: str | None
+    closed: bool = False
+
+    def invoke(self, *args, **kwargs):  # pragma: no cover - not used in test
+        raise NotImplementedError
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class RecordingRunner:
+    def __init__(self) -> None:
+        self.commands: list[tuple[list[str], dict[str, object]]] = []
+
+    def __call__(self, args: list[str], **kwargs: object):
+        self.commands.append((list(args), dict(kwargs)))
+        stdout = ""
+        if args[:2] == ["docker", "run"] and "-d" in args:
+            stdout = "container123\n"
+        elif args[:2] == ["docker", "inspect"]:
+            stdout = '{"harnyx-net":{"IPAddress":"172.18.0.2"}}\n'
+        return subprocess_completed(args, stdout)
+
+
+def subprocess_completed(args: list[str], stdout: str) -> CompletedProcess[str]:
+    return CompletedProcess(args=args, returncode=0, stdout=stdout, stderr="")
+
+
+def test_http_sandbox_client_default_timeout_exceeds_entrypoint_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeAsyncClient:
+        def __init__(self, *, base_url: str, timeout: float) -> None:
+            captured["base_url"] = base_url
+            captured["timeout"] = timeout
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(docker_module.httpx, "AsyncClient", FakeAsyncClient)
+
+    client = HttpSandboxClient("http://sandbox")
+    try:
+        assert captured == {
+            "base_url": "http://sandbox",
+            "timeout": 310.0,
+        }
+    finally:
+        client.close()
+
+
+def test_docker_sandbox_manager_builds_commands(monkeypatch) -> None:
+    runner = RecordingRunner()
+    created_clients: list[DummyClient] = []
+
+    def client_factory(base_url: str, host_container_url: str | None) -> DummyClient:
+        client = DummyClient(base_url, host_container_url)
+        created_clients.append(client)
+        return client
+
+    manager = DockerSandboxManager(
+        docker_binary="docker",
+        host="127.0.0.1",
+        command_runner=runner,
+        client_factory=client_factory,
+    )
+
+    options = SandboxOptions(
+        image="harnyx/sandbox:demo",
+        container_name="sandbox-demo",
+        host_port=9000,
+        container_port=8000,
+        env={"EXAMPLE": "value"},
+        network="harnyx-net",
+        host_container_url=_HOST_CONTAINER_URL,
+    )
+
+    deployment = manager.start(options)
+    assert isinstance(deployment, SandboxDeployment)
+    assert deployment.identifier == "container123"
+    assert deployment.base_url == "http://127.0.0.1:9000"
+    assert isinstance(deployment.client, DummyClient)
+    assert deployment.client.host_container_url == options.host_container_url
+
+    run_args, run_kwargs = runner.commands[0]
+    assert run_args[:4] == [
+        "docker",
+        "run",
+        "--pull",
+        options.pull_policy,
+    ]
+    assert run_args[4:10] == [
+        "-d",
+        "--rm",
+        "--name",
+        "sandbox-demo",
+        "-p",
+        "9000:8000",
+    ]
+    assert "--network" in run_args
+    assert "-e" in run_args
+    assert run_args[-1] == options.image
+    assert run_kwargs["capture_output"] is True
+    assert run_kwargs["text"] is True
+
+    manager.stop(deployment)
+    stop_args, stop_kwargs = runner.commands[1]
+    assert stop_args == ["docker", "stop", "-t", "5", "container123"]
+    assert deployment.client.closed is True
+    assert created_clients[0].closed is True
+
+
+def test_docker_sandbox_manager_binds_published_port_when_configured() -> None:
+    runner = RecordingRunner()
+    created_clients: list[DummyClient] = []
+
+    def client_factory(base_url: str, host_container_url: str | None) -> DummyClient:
+        client = DummyClient(base_url, host_container_url)
+        created_clients.append(client)
+        return client
+
+    manager = DockerSandboxManager(
+        docker_binary="docker",
+        host="127.0.0.1",
+        published_port_bind_host="127.0.0.1",
+        command_runner=runner,
+        client_factory=client_factory,
+    )
+
+    options = SandboxOptions(
+        image="harnyx/sandbox:demo",
+        container_name="sandbox-demo",
+        host_port=9000,
+        container_port=8000,
+        env={"EXAMPLE": "value"},
+        network="harnyx-net",
+        host_container_url=_HOST_CONTAINER_URL,
+    )
+
+    deployment = manager.start(options)
+
+    run_args, _ = runner.commands[0]
+    assert run_args[4:10] == [
+        "-d",
+        "--rm",
+        "--name",
+        "sandbox-demo",
+        "-p",
+        "127.0.0.1:9000:8000",
+    ]
+    assert deployment.base_url == "http://127.0.0.1:9000"
+    assert created_clients[0].base_url == "http://127.0.0.1:9000"
+
+
+def test_docker_sandbox_manager_does_not_use_probe_host_as_bind_host() -> None:
+    runner = RecordingRunner()
+    created_clients: list[DummyClient] = []
+
+    def client_factory(base_url: str, host_container_url: str | None) -> DummyClient:
+        client = DummyClient(base_url, host_container_url)
+        created_clients.append(client)
+        return client
+
+    manager = DockerSandboxManager(
+        docker_binary="docker",
+        host="host.docker.internal",
+        command_runner=runner,
+        client_factory=client_factory,
+    )
+
+    options = SandboxOptions(
+        image="harnyx/sandbox:demo",
+        container_name="sandbox-demo",
+        host_port=9000,
+        container_port=8000,
+        network="harnyx-net",
+        host_container_url=_HOST_CONTAINER_URL,
+    )
+
+    deployment = manager.start(options)
+
+    run_args, _ = runner.commands[0]
+    assert run_args[9] == "9000:8000"
+    assert "host.docker.internal:9000:8000" not in run_args
+    assert deployment.base_url == "http://host.docker.internal:9000"
+    assert created_clients[0].base_url == "http://host.docker.internal:9000"
+
+
+def test_docker_manager_skips_port_mapping_when_host_port_missing() -> None:
+    runner = RecordingRunner()
+
+    def client_factory(base_url: str, host_container_url: str | None) -> DummyClient:
+        return DummyClient(base_url, host_container_url)
+
+    manager = DockerSandboxManager(
+        docker_binary="docker",
+        host="127.0.0.1",
+        command_runner=runner,
+        client_factory=client_factory,
+    )
+
+    options = SandboxOptions(
+        image="harnyx/sandbox:demo",
+        container_name="sandbox-demo",
+        host_port=None,
+        container_port=8000,
+        network="harnyx-net",
+        host_container_url=_HOST_CONTAINER_URL,
+    )
+
+    deployment = manager.start(options)
+    run_args, _ = runner.commands[0]
+    assert "-p" not in run_args
+    assert "--network" in run_args
+    assert deployment.base_url == "http://172.18.0.2:8000"
+    manager.stop(deployment)
+
+
+def test_docker_manager_mounts_volumes() -> None:
+    runner = RecordingRunner()
+
+    def client_factory(base_url: str, host_container_url: str | None) -> DummyClient:
+        return DummyClient(base_url, host_container_url)
+
+    manager = DockerSandboxManager(
+        docker_binary="docker",
+        host="127.0.0.1",
+        command_runner=runner,
+        client_factory=client_factory,
+    )
+
+    options = SandboxOptions(
+        image="harnyx/sandbox:demo",
+        container_name="sandbox-demo",
+        volumes=(("/host/agent.py", "/workspace/agent.py", "ro"),),
+        host_container_url=_HOST_CONTAINER_URL,
+    )
+
+    deployment = manager.start(options)
+    run_args, _ = runner.commands[0]
+    assert "-v" in run_args
+    volume_arg_index = run_args.index("-v") + 1
+    assert run_args[volume_arg_index] == "/host/agent.py:/workspace/agent.py:ro"
+    manager.stop(deployment)
+
+
+def test_docker_manager_requires_network_when_host_port_missing() -> None:
+    manager = DockerSandboxManager()
+    options = SandboxOptions(
+        image="harnyx/sandbox:demo",
+        container_name="sandbox-demo",
+        host_port=None,
+        host_container_url=_HOST_CONTAINER_URL,
+    )
+    with pytest.raises(ValueError):
+        manager.start(options)
+
+
+def test_docker_manager_adds_extra_hosts() -> None:
+    runner = RecordingRunner()
+
+    def client_factory(base_url: str, host_container_url: str | None) -> DummyClient:
+        return DummyClient(base_url, host_container_url)
+
+    manager = DockerSandboxManager(
+        docker_binary="docker",
+        host="127.0.0.1",
+        command_runner=runner,
+        client_factory=client_factory,
+    )
+
+    options = SandboxOptions(
+        image="harnyx/sandbox:demo",
+        container_name="sandbox-demo",
+        extra_hosts=(("host.docker.internal", "host-gateway"),),
+        host_container_url=_HOST_CONTAINER_URL,
+    )
+
+    deployment = manager.start(options)
+    run_args, _ = runner.commands[0]
+    assert "--add-host" in run_args
+    host_arg_index = run_args.index("--add-host") + 1
+    assert run_args[host_arg_index] == "host.docker.internal:host-gateway"
+    manager.stop(deployment)
+
+
+def test_docker_manager_sets_seccomp_profile() -> None:
+    runner = RecordingRunner()
+
+    def client_factory(base_url: str, host_container_url: str | None) -> DummyClient:
+        return DummyClient(base_url, host_container_url)
+
+    manager = DockerSandboxManager(
+        docker_binary="docker",
+        host="127.0.0.1",
+        command_runner=runner,
+        client_factory=client_factory,
+    )
+
+    seccomp_path = "/workspace/runtime-seccomp.json"
+    options = SandboxOptions(
+        image="harnyx/sandbox:demo",
+        container_name="sandbox-demo",
+        seccomp_profile=seccomp_path,
+        host_container_url=_HOST_CONTAINER_URL,
+    )
+
+    deployment = manager.start(options)
+    run_args, _ = runner.commands[0]
+    assert "--security-opt" in run_args
+    opt_index = run_args.index("--security-opt") + 1
+    assert run_args[opt_index] == f"seccomp={seccomp_path}"
+    manager.stop(deployment)
+
+
+def test_start_cleans_up_container_on_healthz_failure(monkeypatch) -> None:
+    runner = RecordingRunner()
+    created_clients: list[DummyClient] = []
+
+    def client_factory(base_url: str, host_container_url: str | None) -> DummyClient:
+        client = DummyClient(base_url, host_container_url)
+        created_clients.append(client)
+        return client
+
+    manager = DockerSandboxManager(
+        docker_binary="docker",
+        host="127.0.0.1",
+        command_runner=runner,
+        client_factory=client_factory,
+    )
+
+    def fail_healthz(*args, **kwargs) -> None:
+        raise RuntimeError("healthz timeout")
+
+    monkeypatch.setattr(manager, "_wait_for_healthz", fail_healthz)
+
+    options = SandboxOptions(
+        image="harnyx/sandbox:demo",
+        container_name="sandbox-demo",
+        host_port=9000,
+        container_port=8000,
+        wait_for_healthz=True,
+        network="harnyx-net",
+        host_container_url=_HOST_CONTAINER_URL,
+    )
+
+    with pytest.raises(RuntimeError, match="healthz timeout"):
+        manager.start(options)
+
+    run_args, _ = runner.commands[0]
+    assert run_args[4:8] == ["-d", "--rm", "--name", "sandbox-demo"]
+    stop_args, _ = runner.commands[1]
+    assert stop_args == ["docker", "stop", "-t", "5", "container123"]
+    assert created_clients[0].closed is True
+
+
+def test_resolve_sandbox_host_container_url_falls_back_to_mountinfo_container_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stale_hostname = "6aadabeb0b48"
+    live_container_id = "7ffe3b2775de"
+    calls: list[str] = []
+
+    def fake_exists(self) -> bool:
+        return str(self) == "/.dockerenv"
+
+    def fake_read_text(self, *, encoding: str = "utf-8") -> str:
+        assert encoding == "utf-8"
+        if str(self) != "/proc/self/mountinfo":
+            raise AssertionError(f"unexpected read_text path: {self}")
+        return (
+            "1533 1522 8:1 "
+            f"/var/lib/docker/containers/{live_container_id}/hostname "
+            "/etc/hostname rw,relatime - ext4 /dev/sda1 rw,commit=30\n"
+        )
+
+    def fake_run(args: list[str], **kwargs: object) -> CompletedProcess[str]:
+        calls.append(args[-1])
+        if args[-1] == stale_hostname:
+            raise subprocess.CalledProcessError(
+                returncode=1,
+                cmd=args,
+                stderr=f"error: no such object: {stale_hostname}",
+            )
+        if args[-1] == live_container_id:
+            return subprocess_completed(args, '{"harnyx-net":{"IPAddress":"172.19.0.2"}}\n')
+        raise AssertionError(f"unexpected docker target: {args[-1]}")
+
+    monkeypatch.setenv("HOSTNAME", stale_hostname)
+    monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+    monkeypatch.setattr(docker_module.Path, "exists", fake_exists)
+    monkeypatch.setattr(docker_module.Path, "read_text", fake_read_text)
+    monkeypatch.setattr(docker_module.subprocess, "run", fake_run)
+
+    result = resolve_sandbox_host_container_url(
+        docker_binary="docker",
+        sandbox_network="harnyx-net",
+        rpc_port=8100,
+    )
+
+    assert result == "http://172.19.0.2:8100"
+    assert calls == [stale_hostname, live_container_id]
+
+
+def test_resolve_sandbox_host_container_url_raises_when_hostname_and_mountinfo_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stale_hostname = "6aadabeb0b48"
+
+    def fake_exists(self) -> bool:
+        return str(self) == "/.dockerenv"
+
+    def fake_read_text(self, *, encoding: str = "utf-8") -> str:
+        assert encoding == "utf-8"
+        if str(self) != "/proc/self/mountinfo":
+            raise AssertionError(f"unexpected read_text path: {self}")
+        return "1522 1498 0:95 / / rw,relatime - overlay overlay rw\n"
+
+    def fake_run(args: list[str], **kwargs: object) -> CompletedProcess[str]:
+        raise subprocess.CalledProcessError(
+            returncode=1,
+            cmd=args,
+            stderr=f"error: no such object: {stale_hostname}",
+        )
+
+    monkeypatch.setenv("HOSTNAME", stale_hostname)
+    monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+    monkeypatch.setattr(docker_module.Path, "exists", fake_exists)
+    monkeypatch.setattr(docker_module.Path, "read_text", fake_read_text)
+    monkeypatch.setattr(docker_module.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match=f"container={stale_hostname}"):
+        resolve_sandbox_host_container_url(
+            docker_binary="docker",
+            sandbox_network="harnyx-net",
+            rpc_port=8100,
+        )

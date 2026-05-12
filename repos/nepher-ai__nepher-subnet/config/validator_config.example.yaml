@@ -1,0 +1,11 @@
+# Nepher Validator Configuration
+
+# Tournament API key
+tournament:
+  api_key: "your_api_key_here"
+
+# Wallet configuration
+wallet:
+  name: "${WALLET_NAME:-validator}"      # Wallet name (default: validator)
+  hotkey: "${WALLET_HOTKEY:-default}"    # Hotkey name (default: default)
+  # path: "/custom/wallet/path"          # Optional custom path

@@ -1,0 +1,36 @@
+services:
+  validator:
+    image: ghcr.io/bitrecs/bitrecs-v2:testnet-latest
+    container_name: bitrecs-validator
+    restart: unless-stopped
+    privileged: true  # Allow DinD access
+    user: root  # Run as root for socket access
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
+      - ~/bitrecs/data:/app/data
+      - /var/log/bitrecs/validator:/var/log/bitrecs/validator
+      - ~/.cache/huggingface/datasets:/root/.cache/huggingface/datasets
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - BITRECS_ENV=testnet
+    networks:
+      - bitrecs-network
+    command: ["uv", "run", "/app/validator/bitrecs_validator.py"]
+
+  watchtower:
+    image: nickfedor/watchtower
+    container_name: bitrecs-watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - WATCHTOWER_CLEANUP=true
+    command: --interval 120 bitrecs-validator
+
+networks:
+  bitrecs-network:
+    external: false

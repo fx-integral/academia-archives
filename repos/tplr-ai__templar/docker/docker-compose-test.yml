@@ -1,0 +1,143 @@
+networks:
+  test:
+    driver: bridge
+
+services:
+  miner1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: templar-miner-M111
+    network_mode: host
+    volumes:
+      - ~/.bittensor/wallets:/root/.bittensor/wallets
+      - ./logs:/app/logs
+      - ../${DATASET_BINS_PATH:-tokenized}:/app/${DATASET_BINS_PATH:-tokenized}
+    environment:
+      NODE_TYPE: miner
+      WALLET_NAME: ${WALLET_NAME:-miner1}
+      WALLET_HOTKEY: ${WALLET_HOTKEY:-default}
+      CUDA_DEVICE: cuda:1
+      NETWORK: ${NETWORK:-local}
+      DEBUG: 'true'
+      WANDB_API_KEY: ${WANDB_API_KEY}
+      PROJECT: ${PROJECT}
+      NETUID: ${NETUID:-2}
+      HOST_CUDA_VERSION: 12.6
+      R2_GRADIENTS_ACCOUNT_ID: ${R2_GRADIENTS_ACCOUNT_ID}
+      R2_GRADIENTS_BUCKET_NAME: ${R2_GRADIENTS_BUCKET_NAME}
+      R2_GRADIENTS_READ_ACCESS_KEY_ID: ${R2_GRADIENTS_READ_ACCESS_KEY_ID}
+      R2_GRADIENTS_READ_SECRET_ACCESS_KEY: ${R2_GRADIENTS_READ_SECRET_ACCESS_KEY}
+      R2_GRADIENTS_WRITE_ACCESS_KEY_ID: ${R2_GRADIENTS_WRITE_ACCESS_KEY_ID}
+      R2_GRADIENTS_WRITE_SECRET_ACCESS_KEY: ${R2_GRADIENTS_WRITE_SECRET_ACCESS_KEY}
+      R2_AGGREGATOR_ACCOUNT_ID: ${R2_AGGREGATOR_ACCOUNT_ID}
+      R2_AGGREGATOR_BUCKET_NAME: ${R2_AGGREGATOR_BUCKET_NAME}
+      R2_AGGREGATOR_READ_ACCESS_KEY_ID: ${R2_AGGREGATOR_READ_ACCESS_KEY_ID}
+      R2_AGGREGATOR_READ_SECRET_ACCESS_KEY: ${R2_AGGREGATOR_READ_SECRET_ACCESS_KEY}
+      R2_AGGREGATOR_WRITE_ACCESS_KEY_ID: ${R2_AGGREGATOR_WRITE_ACCESS_KEY_ID:-""}
+      R2_AGGREGATOR_WRITE_SECRET_ACCESS_KEY: ${R2_AGGREGATOR_WRITE_SECRET_ACCESS_KEY:-""}
+      R2_DATASET_ACCOUNT_ID: ${R2_DATASET_ACCOUNT_ID}
+      R2_DATASET_BUCKET_NAME: ${R2_DATASET_BUCKET_NAME}
+      R2_DATASET_READ_ACCESS_KEY_ID: ${R2_DATASET_READ_ACCESS_KEY_ID}
+      R2_DATASET_READ_SECRET_ACCESS_KEY: ${R2_DATASET_READ_SECRET_ACCESS_KEY}
+      DATASET_BINS_PATH: ${DATASET_BINS_PATH:-tokenized/}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: [ '3' ]
+              capabilities: [ gpu ]
+
+  miner2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: templar-miner-M222
+    network_mode: host
+    volumes:
+      - ~/.bittensor/wallets:/root/.bittensor/wallets
+      - ./logs:/app/logs
+      - ../${DATASET_BINS_PATH:-tokenized}:/app/${DATASET_BINS_PATH:-tokenized}
+    environment:
+      NODE_TYPE: miner
+      WALLET_NAME: ${WALLET_NAME:-miner2}
+      WALLET_HOTKEY: ${WALLET_HOTKEY:-default}
+      CUDA_DEVICE: cuda:2
+      NETWORK: ${NETWORK:-local}
+      DEBUG: 'true'
+      WANDB_API_KEY: ${WANDB_API_KEY}
+      PROJECT: ${PROJECT}
+      NETUID: ${NETUID:-2}
+      HOST_CUDA_VERSION: 12.6
+      R2_GRADIENTS_ACCOUNT_ID: ${R2_GRADIENTS_ACCOUNT_ID}
+      R2_GRADIENTS_BUCKET_NAME: ${R2_GRADIENTS_BUCKET_NAME}
+      R2_GRADIENTS_READ_ACCESS_KEY_ID: ${R2_GRADIENTS_READ_ACCESS_KEY_ID}
+      R2_GRADIENTS_READ_SECRET_ACCESS_KEY: ${R2_GRADIENTS_READ_SECRET_ACCESS_KEY}
+      R2_GRADIENTS_WRITE_ACCESS_KEY_ID: ${R2_GRADIENTS_WRITE_ACCESS_KEY_ID}
+      R2_GRADIENTS_WRITE_SECRET_ACCESS_KEY: ${R2_GRADIENTS_WRITE_SECRET_ACCESS_KEY}
+      R2_AGGREGATOR_ACCOUNT_ID: ${R2_AGGREGATOR_ACCOUNT_ID}
+      R2_AGGREGATOR_BUCKET_NAME: ${R2_AGGREGATOR_BUCKET_NAME}
+      R2_AGGREGATOR_READ_ACCESS_KEY_ID: ${R2_AGGREGATOR_READ_ACCESS_KEY_ID}
+      R2_AGGREGATOR_READ_SECRET_ACCESS_KEY: ${R2_AGGREGATOR_READ_SECRET_ACCESS_KEY}
+      R2_AGGREGATOR_WRITE_ACCESS_KEY_ID: ${R2_AGGREGATOR_WRITE_ACCESS_KEY_ID:-""}
+      R2_AGGREGATOR_WRITE_SECRET_ACCESS_KEY: ${R2_AGGREGATOR_WRITE_SECRET_ACCESS_KEY:-""}
+      R2_DATASET_ACCOUNT_ID: ${R2_DATASET_ACCOUNT_ID}
+      R2_DATASET_BUCKET_NAME: ${R2_DATASET_BUCKET_NAME}
+      R2_DATASET_READ_ACCESS_KEY_ID: ${R2_DATASET_READ_ACCESS_KEY_ID}
+      R2_DATASET_READ_SECRET_ACCESS_KEY: ${R2_DATASET_READ_SECRET_ACCESS_KEY}
+      DATASET_BINS_PATH: ${DATASET_BINS_PATH:-tokenized/}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: [ '1' ]
+              capabilities: [ gpu ]
+
+  validator:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: templar-validator-test
+    network_mode: host
+    volumes:
+      - ~/.bittensor/wallets:/root/.bittensor/wallets
+      - ./logs:/app/logs
+      - ../${DATASET_BINS_PATH:-tokenized}:/app/${DATASET_BINS_PATH:-tokenized}
+    environment:
+      NODE_TYPE: validator
+      WALLET_NAME: ${WALLET_NAME:-validator}
+      WALLET_HOTKEY: ${WALLET_HOTKEY:-default}
+      CUDA_DEVICE: ${CUDA_DEVICE:-cuda:0}
+      NETWORK: local
+      DEBUG: 'true'
+      WANDB_API_KEY: ${WANDB_API_KEY}
+      PROJECT: ${PROJECT}
+      NETUID: ${NETUID}
+      HOST_CUDA_VERSION: 12.6
+      R2_GRADIENTS_ACCOUNT_ID: ${R2_GRADIENTS_ACCOUNT_ID}
+      R2_GRADIENTS_BUCKET_NAME: ${R2_GRADIENTS_BUCKET_NAME}
+      R2_GRADIENTS_READ_ACCESS_KEY_ID: ${R2_GRADIENTS_READ_ACCESS_KEY_ID}
+      R2_GRADIENTS_READ_SECRET_ACCESS_KEY: ${R2_GRADIENTS_READ_SECRET_ACCESS_KEY}
+      R2_GRADIENTS_WRITE_ACCESS_KEY_ID: ${R2_GRADIENTS_WRITE_ACCESS_KEY_ID}
+      R2_GRADIENTS_WRITE_SECRET_ACCESS_KEY: ${R2_GRADIENTS_WRITE_SECRET_ACCESS_KEY}
+      R2_AGGREGATOR_ACCOUNT_ID: ${R2_AGGREGATOR_ACCOUNT_ID}
+      R2_AGGREGATOR_BUCKET_NAME: ${R2_AGGREGATOR_BUCKET_NAME}
+      R2_AGGREGATOR_READ_ACCESS_KEY_ID: ${R2_AGGREGATOR_READ_ACCESS_KEY_ID}
+      R2_AGGREGATOR_READ_SECRET_ACCESS_KEY: ${R2_AGGREGATOR_READ_SECRET_ACCESS_KEY}
+      R2_AGGREGATOR_WRITE_ACCESS_KEY_ID: ${R2_AGGREGATOR_WRITE_ACCESS_KEY_ID:-""}
+      R2_AGGREGATOR_WRITE_SECRET_ACCESS_KEY: ${R2_AGGREGATOR_WRITE_SECRET_ACCESS_KEY:-""}
+      R2_DATASET_ACCOUNT_ID: ${R2_DATASET_ACCOUNT_ID}
+      R2_DATASET_BUCKET_NAME: ${R2_DATASET_BUCKET_NAME}
+      R2_DATASET_READ_ACCESS_KEY_ID: ${R2_DATASET_READ_ACCESS_KEY_ID}
+      R2_DATASET_READ_SECRET_ACCESS_KEY: ${R2_DATASET_READ_SECRET_ACCESS_KEY}
+      DATASET_BINS_PATH: ${DATASET_BINS_PATH:-tokenized/}
+    restart: always
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: [ '2' ]
+              capabilities: [ gpu ]

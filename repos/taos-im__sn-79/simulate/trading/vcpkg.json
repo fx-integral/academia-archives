@@ -1,0 +1,37 @@
+{
+    "name": "taosim",
+    "version": "0.0.2",
+    "dependencies": [
+        "bde",
+        "benchmark",
+        "boost-accumulators",
+        "boost-asio",
+        "boost-beast",
+        "boost-bimap",
+        "boost-interprocess",
+        "boost-math",
+        "boost-signals2",
+        "boost-uuid",
+        "cli11",
+        "date",
+        "eigen3",
+        "fmt",
+        "gtest",
+        "magic-enum",
+        "mimalloc",
+        "msgpack",
+        "pugixml",
+        "pybind11",
+        "range-v3",
+        "rapidcsv",
+        "rapidjson",
+        "spdlog"
+    ],
+    "builtin-baseline": "e140b1fde236eb682b0d47f905e65008a191800f",
+    "overrides": [
+        {
+            "name": "bde",
+            "version": "3.124.0.0"
+        }
+    ]
+}

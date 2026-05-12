@@ -1,0 +1,62 @@
+{
+  "base-sepolia": {
+    "SignalCommitment": {
+      "address": "0x4712479Ba57c9ED40405607b2B18967B359209C0",
+      "startBlock": 38024000
+    },
+    "Escrow": {
+      "address": "0xb43BA175a6784973eB3825acF801Cd7920ac692a",
+      "startBlock": 38024000
+    },
+    "Collateral": {
+      "address": "0x71F0a8c6BBFc4C83c5203807fAdd305B0C0F4C88",
+      "startBlock": 38024000
+    },
+    "Account": {
+      "address": "0x4546354Dd32a613B76Abf530F81c8359e7cE440B",
+      "startBlock": 38024000
+    },
+    "Audit": {
+      "address": "0xCa7e642FE31BA83a7a857644E8894c1B93a2a44E",
+      "startBlock": 38024000
+    },
+    "CreditLedger": {
+      "address": "0xA65296cd11B65629641499024AD905FAcAB64C3E",
+      "startBlock": 38024000
+    },
+    "LineOutcomeRegistry": {
+      "address": "0x2AB6ef76464D25713dfc3b9613f6AD2d07218352",
+      "startBlock": 41282134
+    }
+  },
+  "base": {
+    "SignalCommitment": {
+      "address": "0x0000000000000000000000000000000000000000",
+      "startBlock": 0
+    },
+    "Escrow": {
+      "address": "0x0000000000000000000000000000000000000000",
+      "startBlock": 0
+    },
+    "Collateral": {
+      "address": "0x0000000000000000000000000000000000000000",
+      "startBlock": 0
+    },
+    "Account": {
+      "address": "0x0000000000000000000000000000000000000000",
+      "startBlock": 0
+    },
+    "Audit": {
+      "address": "0x0000000000000000000000000000000000000000",
+      "startBlock": 0
+    },
+    "CreditLedger": {
+      "address": "0x0000000000000000000000000000000000000000",
+      "startBlock": 0
+    },
+    "LineOutcomeRegistry": {
+      "address": "0x0000000000000000000000000000000000000000",
+      "startBlock": 0
+    }
+  }
+}

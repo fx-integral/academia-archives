@@ -1,0 +1,277 @@
+import { Router } from 'express'
+import { log, make_retryable, sanetise_ipv4, sanetise_string } from 'mentie'
+import { cooldown_in_s, retry_times } from "../../modules/networking/routing.js"
+import { annotate_worker_with_defaults, is_valid_worker } from '../../modules/validations.js'
+import { find_clashing_workers, write_workers } from '../../modules/database/workers.js'
+import { is_miner_request } from '../../modules/networking/miners.js'
+import { is_validator_request } from '../../modules/networking/validators.js'
+import { write_mining_pool_metadata } from '../../modules/database/mining_pools.js'
+import { map_ips_to_geodata } from '../../modules/geolocation/ip_mapping.js'
+import { resolve_domain_to_ip } from '../../modules/networking/network.js'
+import { ip_geodata } from '../../modules/geolocation/helpers.js'
+import { find_first_valid_workers_by_ip } from '../../modules/scoring/score_workers.js'
+const { CI_MODE } = process.env
+
+export const router = Router()
+
+/**
+ * Returns true when the payload looks like a worker object.
+ * @param {unknown} worker - Worker payload from the miner.
+ * @returns {boolean} Whether the payload is an object-like worker entry.
+ */
+const is_worker_object = worker => {
+
+    if( !worker || typeof worker !== `object` ) return false
+    if( Array.isArray( worker ) ) return false
+    return true
+
+}
+
+/**
+ * Sanitises a worker IP without rejecting the full worker object.
+ * Invalid or missing IPs are left untouched so later validation can drop them.
+ * @param {Object} worker - Worker payload from the miner.
+ * @returns {Object} Worker with a normalised IP when valid.
+ */
+const sanitise_worker_ip = worker => {
+
+    if( !worker || typeof worker !== `object` ) return worker
+
+    try {
+        const sanitised_ip = sanetise_ipv4( { ip: worker.ip, validate: true, error_on_invalid: false } )
+        if( !sanitised_ip ) return worker
+        return { ...worker, ip: sanitised_ip }
+    } catch {
+        return worker
+    }
+
+}
+
+/**
+ * Handle the submission of worker lists from mining pools
+ * @params {Object} req.body.workers - Array of worker objects with properties: ip, country_code
+ */
+router.post( '/workers', async ( req, res ) => {
+
+    // This endpoint is only for miners
+    const { uid: mining_pool_uid, ip: mining_pool_ip } = await is_miner_request( req )
+    if( !mining_pool_uid ) return res.status( 403 ).json( { error: `Requester ${ mining_pool_ip } not a known miner` } )
+
+    const handle_route = async () => {
+
+        // Get workers from the request
+        let { workers=[] } = req.body || {}
+
+        // Ensure workers is an array
+        if( !Array.isArray( workers ) ) throw new Error( `Invalid workers format, must be an array` )
+        log.info( `Received ${ workers.length } workers from mining pool ${ mining_pool_uid }@${ mining_pool_ip }, example: `, workers[0] )
+
+        // Drop malformed entries before any property access or network lookups
+        const worker_objects = workers.filter( is_worker_object )
+        const dropped_worker_count = workers.length - worker_objects.length
+        if( dropped_worker_count ) log.warn( `Dropping ${ dropped_worker_count } non-object worker entries before preprocessing` )
+
+        // Normalise IPs before any geodata or peer-validator lookups use miner-supplied values
+        workers = worker_objects.map( sanitise_worker_ip )
+
+        // Check that the claimed countries and datacenter status are valid according to our db
+        const workers_geo = await Promise.all( workers.map( async worker => {
+
+            const sanitised_ip = sanetise_ipv4( { ip: worker.ip, validate: true, error_on_invalid: false } )
+            if( !sanitised_ip ) return null
+
+            try {
+                const geodata = await ip_geodata( sanitised_ip )
+                if( !geodata ) return null
+                const { country_code, connection_type, datacenter } = geodata
+                return { ip: sanitised_ip, country_code, connection_type, datacenter }
+            } catch ( e ) {
+                log.warn( `Failed to resolve geodata for worker ${ sanitised_ip }: ${ e.message }` )
+                return null
+            }
+
+        } ) )
+
+        // Filter out workers where the mining_pool_url ip does not match the mining_pool_ip
+        const pool_urls_to_check = [ ...new Set( workers
+            .map( worker => worker.mining_pool_url )
+            .filter( url => typeof url === `string` && url.length )
+        ) ]
+        const pool_url_ip_map = {}
+        await Promise.all( pool_urls_to_check.map( async ( url ) => {
+            try {
+                const { ip } = await resolve_domain_to_ip( { domain: url } )
+                pool_url_ip_map[ url ] = ip
+            } catch ( e ) {
+                log.warn( `Failed to resolve mining pool url ${ url } to IP: ${ e.message }` )
+            }
+        } ) )
+        workers = workers.filter( worker => {
+            const pool_url = worker.mining_pool_url
+            const expected_ip = pool_url_ip_map[ pool_url ]
+            if( expected_ip !== mining_pool_ip ) {
+                log.warn( `Worker ${ worker.ip } claims mining pool url ${ pool_url } which resolves to ${ expected_ip }, expected ${ mining_pool_ip }. Skipping worker.` )
+                return false
+            }
+            return true
+        } )
+        log.info( `Filtered workers to ${ workers.length } entries after verifying mining pool URL IPs` )
+
+        // Overwrite the claimed country codes and track mismatches
+        const geo_mismatches = []
+        workers = workers.map( ( worker ) => {
+
+            // Check is claimed data matches ours
+            const geo = workers_geo.find( g => g?.ip === worker?.ip )
+            if( !geo ) return worker
+            const country_matches = worker.country_code == geo.country_code
+            const connection_type_matches = worker.connection_type == geo.connection_type
+
+            // On match, keep
+            if( connection_type_matches && country_matches ) return worker
+
+            // On mismatch, log and overwrite
+            geo_mismatches.push( { worker, geo } )
+            return { ...worker, ...geo }
+
+        } )
+
+        // Clean up the worker data
+        workers = workers.reduce( ( acc, worker ) => {
+
+            // Skip invalid
+            worker = annotate_worker_with_defaults( worker )
+            if( !is_valid_worker( worker ) ) return acc
+            
+            // Sanetise the IP address
+            let { ip, country_code } = worker || {}
+            ip = sanetise_ipv4( { ip, validate: true } )
+
+            // Force override the minining pool uid to the one we know to be real
+            worker.mining_pool_uid = mining_pool_uid
+            acc.push( { ...worker, ip, country_code } )
+
+            return acc
+
+        }, [] )
+        log.info( `Sanetised worker data, ${ workers.length } valid entries, example: `, workers[0] )
+
+        // Filter out clashing workers
+        const { clashing_workers, non_clashing_workers, clashes_with_workers } = await find_clashing_workers( { workers } )
+
+        // For the clashing workers, find the first matching winner
+        const cleared_clashing_workers = await find_first_valid_workers_by_ip( { workers: [ ...clashing_workers, ...clashes_with_workers ] } )
+
+        // Combine the cleared clashing workers with the non-clashing workers
+        workers = [ ...non_clashing_workers, ...cleared_clashing_workers ]
+        log.info( `Filtered out clashing workers, ${ workers.length } workers cleared to be registered` )
+
+        // Save worker ips to cache
+        const ips = workers.map( worker => worker.ip )
+        await map_ips_to_geodata( { ips, cache_prefix: `worker_`, prefix_merge: true } )
+
+        // Save workers to database
+        const write_result = await write_workers( { workers, mining_pool_uid, is_miner_broadcast: true } )
+        return { ...write_result, mining_pool_uid, mining_pool_ip }
+
+    }
+
+    try {
+
+        const retryable_handler = await make_retryable( handle_route, { retry_times, cooldown_in_s } )
+        const response_data = await retryable_handler()
+        return res.json( response_data )
+
+    } catch ( e ) {
+        
+        log.warn( `Error handling worker broadcast. Error:`, e )
+        return res.status( 200 ).json( { error: e.message, workers: req?.body?.workers } )
+
+    }
+} )
+
+
+/**
+ * Handle the submission of mining pool metadata from miners themselves
+ * Expected body: { protocol: 'http'|'https', url: String, port: Number }
+ */
+router.post( '/mining_pool', async ( req, res ) => {
+
+    // This endpoint is only for miners
+    const { uid: mining_pool_uid, ip: mining_pool_ip } = await is_miner_request( req )
+    if( !mining_pool_uid ) return res.status( 403 ).json( { error: `Requester ${ mining_pool_ip } not a known miner` } )
+
+    const handle_route = async () => {
+
+        // Extract and sanitise inputs
+        let { protocol, url, port } = req.body || {}
+        log.info( `Received mining pool metadata from miner ${ mining_pool_uid }@${ mining_pool_ip }:`, { protocol, url, port } )
+
+        // Fix misconfigurations
+        url = url?.replace( 'http://http://', 'http://' )?.replace( 'https://https://', 'https://' )
+
+        // Normalise
+        protocol = sanetise_string( protocol )
+        url = sanetise_string( url )
+        port = Number( port )
+        log.info( `Sanetised mining pool metadata:`, { protocol, url, port } )
+
+        // Validate inputs
+        if( !`${ protocol }`.match( /^https?/ ) ) throw new Error( `Invalid protocol: ${ protocol }` )
+
+        // Validate port
+        if( !Number.isInteger( port ) || port < 1 || port > 65535 ) throw new Error( `Invalid port: ${ port }` )
+
+        // Check that url resolved to the correct miner ip
+        const { ip } = await resolve_domain_to_ip( { domain: url } )
+        if( CI_MODE !== 'true' && ip !== mining_pool_ip ) throw new Error( `Domain ${ url } does not resolve to metagraph ip address`  )
+
+        // Save mining pool metadata
+        await write_mining_pool_metadata( { mining_pool_uid, mining_pool_ip, protocol, url, port } )
+
+        return { success: true, mining_pool_uid, mining_pool_ip }
+
+    }
+
+    try {
+
+        const retryable_handler = await make_retryable( handle_route, { retry_times, cooldown_in_s } )
+        const response_data = await retryable_handler()
+        return res.json( response_data )
+
+    } catch ( e ) {
+        log.warn( `Error handling mining_pool broadcast. Error:`, e )
+        return res.status( 200 ).json( { error: e.message } )
+    }
+} )
+
+
+/**
+ * Serve geodata to peer validators.
+ * Uses layers 1-3 only (cache + DB + MaxMind) to avoid recursive validator calls.
+ */
+router.get( '/geodata/:ip', async ( req, res ) => {
+
+    try {
+
+        // This endpoint is only for validators
+        const validator = await is_validator_request( req )
+        if( !validator?.uid ) return res.status( 403 ).json( { error: `Requester not a known validator` } )
+
+        // Sanetise and validate the IP parameter
+        const sanitised_ip = sanetise_ipv4( { ip: req.params.ip, validate: true } )
+        if( !sanitised_ip ) return res.status( 400 ).json( { error: `Invalid IP address` } )
+
+        const data = await ip_geodata( sanitised_ip, { authoritative_only: true } )
+
+        if( data ) return res.json( { success: true, data } )
+        return res.status( 404 ).json( { success: false, error: `No geodata available for this IP` } )
+
+    } catch ( e ) {
+
+        log.warn( `Error handling geodata request for ${ req.params?.ip }:`, e )
+        return res.status( 400 ).json( { error: e.message } )
+
+    }
+
+} )

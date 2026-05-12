@@ -1,0 +1,117 @@
+services:
+  node:
+    image: ghcr.io/one-covenant/templar:latest
+    container_name: templar-${NODE_TYPE:-miner}-${WALLET_HOTKEY}
+    restart: unless-stopped
+    runtime: nvidia
+    ipc: host
+    cap_add:
+      - SYS_PTRACE
+    volumes:
+      - ~/.bittensor/wallets:/root/.bittensor/wallets
+      - ./logs:/app/logs
+      - ./${DATASET_BINS_PATH:-tokenized}:/app/${DATASET_BINS_PATH:-tokenized}
+      - ./checkpoints:/app/checkpoints
+      - ./tmp:/tmp
+
+    environment:
+      - NODE_TYPE=${NODE_TYPE:-miner}
+      - WALLET_NAME=${WALLET_NAME}
+      - WALLET_HOTKEY=${WALLET_HOTKEY}
+      - CUDA_DEVICE=${CUDA_DEVICE:-cuda:0}
+      - NETWORK=${NETWORK:-finney}
+      - DEBUG=${DEBUG:-false}
+      - NETUID=${NETUID:-3}
+      - HF_TOKEN=${HF_TOKEN}
+      - WANDB_API_KEY=${WANDB_API_KEY}
+      - HOST_CUDA_VERSION=12.6
+      - TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+      - NCCL_DEBUG=INFO
+      - TORCH_DISTRIBUTED_DEBUG=DETAIL
+      - DP_SHARD=${DP_SHARD:-4}
+      - TP_DEGREE=${TP_DEGREE:-1}
+      - R2_GRADIENTS_ACCOUNT_ID=${R2_GRADIENTS_ACCOUNT_ID}
+      - R2_GRADIENTS_BUCKET_NAME=${R2_GRADIENTS_BUCKET_NAME}
+      - R2_GRADIENTS_READ_ACCESS_KEY_ID=${R2_GRADIENTS_READ_ACCESS_KEY_ID}
+      - R2_GRADIENTS_READ_SECRET_ACCESS_KEY=${R2_GRADIENTS_READ_SECRET_ACCESS_KEY}
+      - R2_GRADIENTS_WRITE_ACCESS_KEY_ID=${R2_GRADIENTS_WRITE_ACCESS_KEY_ID}
+      - R2_GRADIENTS_WRITE_SECRET_ACCESS_KEY=${R2_GRADIENTS_WRITE_SECRET_ACCESS_KEY}
+      - R2_AGGREGATOR_ACCOUNT_ID=${R2_AGGREGATOR_ACCOUNT_ID}
+      - R2_AGGREGATOR_BUCKET_NAME=${R2_AGGREGATOR_BUCKET_NAME}
+      - R2_AGGREGATOR_READ_ACCESS_KEY_ID=${R2_AGGREGATOR_READ_ACCESS_KEY_ID}
+      - R2_AGGREGATOR_READ_SECRET_ACCESS_KEY=${R2_AGGREGATOR_READ_SECRET_ACCESS_KEY}
+      - R2_AGGREGATOR_WRITE_ACCESS_KEY_ID=${R2_AGGREGATOR_WRITE_ACCESS_KEY_ID:-""}
+      - R2_AGGREGATOR_WRITE_SECRET_ACCESS_KEY=${R2_AGGREGATOR_WRITE_SECRET_ACCESS_KEY:-""}
+      - R2_DATASET_ACCOUNT_ID=${R2_DATASET_ACCOUNT_ID}
+      - R2_DATASET_BUCKET_NAME=${R2_DATASET_BUCKET_NAME}
+      - R2_DATASET_READ_ACCESS_KEY_ID=${R2_DATASET_READ_ACCESS_KEY_ID}
+      - R2_DATASET_READ_SECRET_ACCESS_KEY=${R2_DATASET_READ_SECRET_ACCESS_KEY}
+      - DATASET_BINS_PATH=${DATASET_BINS_PATH:-tokenized/}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: [ '0', '1', '2', '3' ]
+              capabilities: [ gpu ]
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  evaluator:
+    image: ghcr.io/one-covenant/templar:latest
+    container_name: templar-evaluator
+    restart: unless-stopped
+    volumes:
+      - ~/.bittensor/wallets:/root/.bittensor/wallets
+      - ./logs:/app/logs
+      - ./${CUSTOM_EVAL_PATH:-eval_dataset}:/app/${CUSTOM_EVAL_PATH:-eval_dataset}
+      - ./checkpoints:/app/checkpoints
+    runtime: nvidia
+    environment:
+      - NODE_TYPE=evaluator
+      - WALLET_NAME=dummy
+      - WALLET_HOTKEY=dummy
+      - NVIDIA_VISIBLE_DEVICES=${EVALUATOR_GPU_IDS:-4,5,6,7}
+      - NETWORK=${NETWORK:-finney}
+      - DEBUG=${DEBUG:-false}
+      - NETUID=${NETUID:-3}
+      - HF_TOKEN=${HF_TOKEN}
+      - WANDB_API_KEY=${WANDB_API_KEY}
+      - HOST_CUDA_VERSION=12.6
+      - EVAL_BATCH_SIZE=${EVAL_BATCH_SIZE:-4}
+      - INFLUXDB_TOKEN=${INFLUXDB_TOKEN}
+      - R2_GRADIENTS_ACCOUNT_ID=${R2_GRADIENTS_ACCOUNT_ID}
+      - R2_GRADIENTS_BUCKET_NAME=${R2_GRADIENTS_BUCKET_NAME}
+      - R2_GRADIENTS_READ_ACCESS_KEY_ID=${R2_GRADIENTS_READ_ACCESS_KEY_ID}
+      - R2_GRADIENTS_READ_SECRET_ACCESS_KEY=${R2_GRADIENTS_READ_SECRET_ACCESS_KEY}
+      - R2_GRADIENTS_WRITE_ACCESS_KEY_ID=${R2_GRADIENTS_WRITE_ACCESS_KEY_ID}
+      - R2_GRADIENTS_WRITE_SECRET_ACCESS_KEY=${R2_GRADIENTS_WRITE_SECRET_ACCESS_KEY}
+      - R2_AGGREGATOR_ACCOUNT_ID=${R2_AGGREGATOR_ACCOUNT_ID}
+      - R2_AGGREGATOR_BUCKET_NAME=${R2_AGGREGATOR_BUCKET_NAME}
+      - R2_AGGREGATOR_READ_ACCESS_KEY_ID=${R2_AGGREGATOR_READ_ACCESS_KEY_ID}
+      - R2_AGGREGATOR_READ_SECRET_ACCESS_KEY=${R2_AGGREGATOR_READ_SECRET_ACCESS_KEY}
+      - R2_AGGREGATOR_WRITE_ACCESS_KEY_ID=${R2_AGGREGATOR_WRITE_ACCESS_KEY_ID:-""}
+      - R2_AGGREGATOR_WRITE_SECRET_ACCESS_KEY=${R2_AGGREGATOR_WRITE_SECRET_ACCESS_KEY:-""}
+      - R2_DATASET_ACCOUNT_ID=${R2_DATASET_ACCOUNT_ID}
+      - R2_DATASET_BUCKET_NAME=${R2_DATASET_BUCKET_NAME}
+      - R2_DATASET_READ_ACCESS_KEY_ID=${R2_DATASET_READ_ACCESS_KEY_ID}
+      - R2_DATASET_READ_SECRET_ACCESS_KEY=${R2_DATASET_READ_SECRET_ACCESS_KEY}
+      - DATASET_BINS_PATH=${DATASET_BINS_PATH:-tokenized/}
+      - CUSTOM_EVAL_PATH=${CUSTOM_EVAL_PATH:-eval_dataset}
+      - EVAL_INTERVAL=${EVAL_INTERVAL:-600}
+      - EVAL_TASKS=${EVAL_TASKS:-arc_challenge,arc_easy,openbookqa,winogrande,piqa,hellaswag,mmlu}
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  watchtower:
+    image: containrrr/watchtower
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --interval 30 --cleanup --label-enable
+    restart: unless-stopped
+    environment:
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_LABEL_ENABLE=true
+      - WATCHTOWER_INCLUDE_RESTARTING=true
+      - REPO_USER=${GITHUB_USER}
+      - REPO_PASSWORD=${GITHUB_TOKEN}

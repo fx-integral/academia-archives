@@ -1,0 +1,1 @@
+cd node && npm run lint && npm run test

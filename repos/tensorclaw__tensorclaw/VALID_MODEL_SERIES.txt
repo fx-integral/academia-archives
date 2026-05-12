@@ -1,0 +1,11 @@
+# Supported Models for Subnet 92 (SN92)
+# To add a new model, please submit a Pull Request (PR) with your proposed implementation.
+gpt
+deepseek
+qwen
+kimi
+glm
+claude
+llama
+mistral
+gemini

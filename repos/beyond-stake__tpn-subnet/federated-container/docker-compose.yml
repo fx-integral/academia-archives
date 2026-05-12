@@ -1,0 +1,316 @@
+services:
+  # Main TPN Federated Application Container
+  tpn-federated:
+    image: "taofuprotocol/tpn-federated:${TPN_IMAGE_TAG:-latest}"
+    build:
+      context: .
+      dockerfile: tpn_federated.Dockerfile
+    container_name: tpn-federated
+    restart: unless-stopped
+    # .env note: environment variable interpolation is done with the .env in the folder where you run docker compose
+    # the env_file only passes into the container, meaning they do not get added in ${VAR} fields in docker-compose.yml
+    env_file:
+      - .env
+    environment:
+      # Shared - All node types
+      - LOG_LEVEL
+      - POSTGRES_HOST
+      - POSTGRES_USER
+      - POSTGRES_PASSWORD
+      - NODE_OPTIONS=--max-old-space-size=${CONTAINER_MAX_PROCESS_RAM_MB:-8192}
+      - SERVER_PUBLIC_PROTOCOL
+      - SERVER_PUBLIC_URL
+      - SERVER_PUBLIC_HOST
+      - SERVER_PUBLIC_PORT
+
+      # Validator and Mining pool
+      - MAXMIND_LICENSE_KEY
+      - IP2LOCATION_DOWNLOAD_TOKEN
+
+      # Mining pool only
+      - MINING_POOL_WEBSITE_URL
+      - MINING_POOL_REWARDS
+
+      # Worker only
+      - MINING_POOL_URL
+      - PAYMENT_ADDRESS_EVM
+      - PAYMENT_ADDRESS_BITTENSOR
+      - BROADCAST_MESSAGE
+      - CONTACT_METHOD
+      - WIREGUARD_PEER_COUNT=${WIREGUARD_PEER_COUNT:-253}
+      - WIREGUARD_SERVERPORT=${WIREGUARD_SERVERPORT:-51820}
+
+      # Networking so the container knows the docker network subnets
+      - TPN_INTERNAL_SUBNET
+      - TPN_EXTERNAL_SUBNET
+
+      # Development options
+      - FORCE_DESTROY_DATABASE
+      - CI_MODE
+      - SCORE_ON_START
+
+    volumes:
+      - ./wg_configs:/app/wg_configs
+      - maxmind_data:/app/node_modules/geoip-lite/data
+      - ip2location_data:/app/ip2location_data
+      - container_cache:/app/cache
+      - ../.git:/app/.git:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./dante_passwords:/passwords
+      - ./dante_regen_requests:/dante_regen_requests
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - tpn-internal
+      - tpn-external
+    ports:
+      - "127.0.0.1:57287:${SERVER_PUBLIC_PORT:-3000}" # Make this container available from localhost so the neuron can access it, hardcoded to :57287 for the neuron
+      - "${SERVER_PUBLIC_PORT:-3000}:${SERVER_PUBLIC_PORT:-3000}"
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+      - SYS_MODULE
+    devices:
+      - /dev/net/tun
+    security_opt:
+      - seccomp:unconfined
+    privileged: true
+    stdin_open: true
+    healthcheck:
+      test:
+        ["CMD", "curl", "-f", "http://localhost:${SERVER_PUBLIC_PORT:-3000}/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Reverse Proxy (SWAG)
+  swag:
+    image: lscr.io/linuxserver/swag:latest
+    container_name: swag
+    restart: unless-stopped
+    profiles:
+      - proxy
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ:-UTC}
+      - URL="${SWAG_DOMAIN_NAME}"
+      - VALIDATION=${SWAG_VALIDATION:-http}
+      - SUBDOMAINS=${SWAG_SUBDOMAINS:-www}
+      - CERTPROVIDER=${SWAG_CERTPROVIDER:-}
+      - DNSPLUGIN=${SWAG_DNSPLUGIN:-}
+      - PROPAGATION=${SWAG_PROPAGATION:-}
+      - EMAIL=${SWAG_EMAIL}
+      - ONLY_SUBDOMAINS=${SWAG_ONLY_SUBDOMAINS:-true}
+      - EXTRA_DOMAINS=${SWAG_EXTRA_DOMAINS:-}
+      - STAGING=${SWAG_STAGING:-false}
+      - DISABLE_SSL=${SWAG_DISABLE_SSL:-false}
+    volumes:
+      - ./swag:/config
+      - ./swag/nginx/default.conf:/config/nginx/site-confs/default.conf:ro
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      - tpn-external
+      - tpn-internal
+    depends_on:
+      tpn-federated:
+        condition: service_healthy
+
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-tpn}
+      - POSTGRES_USER=${POSTGRES_USER:-tpn}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_PORT=${POSTGRES_PORT:-5432}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./config/postgres/init:/docker-entrypoint-initdb.d
+    networks:
+      - tpn-internal
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-tpn} -d ${POSTGRES_DB:-tpn}",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # Watchtower - Automatic Updates
+  watchtower:
+    image: nickfedor/watchtower:latest
+    container_name: watchtower
+    restart: unless-stopped
+    environment:
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_POLL_INTERVAL=${WATCHTOWER_POLL_INTERVAL:-3600}
+      - WATCHTOWER_INCLUDE_STOPPED=true
+      - WATCHTOWER_REVIVE_STOPPED=false
+      - WATCHTOWER_NOTIFICATIONS=${WATCHTOWER_NOTIFICATIONS:-}
+      - WATCHTOWER_NOTIFICATION_URL=${WATCHTOWER_NOTIFICATION_URL:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - tpn-internal
+
+  # Autoheal - Container Health Monitor and Restarter
+  autoheal:
+    image: willfarrell/autoheal:latest
+    container_name: autoheal
+    restart: unless-stopped
+    environment:
+      - AUTOHEAL_CONTAINER_LABEL=all
+      - AUTOHEAL_INTERVAL=${AUTOHEAL_INTERVAL:-300}
+      - AUTOHEAL_START_PERIOD=${AUTOHEAL_START_PERIOD:-300}
+      - AUTOHEAL_DEFAULT_STOP_TIMEOUT=${AUTOHEAL_DEFAULT_STOP_TIMEOUT:-60}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - tpn-internal
+
+  # WireGuard VPN Container (Worker-specific)
+  # This container is only needed for worker nodes
+  wireguard:
+    image: "taofuprotocol/tpn-wireguard:${TPN_IMAGE_TAG:-latest}"
+    build:
+      context: .
+      dockerfile: tpn_wireguard.Dockerfile
+    container_name: wireguard
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ:-UTC}
+      - SERVERURL=${SERVER_PUBLIC_HOST:-auto}
+      - SERVERPORT=${WIREGUARD_SERVERPORT:-51820}
+      - PEERS=${WIREGUARD_PEER_COUNT:-253}
+      - PEERDNS=${WIREGUARD_PEERDNS:-auto}
+      - INTERNAL_SUBNET=${WIREGUARD_INTERNAL_SUBNET:-10.13.13.0}
+      - ALLOWEDIPS=${WIREGUARD_ALLOWEDIPS:-0.0.0.0/0}
+      - LOG_CONFS=${WIREGUARD_LOG_CONFS:-false}
+      - REGEN_MISSING_CONFIGS_INTERVAL=${WIREGUARD_REGEN_MISSING_CONFIGS_INTERVAL:-300}
+    volumes:
+      - ./wg_configs:/config
+      - /lib/modules:/lib/modules:ro
+    ports:
+      - "${WIREGUARD_SERVERPORT:-51820}:51820/udp"
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+      # Traffic obfuscation: TCP keepalive tuned to Windows defaults
+      - net.ipv4.tcp_keepalive_time=7200
+      - net.ipv4.tcp_keepalive_intvl=75
+      - net.ipv4.tcp_keepalive_probes=9
+    networks:
+      - tpn-external
+    profiles:
+      - worker
+    healthcheck:
+      test: ["CMD", "wg", "show"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  dante:
+    image: "taofuprotocol/tpn-dante:${TPN_IMAGE_TAG:-latest}"
+    build:
+      context: .
+      dockerfile: tpn_dante.Dockerfile
+    container_name: dante
+    restart: unless-stopped
+    environment:
+      - USER_COUNT=${DANTE_USER_COUNT:-256}
+      - PORT=${DANTE_PORT:-1080}
+    volumes:
+      - ./dante_passwords:/passwords
+      - ./dante_regen_requests:/dante_regen_requests
+      - dante_etc:/etc
+      - ./dante_logs:/var/log
+    ports:
+      - "${DANTE_PORT:-1080}:${DANTE_PORT:-1080}"
+    sysctls:
+      # Traffic obfuscation: TCP keepalive tuned to Windows defaults
+      - net.ipv4.tcp_keepalive_time=7200
+      - net.ipv4.tcp_keepalive_intvl=75
+      - net.ipv4.tcp_keepalive_probes=9
+    networks:
+      - tpn-external
+    profiles:
+      - worker
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost ${DANTE_PORT:-1080}"]
+      interval: 10s
+      timeout: 5s
+      start_period: 600s
+      retries: 3
+
+  # HTTP Proxy — bridges HTTP CONNECT to Dante SOCKS5 with the same credentials
+  tpn-3proxy:
+    image: "taofuprotocol/tpn-3proxy:${TPN_IMAGE_TAG:-latest}"
+    build:
+      context: .
+      dockerfile: tpn_3proxy.Dockerfile
+    container_name: tpn-3proxy
+    restart: unless-stopped
+    environment:
+      - PROXY_PORT=${HTTP_PROXY_PORT:-3128}
+      - DANTE_HOST=dante
+      - DANTE_PORT=${DANTE_PORT:-1080}
+    volumes:
+      - ./dante_passwords:/passwords:ro
+    ports:
+      - "${HTTP_PROXY_PORT:-3128}:${HTTP_PROXY_PORT:-3128}"
+    sysctls:
+      - net.ipv4.tcp_keepalive_time=7200
+      - net.ipv4.tcp_keepalive_intvl=75
+      - net.ipv4.tcp_keepalive_probes=9
+    networks:
+      - tpn-external
+    profiles:
+      - worker
+    depends_on:
+      dante:
+        condition: service_healthy
+
+networks:
+  # Internal network - has internal connectivity only, cannot reach internet or be reached from it
+  tpn-internal:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        # Subnet edits must be synced in: .env (so the container knows), AND either in environment variables where docker compose is started OR in the values hardcoded below (so docker-compose.yml interpolation works)
+        - subnet: ${TPN_INTERNAL_SUBNET:-172.20.0.0/16}
+          gateway: ${TPN_INTERNAL_GATEWAY:-172.20.0.1}
+
+  # External network - only contains the reverse proxy server
+  tpn-external:
+    driver: bridge
+    ipam:
+      config:
+        # Subnet edits must be synced in: .env (so the container knows), AND either in environment variables where docker compose is started OR in the values hardcoded below (so docker-compose.yml interpolation works)
+        - subnet: ${TPN_EXTERNAL_SUBNET:-172.21.0.0/16}
+          gateway: ${TPN_EXTERNAL_GATEWAY:-172.21.0.1}
+
+volumes:
+  postgres_data:
+  maxmind_data:
+  ip2location_data:
+  container_cache:
+  wireguard_config:
+  dante_etc:

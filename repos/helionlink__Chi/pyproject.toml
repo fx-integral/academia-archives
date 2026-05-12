@@ -1,0 +1,12 @@
+[project]
+name = "chi"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "bittensor>=8.0.0",
+    "bittensor-cli>=9.17.0",
+    "bittensor-wallet>=2.0.0",
+    "click>=8.0.0",
+]

@@ -1,0 +1,180 @@
+"""Typed training configuration, sourced from shared constants.
+
+Keeps a single source of truth while enabling injection and testing.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+
+from grail.protocol import constants as protocol
+from grail.shared import config as constants
+
+
+@dataclass
+class TrainingConfig:
+    """Hyperparameters and settings for training.
+
+    Values default from `grail.shared.config` to avoid duplication.
+    """
+
+    # Basic training parameters
+    lr: float = constants.TRAINER_LR
+    epochs: int = constants.TRAINER_EPOCHS
+    micro_batch_size: int = constants.TRAINER_MICRO_BATCH_SIZE
+    max_tokens_per_micro_batch: int = constants.TRAINER_MAX_TOKENS_PER_MICRO_BATCH
+    max_length: int = constants.TRAINER_MAX_LENGTH
+    grad_clip: float = constants.TRAINER_GRAD_CLIP
+    warmup_steps: int = constants.TRAINER_WARMUP_STEPS
+
+    # Loss coefficients
+    kl_coef: float = constants.TRAINER_KL_COEF
+    entropy_coef: float = constants.TRAINER_ENTROPY_COEF
+    kl_target: float = constants.TRAINER_KL_TARGET
+    kl_min: float = constants.TRAINER_KL_MIN
+    kl_max: float = constants.TRAINER_KL_MAX
+    kl_adapt_rate: float = constants.TRAINER_KL_ADAPT_RATE
+
+    # Gradient accumulation and clipping
+    grad_accum_steps: int = constants.TRAINER_GRAD_ACCUM_STEPS
+    effective_batch_size: int = constants.TRAINER_EFFECTIVE_BATCH_SIZE
+
+    # Advantage normalization and PPO clipping
+    adv_clip_percentile: float = constants.TRAINER_ADV_CLIP_PERCENTILE
+    ppo_clip_eps: float = constants.TRAINER_PPO_CLIP_EPS
+    ppo_clip_eps_upper: float = constants.TRAINER_PPO_CLIP_EPS_UPPER
+    logratio_clamp: float = constants.TRAINER_LOGRATIO_CLAMP
+
+    # Importance sampling
+    use_is: bool = constants.TRAINER_USE_IS
+    is_ratio_max: float = constants.TRAINER_IS_RATIO_MAX
+
+    # GRPO variant selection
+    grpo_variant: str = constants.GRPO_VARIANT
+
+    # Advantage estimation strategy (orthogonal to grpo_variant)
+    adv_estimator: str = constants.ADV_ESTIMATOR
+
+    # Gradient checkpointing for memory efficiency
+    use_gradient_checkpointing: bool = constants.TRAINER_USE_GRADIENT_CHECKPOINTING
+
+    # Sequence packing (eliminates padding waste, requires FA2)
+    use_sequence_packing: bool = constants.TRAINER_USE_SEQUENCE_PACKING
+
+    # torch.compile for training (fuses ops, reduces kernel launch overhead)
+    use_torch_compile: bool = constants.TRAINER_USE_TORCH_COMPILE
+
+    # Chunked logit computation (avoids materializing full vocab-sized tensors)
+    chunked_logits: bool = constants.TRAINER_CHUNKED_LOGITS
+    logit_chunk_size: int = constants.TRAINER_LOGIT_CHUNK_SIZE
+
+    # Data loading
+    rollouts_per_problem: int = protocol.ROLLOUTS_PER_PROBLEM
+
+    # Miner/data quality filters
+    group_adv_sum_tolerance: float = constants.TRAINER_GROUP_ADV_SUM_TOL
+    min_trusted_miners: int = constants.TRAINER_MIN_TRUSTED_MINERS
+
+    # GRPO two-stage filtering controls
+    grpo_max_groups: int = constants.GRPO_MAX_GROUPS
+    grpo_max_completion_tokens: int = constants.GRPO_MAX_COMPLETION_TOKENS
+    grpo_min_success_fraction: float = constants.GRPO_MIN_SUCCESS_FRACTION
+    grpo_min_reward_per_token: float = constants.GRPO_MIN_REWARD_PER_TOKEN
+    grpo_reward_per_token_drop_quantile: float = constants.GRPO_REWARD_PER_TOKEN_DROP_QUANTILE
+
+    # Replay buffer configuration
+    replay_buffer_enabled: bool = True
+    replay_buffer_max_windows: int = 2
+    replay_buffer_recent_fraction: float = 0.5
+    replay_buffer_decay_factor: float = 0.7
+    replay_buffer_max_groups_per_epoch: int = 64
+
+    # Parameter change tracking configuration
+    param_change_measure_interval: int = constants.PARAM_CHANGE_MEASURE_INTERVAL
+    param_change_threshold: float = constants.PARAM_CHANGE_THRESHOLD
+    param_change_track_per_layer: bool = constants.PARAM_CHANGE_TRACK_PER_LAYER
+    param_change_track_components: bool = constants.PARAM_CHANGE_TRACK_COMPONENTS
+    param_change_track_sign_flips: bool = constants.PARAM_CHANGE_TRACK_SIGN_FLIPS
+    param_change_relative_eps: float = constants.PARAM_CHANGE_RELATIVE_EPS
+
+    # Sparse quality analysis (runs at same interval as param tracking)
+    sparse_quality_enabled: bool = constants.SPARSE_QUALITY_ENABLED
+
+
+@dataclass
+class EvalConfig:
+    """Configuration for periodic evaluation cycles.
+
+    Defaults chosen to be safe and reasonably fast for initial integration.
+    """
+
+    enabled: bool = os.getenv("GRAIL_EVAL_ENABLED", "1").lower() in ("1", "true", "yes")
+    window_interval: int = 20
+    env_id: str | None = None  # If None, uses CURRENT_ENV_ID from constants
+    split: str = "val"  # dataset-backed envs (e.g., GSM8K, MBPP)
+    subset_size: int | None = None  # generative envs or capped dataset eval
+    seed_base: int = 2025
+    batch_size: int = 32  # Conservative for vLLM server: 8 tasks × 5 reps = 40 prompts/batch (prevent queue timeout)
+    replicates: int = 5  # for pass@k / mean@k curves
+    # Decoding configuration for evaluation (separate from training)
+    max_new_tokens: int = 8192
+    temperature: float = 0.8
+    top_p: float = 0.95
+    do_sample: bool = True
+    # Backend control: "hf" | "vllm" | "sglang"
+    backend: str = constants.INFERENCE_BACKEND
+    # sgLang server options (used when backend == "sglang")
+    server_host: str = "127.0.0.1"
+    server_port: int = 30000
+    start_server: bool = True  # Server runs in subprocess (avoids Gloo socket issues)
+    server_timeout: float = 180.0  # Increased from 120s to handle edge cases
+    server_trust_remote_code: bool = False
+    # vLLM server options (used when backend == "vllm")
+    # Path to isolated vLLM environment Python executable
+    # Override via GRAIL_VLLM_PYTHON env var for custom deployments
+    vllm_python_executable: str = field(
+        default_factory=lambda: os.getenv("GRAIL_VLLM_PYTHON", "tools/vllm-server/.venv/bin/python")
+    )
+    # vLLM module entrypoint (version-specific, may change across vLLM releases)
+    vllm_module_entrypoint: str = "vllm.entrypoints.openai.api_server"
+    # vLLM server memory and concurrency tuning (optimized for single A100)
+    # Best practices per vLLM docs: leave headroom for CUDA graph capture and KV cache
+    # See: https://docs.vllm.ai/en/v0.10.2/configuration/optimization.html
+    # - Lower gpu_memory_utilization (0.7–0.8) to leave room for graph allocation
+    # - Set max_num_seqs low enough to fit in available KV cache (target ~24 for safety)
+    # - Client concurrency at 50–70% of server max_num_seqs (avoid burst deadlock)
+    vllm_gpu_memory_utilization: float = (
+        0.95  # During eval, training model+optimizer are on CPU — full GPU available for vLLM
+    )
+    # KV cache precision control (vLLM): valid values typically include: 'auto', 'fp16', 'bf16', 'fp8'
+    # Note: 'fp32' is generally not supported for KV cache in vLLM V1 and will be rejected.
+    vllm_kv_cache_dtype: str = "auto"
+    vllm_max_model_len: int = 12288  # Supports ~4k-token prompts plus 8k-token completions
+    vllm_max_num_seqs: int = (
+        48  # 12288 max_model_len × 64 seqs = 786K KV tokens, fits in ~115GB KV cache at 0.95 util
+    )
+    vllm_max_concurrent_requests: int = 32  # 75% of max_num_seqs=64
+    # SGLang server memory and concurrency tuning (optimized for single A100)
+    sglang_python_executable: str = field(
+        default_factory=lambda: os.getenv("GRAIL_SGLANG_PYTHON", "")
+    )
+    sglang_mem_fraction_static: float = 0.90  # Fraction of GPU memory for SGLang
+    sglang_context_length: int = 12288  # Maximum sequence length
+    sglang_max_running_requests: int = 48  # Server-side: max concurrent requests
+    sglang_max_concurrent_requests: int = 32  # Client-side: max parallel HTTP requests
+    use_num_return_sequences: bool = False  # HF-only optimization
+    # Metrics aggregation: which k to report (subset of 1..replicates)
+    report_ks: tuple[int, ...] = (1, 5, 10)
+    # Optional: path to store JSONL predictions (None disables)
+    store_predictions_path: str | None = "logs/eval_samples"
+    # Sample storage: save k successful + k failed samples for debugging
+    sample_storage_k: int = 30
+    # Logging controls
+    # - Enable server logs to capture vLLM/SGLang startup errors for debugging
+    # - Optionally log a few sample completions per batch for visibility
+    stream_server_logs: bool = True
+    log_completions_n: int = 1
+    log_completions_max_chars: int = 4096
+    # vLLM: request chosen-token logprobs via OpenAI-compatible API (disabled by default)
+    vllm_return_chosen_logprobs: bool = False

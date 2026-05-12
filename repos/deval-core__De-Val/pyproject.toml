@@ -1,0 +1,35 @@
+[tool.poetry]
+name = "deval"
+version = "0.1.0"
+description = ""
+authors = ["Your Name <you@example.com>"]
+license = "mit"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10,<3.13"
+numpy = "^2.0.1"
+python-dotenv = "1.0.1"
+sympy = "1.12"
+torch = ">=2.0.0, !=2.0.1, !=2.1.0"
+wandb = "0.17.3"
+wikipedia = "1.4.0"
+wikipedia-sections = "2.0.0"
+pandas = "^2.2.2"
+boto3 = "^1.35.14"
+transformers = "^4.44.2"
+pyarmor = "8.5.11"
+uvicorn = "^0.30"
+rouge = "^1.0.1"
+bitsandbytes = "0.42.0"
+angle-emb = "^0.5.0"
+openai = "^1.51.0"
+bittensor = "9.0.1"
+docker = "^7.1.0"
+gitpython = "^3.1.43"
+substrate-interface = "^1.7.11"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

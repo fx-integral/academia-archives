@@ -1,0 +1,49 @@
+services:
+  # Miner service - can be deployed on a dedicated server
+  bst-miner:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        - SERVICE_TYPE=miner
+    image: bst-miner:${VERSION:-latest}
+    container_name: bst-miner-${MINER_NAME:-default}
+    ports:
+      - "${MINER_PORT:-8091}:${MINER_PORT:-8091}"
+    volumes:
+      - ../.env:/app/.env
+      - ~/.bittensor:/root/.bittensor
+      - ./logs:/app/logs
+    environment:
+      - MINER_PORT=${MINER_PORT:-8091}
+      - BT_SUBTENSOR_CHAIN_ENDPOINT=${CHAIN_ENDPOINT:-ws://host.docker.internal:9944}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    # Resource limits optimized for 4-core 8GB system
+    deploy:
+      resources:
+        limits:
+          memory: ${MEMORY_LIMIT:-2G}
+          cpus: ${CPU_LIMIT:-1}
+        reservations:
+          memory: ${MEMORY_RESERVATION:-512M}
+          cpus: ${CPU_RESERVATION:-0.25}
+    # File descriptor limits
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+      nproc:
+        soft: 32768
+        hard: 32768
+    # Security options
+    security_opt:
+      - no-new-privileges:true
+    # Health check
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:${MINER_PORT:-8091}/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s 

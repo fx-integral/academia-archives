@@ -1,0 +1,3 @@
+# cargo-audit configuration. Read at the workspace root.
+[advisories]
+ignore = []

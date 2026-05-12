@@ -1,0 +1,77 @@
+"""Pricing helpers for validator tool budgeting.
+
+All LLM prices here are **Chutes-based** reference rates, used solely for
+budgeting miner tool calls (even if the runtime executes against another
+provider like Vertex). External benchmarking uses its own pricing
+(`apps/platform/scripts/miner_task_benchmark.py`) and must not import this module.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass
+
+from harnyx_commons.llm.schema import LlmUsage
+from harnyx_commons.llm.tool_models import ToolModelName
+from harnyx_commons.tools.types import SearchToolName
+
+# Per-referenceable-result rates for search tools, keyed by tool name.
+SEARCH_PRICING_PER_REFERENCEABLE_RESULT: dict[SearchToolName, float] = {
+    "search_web": 0.0001,
+    "search_ai": 0.0004,
+    "fetch_page": 0.0005,
+}
+
+
+@dataclass(frozen=True)
+class ModelPricing:
+    input_per_million: float
+    output_per_million: float
+    reasoning_per_million: float
+
+    @property
+    def billable_reasoning_per_million(self) -> float:
+        if self.reasoning_per_million != 0.0:
+            return self.reasoning_per_million
+        return self.output_per_million
+
+
+# Chutes reference rates keyed by canonical model id.
+MODEL_PRICING: Mapping[ToolModelName, ModelPricing] = {
+    "deepseek-ai/DeepSeek-V3.1-TEE": ModelPricing(0.27, 1.00, 0.0),
+    "deepseek-ai/DeepSeek-V3.2-TEE": ModelPricing(0.28, 0.42, 0.0),
+    "zai-org/GLM-5-TEE": ModelPricing(0.95, 2.55, 0.0),
+    "Qwen/Qwen3-Next-80B-A3B-Instruct": ModelPricing(0.10, 0.80, 0.0),
+    "Qwen/Qwen3.6-27B-TEE": ModelPricing(0.50, 2.00, 0.0),
+    "google/gemma-4-31B-turbo-TEE": ModelPricing(0.13, 0.38, 0.0),
+}
+
+
+def price_llm(model: ToolModelName, usage: LlmUsage) -> float:
+    """Return USD cost for a single LLM call using Chutes reference pricing."""
+    pricing = MODEL_PRICING[model]
+
+    prompt_tokens = float(usage.prompt_tokens or 0)
+    completion_tokens = float(usage.completion_tokens or 0)
+    reasoning_tokens = float(usage.reasoning_tokens or 0)
+
+    cost_input = (prompt_tokens / 1_000_000) * pricing.input_per_million
+    cost_output = (completion_tokens / 1_000_000) * pricing.output_per_million
+    cost_reasoning = (reasoning_tokens / 1_000_000) * pricing.billable_reasoning_per_million
+    return cost_input + cost_output + cost_reasoning
+
+
+def price_search(tool_name: SearchToolName, *, referenceable_results: int) -> float:
+    """Return USD cost for a search call based on referenceable result count."""
+    if referenceable_results < 0:
+        raise ValueError("referenceable_results must be non-negative")
+    return float(referenceable_results) * SEARCH_PRICING_PER_REFERENCEABLE_RESULT[tool_name]
+
+
+__all__ = [
+    "price_llm",
+    "price_search",
+    "MODEL_PRICING",
+    "SEARCH_PRICING_PER_REFERENCEABLE_RESULT",
+    "ModelPricing",
+]

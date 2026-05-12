@@ -1,0 +1,59 @@
+% Fix bullet lists - prevent pandoc tight list compression
+\def\tightlist{}
+
+% Better image handling - constrain to page width
+\usepackage{graphicx}
+\makeatletter
+\def\maxwidth{\ifdim\Gin@nat@width>\linewidth\linewidth\else\Gin@nat@width\fi}
+\makeatother
+
+% Center all images and add spacing
+\usepackage{float}
+\let\origfigure\figure
+\let\endorigfigure\endfigure
+\renewenvironment{figure}[1][htbp]{%
+  \origfigure[H]
+  \centering
+}{%
+  \endorigfigure
+}
+
+% Better table styling
+\usepackage{booktabs}
+\usepackage{longtable}
+
+% Page headers and footers
+\usepackage{fancyhdr}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\textit{Djinn Protocol}}
+\fancyhead[R]{\small\textit{Whitepaper}}
+\fancyfoot[C]{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\footrulewidth}{0pt}
+
+% Title page styling
+\usepackage{titling}
+
+% Better section spacing
+\usepackage{titlesec}
+\titlespacing*{\section}{0pt}{2em}{1em}
+\titlespacing*{\subsection}{0pt}{1.5em}{0.75em}
+\titlespacing*{\subsubsection}{0pt}{1em}{0.5em}
+
+% Paragraph spacing instead of indent for whitepaper style
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.5em}
+
+% Better code block styling
+\usepackage{xcolor}
+\definecolor{codebg}{gray}{0.95}
+\usepackage{mdframed}
+
+% Insert logo at start of document
+\AtBeginDocument{%
+  \begin{center}
+    \includegraphics[width=150px]{images/djinn-logo.png}
+  \end{center}
+  \vspace{0.5em}
+}

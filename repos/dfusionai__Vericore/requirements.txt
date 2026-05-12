@@ -1,0 +1,22 @@
+bittensor===9.9.0
+sanic
+webdriver_manager
+lxml
+openai
+torch
+pydantic
+transformers
+selenium
+fuzzywuzzy
+python-Levenshtein  # required: fuzzywuzzy's pure-Python fallback gives wrong partial_ratio for short-vs-long (snippet vs page)
+sentence-transformers
+python-whois
+beautifulsoup4
+aiolimiter
+httpx
+httpx[http2]
+
+tldextract
+certifi
+PyJWT>=2.0
+cryptography  # required by PyJWT for RS256/RS384/RS512

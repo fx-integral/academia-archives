@@ -1,0 +1,20 @@
+from utils.validator_hotkeys import TEST_VALIDATOR_HOTKEYS, MAINNET_VALIDATOR_HOTKEYS
+
+
+def test_testnet_keys_ok():
+    assert len(TEST_VALIDATOR_HOTKEYS) == 3
+    assert "5FNL6e4JsB3ZPUGk1x1izK1xnTWsZDZrVF6WaRp1gNpoTvsM" in TEST_VALIDATOR_HOTKEYS
+    assert "5FtH6Aj3xKbkNdgbZUghkTeJrkJexn6eBRZSnS8Zgc3oo4GX" in TEST_VALIDATOR_HOTKEYS
+    assert "5Eyj7B2PzUMzRpW59eXziw4LazsQkn8bESF5gnbchyTdZEhX" in TEST_VALIDATOR_HOTKEYS
+
+def test_mainnet_keys_ok():
+    assert len(MAINNET_VALIDATOR_HOTKEYS) == 5
+    assert "5E7ooDPMFb8FMrnVD7z3B6ebkaNZRA5ksi87azE5okJsn122" in MAINNET_VALIDATOR_HOTKEYS
+    assert "5FtG4tgLC6ypK4veNwRd9C2SJGfHzckzjV9JafWtPUWzRCYy" in MAINNET_VALIDATOR_HOTKEYS
+    assert "5CXEbmzg7SD9dAsxep8MpjE28PbHxPotE63UnzLqu9VB99Tr" in MAINNET_VALIDATOR_HOTKEYS
+    assert "5Dd76FfntpDjfYJK8Mwnq1yPTAw9QW7vHfxNQdiWxVgmkfk6" in MAINNET_VALIDATOR_HOTKEYS
+    assert "5CZoa8Uw2GjkHfg3vybiiG5iGGAqqbDR6BdvhqJbj2Avs122" in MAINNET_VALIDATOR_HOTKEYS
+
+    assert "5FNL6e4JsB3ZPUGk1x1izK1xnTWsZDZrVF6WaRp1gNpoTvsM" not in MAINNET_VALIDATOR_HOTKEYS
+    assert "5FtH6Aj3xKbkNdgbZUghkTeJrkJexn6eBRZSnS8Zgc3oo4GX" not in MAINNET_VALIDATOR_HOTKEYS
+    assert "5Eyj7B2PzUMzRpW59eXziw4LazsQkn8bESF5gnbchyTdZEhX" not in MAINNET_VALIDATOR_HOTKEYS

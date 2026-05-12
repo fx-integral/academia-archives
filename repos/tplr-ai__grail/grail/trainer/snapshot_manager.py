@@ -1,0 +1,294 @@
+"""Snapshot management for async trainer coordination.
+
+Provides filesystem-based IPC for coordinating between main process,
+training process, and upload worker process.
+
+Design:
+- Atomic snapshot writes using temp dir + rename
+- Marker files for process coordination
+- Heartbeat monitoring for liveness detection
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import shutil
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+class SnapshotManager:
+    """Manages model snapshots and inter-process coordination via filesystem.
+
+    Directory structure:
+        snapshots/
+            latest/              # Current snapshot (atomically updated)
+            SNAPSHOT_READY       # Flag: new snapshot available for upload
+        staging/
+            pending/             # Upload worker copies snapshot here
+        locks/
+            TRAINING_HEARTBEAT   # Timestamp file for liveness monitoring
+    """
+
+    def __init__(self, cache_root: Path) -> None:
+        """Initialize snapshot manager.
+
+        Args:
+            cache_root: Root directory for snapshot storage
+        """
+        self.cache_root = Path(cache_root).expanduser()
+        self.snapshot_dir = self.cache_root / "snapshots"
+        self.staging_dir = self.cache_root / "staging"
+        self.locks_dir = self.cache_root / "locks"
+
+        # Create directory structure
+        self.snapshot_dir.mkdir(parents=True, exist_ok=True)
+        self.staging_dir.mkdir(parents=True, exist_ok=True)
+        self.locks_dir.mkdir(parents=True, exist_ok=True)
+
+        # Marker file paths
+        self._snapshot_ready_marker = self.snapshot_dir / "SNAPSHOT_READY"
+        self._training_heartbeat_file = self.locks_dir / "TRAINING_HEARTBEAT"
+
+    def save_snapshot_atomic(
+        self,
+        model: Any,
+        tokenizer: Any,
+        metadata: dict[str, Any],
+    ) -> None:
+        """Atomically save model snapshot and set READY marker.
+
+        Uses temp directory + atomic rename to ensure snapshot is never
+        partially written. Sets SNAPSHOT_READY marker after successful write.
+
+        Args:
+            model: Model to save (supports save_pretrained)
+            tokenizer: Tokenizer to save
+            metadata: Additional metadata (epoch, timestamp, metrics)
+        """
+        # Generate unique temp directory name
+        temp_name = f"latest.tmp.{uuid.uuid4().hex[:8]}"
+        temp_dir = self.snapshot_dir / temp_name
+        target_dir = self.snapshot_dir / "latest"
+
+        try:
+            # Create temp directory
+            temp_dir.mkdir(parents=True, exist_ok=True)
+
+            # Save model and tokenizer
+            logger.debug("Saving model to temp snapshot: %s", temp_dir)
+            model.save_pretrained(
+                str(temp_dir),
+                safe_serialization=True,
+            )
+            tokenizer.save_pretrained(str(temp_dir))
+
+            # Save metadata
+            metadata_path = temp_dir / "snapshot_metadata.json"
+            with open(metadata_path, "w", encoding="utf-8") as f:
+                json.dump(metadata, f, indent=2)
+
+            # Fsync directory to ensure data is on disk
+            try:
+                fd = os.open(temp_dir, os.O_RDONLY)
+                os.fsync(fd)
+                os.close(fd)
+            except (OSError, AttributeError):
+                # fsync on directory not supported on all platforms
+                pass
+
+            # Atomic rename chain: rename old to backup, rename temp to target, delete backup
+            # This ensures target_dir is NEVER missing - it's either old version or new version
+            backup_dir = self.snapshot_dir / f"latest.backup.{uuid.uuid4().hex[:8]}"
+
+            if target_dir.exists():
+                # Step 1: Atomically rename old target to backup (target still accessible)
+                target_dir.rename(backup_dir)
+
+            # Step 2: Atomically rename temp to target (target now points to new snapshot)
+            temp_dir.rename(target_dir)
+
+            # Step 3: Clean up backup (safe - new target is already in place)
+            if backup_dir.exists():
+                try:
+                    shutil.rmtree(backup_dir)
+                except Exception as cleanup_exc:
+                    logger.warning("Failed to cleanup backup snapshot: %s", cleanup_exc)
+
+            # Set SNAPSHOT_READY marker
+            self._snapshot_ready_marker.touch()
+
+            logger.info("Snapshot saved atomically to %s", target_dir)
+
+        except Exception as exc:
+            logger.error("Failed to save snapshot: %s", exc)
+            # Cleanup temp directory on failure
+            if temp_dir.exists():
+                try:
+                    shutil.rmtree(temp_dir)
+                except Exception as cleanup_exc:
+                    logger.debug("Cleanup failed: %s", cleanup_exc)
+            raise
+
+    def adopt_snapshot_atomic(
+        self,
+        source_dir: Path | str,
+        metadata: dict[str, Any],
+    ) -> None:
+        """Atomically adopt an already-written checkpoint directory as the latest snapshot.
+
+        Unlike ``save_snapshot_atomic``, this does NOT call ``model.save_pretrained()``.
+        It writes only metadata into *source_dir*, then performs the same atomic rename
+        dance so that ``snapshots/latest/`` always points to a complete snapshot.
+
+        Use this when FSDP2's ``save_full_checkpoint()`` has already written model
+        weights to *source_dir* and we just need the snapshot manager to adopt it.
+
+        Args:
+            source_dir: Directory containing model weights (already written).
+            metadata: Snapshot metadata (epoch, timestamp, metrics, etc.).
+        """
+        source_dir = Path(source_dir)
+        target_dir = self.snapshot_dir / "latest"
+
+        if not source_dir.exists():
+            raise FileNotFoundError(f"Source directory does not exist: {source_dir}")
+
+        try:
+            # Write metadata into the source directory
+            metadata_path = source_dir / "snapshot_metadata.json"
+            with open(metadata_path, "w", encoding="utf-8") as f:
+                json.dump(metadata, f, indent=2)
+
+            # Fsync directory
+            try:
+                fd = os.open(source_dir, os.O_RDONLY)
+                os.fsync(fd)
+                os.close(fd)
+            except (OSError, AttributeError):
+                pass
+
+            # Atomic rename chain (same protocol as save_snapshot_atomic)
+            backup_dir = self.snapshot_dir / f"latest.backup.{uuid.uuid4().hex[:8]}"
+
+            if target_dir.exists():
+                target_dir.rename(backup_dir)
+
+            source_dir.rename(target_dir)
+
+            if backup_dir.exists():
+                try:
+                    shutil.rmtree(backup_dir)
+                except Exception as cleanup_exc:
+                    logger.warning("Failed to cleanup backup snapshot: %s", cleanup_exc)
+
+            # Set SNAPSHOT_READY marker
+            self._snapshot_ready_marker.touch()
+
+            logger.info("Snapshot adopted atomically from %s to %s", source_dir, target_dir)
+
+        except Exception as exc:
+            logger.error("Failed to adopt snapshot: %s", exc)
+            raise
+
+    def check_snapshot_ready(self) -> bool:
+        """Check if new snapshot is available for upload.
+
+        Returns:
+            True if SNAPSHOT_READY marker exists
+        """
+        return self._snapshot_ready_marker.exists()
+
+    def copy_snapshot_to_staging(self) -> Path:
+        """Copy snapshot to staging directory and clear READY marker.
+
+        Upload worker calls this to get a stable copy of the snapshot
+        while training continues.
+
+        Returns:
+            Path to staging directory containing snapshot copy
+
+        Raises:
+            FileNotFoundError: If no snapshot available
+        """
+        source_dir = self.snapshot_dir / "latest"
+        staging_pending = self.staging_dir / "pending"
+
+        if not source_dir.exists():
+            raise FileNotFoundError(f"No snapshot available at {source_dir}")
+
+        # Remove old staging if exists
+        if staging_pending.exists():
+            shutil.rmtree(staging_pending)
+
+        # Copy snapshot to staging
+        logger.info("Copying snapshot to staging: %s -> %s", source_dir, staging_pending)
+        shutil.copytree(source_dir, staging_pending)
+
+        # Clear SNAPSHOT_READY marker
+        if self._snapshot_ready_marker.exists():
+            self._snapshot_ready_marker.unlink()
+
+        return staging_pending
+
+    def cleanup_staging(self) -> None:
+        """Remove staging directory after successful upload."""
+        staging_pending = self.staging_dir / "pending"
+        if staging_pending.exists():
+            shutil.rmtree(staging_pending)
+            logger.debug("Cleaned up staging directory")
+
+    def set_training_heartbeat(self) -> None:
+        """Update training heartbeat timestamp for liveness monitoring."""
+        self._training_heartbeat_file.write_text(str(time.time()))
+
+    def get_training_heartbeat_age(self) -> float:
+        """Get age of training heartbeat in seconds.
+
+        Returns:
+            Age in seconds, or infinity if heartbeat file doesn't exist
+        """
+        if not self._training_heartbeat_file.exists():
+            return float("inf")
+
+        try:
+            heartbeat_time = float(self._training_heartbeat_file.read_text())
+            return time.time() - heartbeat_time
+        except (ValueError, OSError):
+            return float("inf")
+
+    def get_latest_snapshot_path(self) -> Path | None:
+        """Get path to latest snapshot if it exists.
+
+        Returns:
+            Path to latest snapshot directory, or None if not available
+        """
+        snapshot_path = self.snapshot_dir / "latest"
+        return snapshot_path if snapshot_path.exists() else None
+
+    def get_latest_snapshot_metadata(self) -> dict[str, Any] | None:
+        """Get metadata from latest snapshot.
+
+        Returns:
+            Metadata dict or None if unavailable
+        """
+        snapshot_path = self.get_latest_snapshot_path()
+        if not snapshot_path:
+            return None
+
+        metadata_path = snapshot_path / "snapshot_metadata.json"
+        if not metadata_path.exists():
+            return None
+
+        try:
+            with open(metadata_path, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as exc:
+            logger.warning("Failed to read snapshot metadata: %s", exc)
+            return None

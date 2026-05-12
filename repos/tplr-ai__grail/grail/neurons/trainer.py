@@ -1,0 +1,1200 @@
+"""Trainer neuron orchestrating async training, upload, and evaluation."""
+
+from __future__ import annotations
+
+import asyncio
+import gc
+import logging
+import multiprocessing
+import os
+import time
+from dataclasses import dataclass
+from types import SimpleNamespace
+from typing import Any
+
+import bittensor as bt
+import numpy as np
+import torch
+
+from grail.environments.factory import create_env_factory
+from grail.infrastructure.chain import GrailChainManager
+from grail.infrastructure.checkpoint_consumer import default_checkpoint_cache_root
+from grail.model.provider import get_model, get_tokenizer
+from grail.model.train_loading import ModelLoadSpec
+from grail.protocol.constants import CURRENT_ENV_ID, WINDOW_LENGTH
+from grail.shared.config import (
+    NETUID,
+    SNAPSHOT_POLL_INTERVAL_SECONDS,
+    TRAINING_HEARTBEAT_TIMEOUT_SECONDS,
+)
+from grail.trainer.checkpoint_publisher import CheckpointPublisher
+from grail.trainer.config import EvalConfig, TrainingConfig
+from grail.trainer.dashboard_logger import eval_logger
+from grail.trainer.eval_planner import EvaluationPlanner
+from grail.trainer.evaluator import EvaluatorService
+from grail.trainer.inference_server import create_inference_server
+from grail.trainer.ipc import IPCChannels, create_ipc_channels
+from grail.trainer.snapshot_manager import SnapshotManager
+from grail.trainer.training_process import run_training_process
+from grail.trainer.upload_worker import run_upload_worker
+
+from .base import BaseNeuron
+
+logger = logging.getLogger(__name__)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Constants
+# ────────────────────────────────────────────────────────────────────────────────
+
+WATCHDOG_TIMEOUT_SECONDS = 60 * 60  # 60 minutes (eval with 8k generation can take 20-40 min)
+WATCHDOG_GRACE_SECONDS = 10
+
+ORCHESTRATION_SLEEP_SECONDS = 60
+ORCHESTRATION_ERROR_SLEEP_SECONDS = 30
+
+PAUSE_CONFIRMATION_POLL_SECONDS = 2
+PAUSE_CONFIRMATION_TIMEOUT_SECONDS = 300  # 5 minutes max wait for training to pause
+PROCESS_JOIN_TIMEOUT_SECONDS = 30
+PROCESS_TERMINATE_TIMEOUT_SECONDS = 10
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Data Classes
+# ────────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class TrainerContext:
+    """Resources required to run the trainer neuron.
+
+    Attributes:
+        wallet: Bittensor wallet for authentication
+        credentials: R2/S3 credentials for storage
+        checkpoint_publisher: Publisher for uploading checkpoints
+        monitor: Monitoring manager (W&B, etc.)
+        train_spec: Specification for loading training model
+        ref_spec: Specification for loading reference model
+        verbosity: CLI verbosity level for child process logging
+        test_mode: Test mode flag for training on TRAINER_UID data only
+        chain_manager: Chain manager for miner data (initialized later)
+    """
+
+    wallet: bt.wallet
+    credentials: Any
+    checkpoint_publisher: CheckpointPublisher | None
+    monitor: Any | None
+    train_spec: ModelLoadSpec
+    ref_spec: ModelLoadSpec
+    verbosity: int = 1
+    test_mode: bool = False
+    chain_manager: Any | None = None
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Trainer Neuron
+# ────────────────────────────────────────────────────────────────────────────────
+
+
+class TrainerNeuron(BaseNeuron):
+    """Orchestrates async training, upload, and evaluation processes.
+
+    Architecture:
+    - Main process: Orchestrates child processes, runs evaluation
+    - Training process: Loads models to GPU, trains continuously
+    - Upload worker: Uploads snapshots to R2/S3 asynchronously
+
+    The main process never uses GPU to avoid CUDA fork issues.
+    """
+
+    def __init__(self, context: TrainerContext) -> None:
+        """Initialize trainer neuron.
+
+        Args:
+            context: Resources required for training
+        """
+        super().__init__()
+        self._context = context
+
+        # Set multiprocessing start method to 'spawn' for CUDA compatibility
+        multiprocessing.set_start_method("spawn", force=True)
+        logger.info("Set multiprocessing start method to 'spawn' for CUDA compatibility")
+
+        # Configuration
+        self._train_cfg = TrainingConfig()
+        self._eval_cfg = EvalConfig()
+
+        # Snapshot management (IPC coordination)
+        cache_root = default_checkpoint_cache_root() / "async_trainer"
+        self._snapshot_manager = SnapshotManager(cache_root)
+
+        # Child processes
+        self._training_process: multiprocessing.Process | None = None
+        self._upload_process: multiprocessing.Process | None = None
+
+        # Unified IPC channels for all inter-process communication
+        self._ipc: IPCChannels = create_ipc_channels()
+
+        # Evaluation state
+        self._eval_in_progress: bool = False
+        self._eval_last_run_window_number: int | None = None
+        self._windows_since_last_eval: int = 0
+        self._eval_checkpoint_dir: str | None = None
+        self._last_seen_window: int | None = None  # Track window changes for eval interval
+
+    async def run(self) -> None:
+        """Run trainer orchestration loop.
+
+        Lifecycle:
+        1. Start watchdog for liveness monitoring
+        2. Initialize chain manager
+        3. Request pause (if evaluation enabled) to prevent training before first eval
+        4. Spawn training and upload worker processes
+        5. Enter orchestration loop (first iteration runs initial evaluation)
+        6. Gracefully shutdown on exit
+        """
+        self.start_watchdog(
+            timeout_seconds=WATCHDOG_TIMEOUT_SECONDS,
+            grace_seconds=WATCHDOG_GRACE_SECONDS,
+        )
+
+        await self._initialize_chain_manager()
+
+        logger.info("Main process will not use GPU (training process owns GPU)")
+
+        try:
+            # Request pause BEFORE starting training to ensure initial evaluation runs first.
+            # Training will see this flag when it enters its loop and confirm pause.
+            # The orchestration loop's first iteration will then run evaluation immediately
+            # since _coordinate_evaluation() will see pause already confirmed.
+            if self._eval_cfg.enabled:
+                self._ipc.request_pause()
+                logger.info("Pause requested before training start (initial evaluation pending)")
+
+            logger.info("Starting async training and upload worker processes...")
+            self._start_training_process()
+            self._start_upload_worker()
+
+            logger.info("Entering orchestration loop...")
+            await self._orchestration_loop()
+
+        except asyncio.CancelledError:
+            logger.info("Trainer received CancelledError, shutting down...")
+        except Exception:
+            logger.exception("Trainer run() failed")
+        finally:
+            await self._shutdown_processes()
+
+        logger.info("Trainer exited")
+
+    # ────────────────────────────────────────────────────────────────────────────
+    # Process Management
+    # ────────────────────────────────────────────────────────────────────────────
+
+    def _start_training_process(self) -> None:
+        """Spawn training process(es) for continuous training.
+
+        Checks ``GRAIL_DIST_NPROC`` env var.  If > 1, spawns N distributed
+        training processes via ``run_distributed_training_process``.
+        Otherwise, spawns a single process via ``run_training_process``.
+        """
+        nproc = int(os.getenv("GRAIL_DIST_NPROC", "1"))
+        if nproc > 1:
+            self._start_distributed_training(nproc)
+            return
+
+        wallet_args = self._serialize_wallet()
+        monitor_config = self._prepare_monitor_config(subprocess_label="training_process")
+
+        self._training_process = multiprocessing.Process(
+            target=run_training_process,
+            args=(
+                self._context.train_spec,
+                self._context.ref_spec,
+                self._train_cfg,
+                self._snapshot_manager,
+                self._context.credentials,
+                wallet_args,
+                monitor_config,
+                self._ipc,
+                self._context.verbosity,
+                self._context.test_mode,
+            ),
+        )
+        self._training_process.start()
+        logger.info("Training process started (PID=%d)", self._training_process.pid)
+
+    def _start_distributed_training(self, nproc: int) -> None:
+        """Spawn N distributed training processes via multiprocessing.Process.
+
+        Each process receives the same ``IPCChannels`` object.  Only rank 0
+        interacts with IPC (heartbeat, stop, snapshots).  Other ranks follow
+        rank 0 via NCCL broadcast.
+
+        Evaluation is disabled in distributed mode (remote eval handles it).
+
+        Args:
+            nproc: Number of training processes (one per GPU).
+        """
+        from grail.trainer.distributed.config import DistributedConfig
+        from grail.trainer.distributed.launcher import run_distributed_training_process
+
+        # Disable local evaluation in distributed mode
+        self._eval_cfg.enabled = False
+        logger.info("Distributed training: nproc=%d, local evaluation disabled", nproc)
+
+        wallet_args = self._serialize_wallet()
+        monitor_config = self._prepare_monitor_config(subprocess_label="distributed_training")
+        dist_cfg = DistributedConfig.from_env()
+
+        self._distributed_processes: list[multiprocessing.Process] = []
+
+        for rank in range(nproc):
+            p = multiprocessing.Process(
+                target=run_distributed_training_process,
+                args=(
+                    rank,
+                    nproc,
+                    self._ipc,
+                    self._snapshot_manager,
+                    self._train_cfg,
+                    dist_cfg,
+                    self._context.credentials,
+                    wallet_args,
+                    monitor_config,
+                    self._context.verbosity,
+                    self._context.test_mode,
+                ),
+            )
+            p.start()
+            logger.info("Distributed rank %d started (PID=%d)", rank, p.pid)
+            self._distributed_processes.append(p)
+
+        # Point _training_process to rank 0 for health checks
+        self._training_process = self._distributed_processes[0]
+
+    def _start_upload_worker(self) -> None:
+        """Spawn upload worker process for async uploads."""
+        wallet_args = self._serialize_wallet()
+        monitor_config = self._prepare_monitor_config(subprocess_label="upload_worker")
+
+        self._upload_process = multiprocessing.Process(
+            target=run_upload_worker,
+            args=(
+                self._snapshot_manager,
+                self._context.credentials,
+                wallet_args,
+                monitor_config,
+                self._ipc,
+                SNAPSHOT_POLL_INTERVAL_SECONDS,
+                self._context.verbosity,
+            ),
+        )
+        self._upload_process.start()
+        logger.info("Upload worker started (PID=%d)", self._upload_process.pid)
+
+    async def _shutdown_processes(self) -> None:
+        """Gracefully shutdown child processes."""
+        logger.info("Shutting down child processes...")
+
+        self._ipc.stop.set()
+
+        # Shutdown distributed training processes (if any)
+        if hasattr(self, "_distributed_processes"):
+            for i, p in enumerate(self._distributed_processes):
+                await self._shutdown_process(p, f"Rank-{i}")
+        else:
+            await self._shutdown_process(self._training_process, "Training")
+
+        await self._shutdown_process(self._upload_process, "Upload")
+
+        logger.info("Child processes shut down")
+
+    async def _shutdown_process(
+        self,
+        process: multiprocessing.Process | None,
+        name: str,
+    ) -> None:
+        """Shutdown a single process gracefully.
+
+        Args:
+            process: Process to shutdown
+            name: Process name for logging
+        """
+        if not process:
+            return
+
+        if not process.pid:
+            logger.warning("%s process was never started (no PID)", name)
+            return
+
+        process.join(timeout=PROCESS_JOIN_TIMEOUT_SECONDS)
+
+        if process.is_alive():
+            logger.warning("%s process didn't exit, terminating...", name)
+            process.terminate()
+            process.join(timeout=PROCESS_TERMINATE_TIMEOUT_SECONDS)
+
+    # ────────────────────────────────────────────────────────────────────────────
+    # Orchestration Loop
+    # ────────────────────────────────────────────────────────────────────────────
+
+    async def _orchestration_loop(self) -> None:
+        """Main orchestration loop: monitor processes and coordinate evaluation."""
+        while not self.stop_event.is_set():
+            try:
+                self.heartbeat()
+
+                await self._check_process_health()
+
+                if await self._should_wait_for_initialization():
+                    await asyncio.sleep(ORCHESTRATION_SLEEP_SECONDS)
+                    continue
+
+                # Skip window checks during evaluation to avoid event loop starvation
+                if self._eval_in_progress:
+                    logger.debug("Evaluation in progress, skipping window check")
+                    await asyncio.sleep(ORCHESTRATION_SLEEP_SECONDS)
+                    continue
+
+                current_window = await self._get_current_window()
+
+                # Only count window changes, not loop iterations
+                # A window is ~6 min (30 blocks × 12s), loop runs every 60s
+                window_changed = (
+                    self._last_seen_window is None or current_window != self._last_seen_window
+                )
+                if window_changed:
+                    self._last_seen_window = current_window
+                    self._windows_since_last_eval += 1
+                    logger.debug(
+                        "Window changed to %d, windows_since_last_eval=%d",
+                        current_window,
+                        self._windows_since_last_eval,
+                    )
+
+                if self._should_run_evaluation():
+                    logger.info("Evaluation due, coordinating with training process...")
+                    await self._coordinate_evaluation(current_window)
+                    self._windows_since_last_eval = 0
+
+                await asyncio.sleep(ORCHESTRATION_SLEEP_SECONDS)
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Orchestration loop error")
+                await asyncio.sleep(ORCHESTRATION_ERROR_SLEEP_SECONDS)
+
+    async def _should_wait_for_initialization(self) -> bool:
+        """Check if training process is still initializing.
+
+        Returns:
+            True if should wait, False if ready
+        """
+        heartbeat_age = self._get_heartbeat_age()
+        if heartbeat_age == float("inf"):
+            logger.debug(
+                "Training process still initializing (no heartbeat yet), skipping evaluation check"
+            )
+            return True
+        return False
+
+    async def _get_current_window(self) -> int:
+        """Get current window number from subtensor.
+
+        Returns:
+            Current window number
+        """
+        subtensor = await self.get_subtensor()
+        current_block = await subtensor.get_current_block()  # type: ignore[misc]  # bittensor async stub
+        current_window = (current_block // WINDOW_LENGTH) * WINDOW_LENGTH
+
+        if self._context.monitor:
+            self._context.monitor.set_block_context(current_block, current_window)
+
+        return current_window
+
+    async def _check_process_health(self) -> None:
+        """Monitor training and upload process health."""
+        if hasattr(self, "_distributed_processes"):
+            for i, p in enumerate(self._distributed_processes):
+                if not p.is_alive():
+                    logger.error(
+                        "Distributed rank %d died (PID=%s) - system should restart",
+                        i,
+                        p.pid,
+                    )
+        elif self._training_process and not self._training_process.is_alive():
+            logger.error("Training process died - system should restart")
+
+        if self._upload_process and not self._upload_process.is_alive():
+            logger.error("Upload process died - system should restart")
+
+        # Get heartbeat age from IPC (primary) or filesystem (fallback)
+        heartbeat_age = self._get_heartbeat_age()
+        if heartbeat_age == float("inf"):
+            # No heartbeat received yet - process still initializing (e.g., loading model)
+            # This is normal during startup, not an error condition
+            logger.debug("Training process initializing (awaiting first heartbeat)")
+        elif heartbeat_age > TRAINING_HEARTBEAT_TIMEOUT_SECONDS:
+            # Had heartbeat but it went stale - this is concerning
+            logger.error(
+                "Training heartbeat stale (%.1fs > %ds)",
+                heartbeat_age,
+                TRAINING_HEARTBEAT_TIMEOUT_SECONDS,
+            )
+
+    def _get_heartbeat_age(self) -> float:
+        """Get training heartbeat age from IPC channels.
+
+        Returns:
+            Age in seconds, or infinity if no heartbeat received yet
+        """
+        age = self._ipc.get_heartbeat_age()
+        if age == float("inf"):
+            # No heartbeat yet - fall back to filesystem for backward compat
+            return self._snapshot_manager.get_training_heartbeat_age()
+        return age
+
+    def _should_run_evaluation(self) -> bool:
+        """Check if evaluation should run.
+
+        Returns:
+            True if evaluation is due
+        """
+        if not self._eval_cfg.enabled:
+            return False
+
+        is_first_eval = self._eval_last_run_window_number is None
+        interval_reached = self._windows_since_last_eval >= self._eval_cfg.window_interval
+
+        return is_first_eval or interval_reached
+
+    # ────────────────────────────────────────────────────────────────────────────
+    # Evaluation Coordination
+    # ────────────────────────────────────────────────────────────────────────────
+
+    async def _coordinate_evaluation(self, current_window: int) -> None:
+        """Pause training, run evaluation, resume training.
+
+        Uses IPC events for coordination between main and training processes.
+
+        Args:
+            current_window: Current window number
+        """
+        logger.info("🔄 STATE: evaluation_pause_requested (window=%d)", current_window)
+
+        # Signal pause via IPC event
+        self._ipc.request_pause()
+        logger.info("Set pause_requested event, waiting for training to pause...")
+
+        if not await self._wait_for_training_pause():
+            logger.error("Training process failed to pause in time, skipping evaluation")
+            self._ipc.clear_pause()
+            self.reset_subtensor()  # Reset connection after idle wait period
+            return
+
+        logger.info("🔄 STATE: evaluation_starting - training paused, GPU freed")
+        try:
+            await self._maybe_run_evaluation(current_window)
+            logger.info("🔄 STATE: evaluation_complete - clearing pause flag")
+        finally:
+            # Signal resume via IPC event
+            self._ipc.clear_pause()
+            # Reset main process subtensor connection after idle period during evaluation
+            self.reset_subtensor()
+            logger.info("🔄 STATE: evaluation_resume_signaled - training will resume")
+
+    async def _wait_for_training_pause(self) -> bool:
+        """Wait for training to confirm pause via IPC event.
+
+        Uses multiprocessing.Event with native timeout support for reliable
+        coordination. Falls back to checking process liveness and stop_event.
+
+        Returns:
+            True if training paused successfully, False if timeout/failure
+        """
+        # If training is already paused (confirmation still set from prior request),
+        # we can proceed immediately. This prevents a deadlock where the orchestrator
+        # requests pause while training is already paused and waiting for resume.
+        if self._ipc.pause_confirmed.is_set():
+            logger.info(
+                "Training already paused (confirmation from prior request), proceeding immediately"
+            )
+            return True
+
+        start_wait = time.time()
+        timeout = PAUSE_CONFIRMATION_TIMEOUT_SECONDS
+
+        # Use Event.wait() with timeout in thread pool to avoid blocking event loop
+        loop = asyncio.get_running_loop()
+
+        while True:
+            # Check for shutdown request
+            if self.stop_event.is_set():
+                logger.info("Stop event set during pause wait, aborting")
+                return False
+
+            # Check if training process is still alive
+            if self._training_process and not self._training_process.is_alive():
+                logger.error("Training process died while waiting for pause")
+                return False
+
+            # Check for timeout
+            elapsed = time.time() - start_wait
+            if elapsed > timeout:
+                logger.error(
+                    "Timeout waiting for training to pause (%.1fs > %ds)",
+                    elapsed,
+                    timeout,
+                )
+                return False
+
+            # Wait for pause confirmation with short timeout (non-blocking check)
+            # Using run_in_executor to avoid blocking the asyncio event loop
+            confirmed = await loop.run_in_executor(
+                None,
+                self._ipc.wait_for_pause_confirmation,
+                PAUSE_CONFIRMATION_POLL_SECONDS,  # Short wait, then re-check conditions
+            )
+
+            if confirmed:
+                logger.info(
+                    "Confirmed training paused via IPC event (%.1fs elapsed)",
+                    time.time() - start_wait,
+                )
+                return True
+
+            logger.info(
+                "Waiting for training to pause... %.1fs / %ds",
+                elapsed,
+                timeout,
+            )
+
+    async def _maybe_run_evaluation(self, current_window: int) -> bool:
+        """Run evaluation if due.
+
+        Args:
+            current_window: Current window number
+
+        Returns:
+            True if evaluation executed successfully
+        """
+        logger.debug("_maybe_run_evaluation: enabled=%s", self._eval_cfg.enabled)
+
+        if not self._eval_cfg.enabled:
+            return False
+
+        window_number = current_window // WINDOW_LENGTH
+        is_first_eval = self._eval_last_run_window_number is None
+
+        should_start = (
+            self._eval_in_progress
+            or is_first_eval
+            or (
+                self._windows_since_last_eval >= self._eval_cfg.window_interval
+                and self._eval_last_run_window_number != window_number
+            )
+        )
+
+        if not should_start:
+            logger.debug("Evaluation not due yet")
+            return False
+
+        self._eval_in_progress = True
+        eval_env_id = self._eval_cfg.env_id or CURRENT_ENV_ID
+        logger.info("=" * 80)
+        logger.info("📊 EVALUATION CYCLE START")
+        logger.info(f"   Window: {window_number}")
+        logger.info(f"   Environment: {eval_env_id}")
+        logger.info(f"   Split: {self._eval_cfg.split}")
+        logger.info(f"   Backend: {self._eval_cfg.backend or 'hf'}")
+        logger.info(f"   First eval: {is_first_eval}")
+        logger.info("=" * 80)
+
+        logger.info("⏱️  [STAGE 1/4] Creating evaluation plan...")
+        plan_start = time.time()
+        plan, env_factory = self._create_evaluation_plan(window_number)
+        logger.info(f"   ✓ Plan created in {time.time() - plan_start:.2f}s")
+        logger.info(f"   Tasks: {len(plan.ids)}, Replicates: {plan.replicates}")
+
+        eval_start = time.time()
+
+        try:
+            logger.info("⏱️  [STAGE 2/4] Running evaluation (model inference + code execution)...")
+            metrics = await self._run_evaluation(plan, window_number, env_factory)
+
+            logger.info("")
+            logger.info("=" * 80)
+            logger.info("🧪 EVALUATION RESULTS")
+            logger.info(f"   Metrics: {metrics}")
+            logger.info(f"   Duration: {time.time() - eval_start:.2f}s")
+            logger.info("=" * 80)
+
+            logger.info("⏱️  [STAGE 3/4] Logging metrics...")
+            await self._log_evaluation_metrics(metrics, time.time() - eval_start)
+
+            self._eval_last_run_window_number = window_number
+            self._windows_since_last_eval = 0
+
+            self.heartbeat()
+            logger.info("⏱️  [STAGE 4/4] Cleanup complete")
+            logger.info(f"✅ EVALUATION CYCLE COMPLETE (total: {time.time() - eval_start:.2f}s)")
+            logger.info("=" * 80)
+            return True
+
+        except Exception:
+            logger.exception("❌ EVALUATION FAILED")
+            await self._log_evaluation_failure(time.time() - eval_start)
+            return False
+
+        finally:
+            self._eval_in_progress = False
+            self._eval_checkpoint_dir = None
+
+    async def _run_evaluation(
+        self,
+        plan: Any,
+        window_number: int,
+        env_factory: Any,
+    ) -> dict[str, float]:
+        """Run evaluation with appropriate backend.
+
+        Args:
+            plan: Evaluation plan
+            window_number: Current window number
+            env_factory: Factory function for environments
+
+        Returns:
+            Evaluation metrics
+        """
+        should_start_server = self._eval_cfg.start_server and self._eval_cfg.backend in (
+            "sglang",
+            "vllm",
+        )
+
+        if should_start_server:
+            return await self._run_server_evaluation(plan, window_number, env_factory)
+        else:
+            return await self._run_direct_evaluation(plan, window_number, env_factory)
+
+    def _create_evaluation_plan(self, window_number: int) -> tuple[Any, Any]:
+        """Create evaluation plan and environment factory.
+
+        Uses the configured eval_env_id (or CURRENT_ENV_ID if not set) to ensure
+        evaluation matches the training environment.
+
+        Args:
+            window_number: Current window number
+
+        Returns:
+            Tuple of (plan, env_factory)
+        """
+        from grail.environments import get_or_create_task_source
+
+        # Use configured env_id or fall back to CURRENT_ENV_ID
+        eval_env_id = self._eval_cfg.env_id or CURRENT_ENV_ID
+
+        source = get_or_create_task_source(eval_env_id, split=self._eval_cfg.split)
+        env_factory = create_env_factory(
+            eval_env_id, task_source=source, split=self._eval_cfg.split
+        )
+
+        if self._eval_cfg.subset_size is not None:
+            plan = self._create_subset_evaluation_plan(source, window_number)
+        else:
+            plan = self._create_full_evaluation_plan(source, window_number)
+
+        return plan, env_factory
+
+    def _create_subset_evaluation_plan(self, source: Any, window_number: int) -> Any:
+        """Create evaluation plan for fixed subset.
+
+        Args:
+            source: Task source
+            window_number: Current window number
+
+        Returns:
+            Evaluation plan
+        """
+
+        def generate_fixed_subset(cycle_index: int, subset_size: int) -> list[str]:
+            all_ids = source.iter_ids()
+            n_samples = min(subset_size, len(all_ids))
+            rng = np.random.RandomState(seed=self._eval_cfg.seed_base)
+            indices = rng.choice(len(all_ids), size=n_samples, replace=False)
+            return [all_ids[i] for i in sorted(indices)]
+
+        planner = EvaluationPlanner(
+            replicates=self._eval_cfg.replicates,
+            seed_base=self._eval_cfg.seed_base,
+            generate_ids=generate_fixed_subset,
+        )
+        plan = planner.for_cycle(
+            cycle_index=window_number,
+            subset_size=self._eval_cfg.subset_size,
+        )
+
+        logger.info(
+            "Using fixed subset: %d tasks (%.1f%%)",
+            len(plan.ids),
+            100 * len(plan.ids) / source.size(),
+        )
+
+        return plan
+
+    def _create_full_evaluation_plan(self, source: Any, window_number: int) -> Any:
+        """Create evaluation plan for full dataset.
+
+        Args:
+            source: Task source
+            window_number: Current window number
+
+        Returns:
+            Evaluation plan
+        """
+        planner = EvaluationPlanner(
+            replicates=self._eval_cfg.replicates,
+            seed_base=self._eval_cfg.seed_base,
+            enumerate_ids=source.iter_ids,
+        )
+        return planner.for_cycle(cycle_index=window_number)
+
+    def _load_evaluation_resources(
+        self,
+        for_hf_backend: bool = False,
+    ) -> tuple[str, Any, Any | None]:
+        """Load tokenizer and optionally model from snapshot for evaluation.
+
+        Args:
+            for_hf_backend: If True, loads model to GPU for HF backend
+
+        Returns:
+            Tuple of (snapshot_path, tokenizer, model_or_none)
+
+        Raises:
+            RuntimeError: If snapshot not available
+        """
+        logger.info("📦 Loading evaluation resources...")
+        snapshot_path = self._snapshot_manager.get_latest_snapshot_path()
+        if not snapshot_path:
+            raise RuntimeError("No snapshot available for evaluation")
+
+        logger.info(f"   Snapshot path: {snapshot_path}")
+
+        logger.info("   Loading tokenizer...")
+        tok_start = time.time()
+        tokenizer = get_tokenizer(str(snapshot_path))
+        logger.info(f"   ✓ Tokenizer loaded in {time.time() - tok_start:.2f}s")
+
+        model = None
+        if for_hf_backend:
+            logger.info("   Loading model to GPU for HF backend...")
+            model_start = time.time()
+            model = get_model(
+                str(snapshot_path),
+                device="cuda",
+                eval_mode=True,
+            )
+            logger.info(f"   ✓ Model loaded in {time.time() - model_start:.2f}s")
+
+        return str(snapshot_path), tokenizer, model
+
+    async def _run_server_evaluation(
+        self,
+        plan: Any,
+        window_number: int,
+        env_factory: Any,
+    ) -> dict[str, float]:
+        """Run evaluation with managed vLLM/SGLang server.
+
+        Args:
+            plan: Evaluation plan
+            window_number: Current window number
+            env_factory: Factory function for environments
+
+        Returns:
+            Evaluation metrics
+        """
+        logger.info("🖥️  Using managed server backend (%s)", self._eval_cfg.backend)
+
+        logger.info("   [1/5] Loading resources...")
+        load_start = time.time()
+        snapshot_path, tokenizer, _ = self._load_evaluation_resources(for_hf_backend=False)
+        self._eval_checkpoint_dir = snapshot_path
+        logger.info(f"   ✓ Resources loaded in {time.time() - load_start:.2f}s")
+
+        self._log_gpu_memory("before server")
+
+        chat_template_path = self._get_chat_template_path(snapshot_path)
+
+        logger.info("   [2/5] Creating server manager...")
+        server_manager = create_inference_server(
+            backend=self._eval_cfg.backend,
+            model_path=snapshot_path,
+            eval_config=self._eval_cfg,
+            model_name_override="async_trainer_snapshot",
+            chat_template_path=chat_template_path,
+        )
+        logger.info("   ✓ Server manager created")
+
+        async with server_manager as server:
+            self.heartbeat()
+            logger.info("   [3/5] Starting server process...")
+            server_start = time.time()
+            await server.start_server()
+            logger.info(
+                f"   ✓ Server started at {server.base_url} in {time.time() - server_start:.2f}s"
+            )
+            self._log_gpu_memory("after server start")
+            self.heartbeat()
+
+            logger.info("   [4/5] Creating evaluator service...")
+            evaluator = EvaluatorService(
+                model=None,
+                tokenizer=tokenizer,
+                env_factory=env_factory,
+                config=self._eval_cfg,
+                monitor=self._context.monitor,
+                device="cuda",
+                server_base_url=server.base_url,
+                server_model_name=server.model_name,
+            )
+            logger.info("   ✓ Evaluator created")
+
+            try:
+                logger.info("   [5/5] Running evaluation cycle...")
+                eval_cycle_start = time.time()
+                metrics = await self._run_evaluation_cycle(
+                    plan=plan,
+                    window_number=window_number,
+                    env_factory=env_factory,
+                    evaluator=evaluator,
+                )
+                logger.info(
+                    f"   ✓ Evaluation cycle complete in {time.time() - eval_cycle_start:.2f}s"
+                )
+            finally:
+                # Explicitly shutdown evaluator before server context exits
+                # to ensure all resources are released before vLLM process is killed
+                logger.info("   Shutting down evaluator...")
+                shutdown_start = time.time()
+                evaluator.shutdown()
+                del tokenizer
+                gc.collect()
+                logger.info(
+                    f"   ✓ Evaluator shutdown complete in {time.time() - shutdown_start:.2f}s"
+                )
+
+        logger.info("   ✓ Server shutdown complete")
+        self._log_gpu_memory("after server shutdown")
+        return metrics
+
+    async def _run_direct_evaluation(
+        self,
+        plan: Any,
+        window_number: int,
+        env_factory: Any,
+    ) -> dict[str, float]:
+        """Run evaluation with HF backend or external server.
+
+        Args:
+            plan: Evaluation plan
+            window_number: Current window number
+            env_factory: Factory function for environments
+
+        Returns:
+            Evaluation metrics
+        """
+        backend_name = (self._eval_cfg.backend or "hf").lower()
+        logger.info("🖥️  Using direct evaluation (backend: %s)", backend_name)
+
+        server_base_url = None
+        if backend_name in ("vllm", "sglang"):
+            server_base_url = f"http://{self._eval_cfg.server_host}:{self._eval_cfg.server_port}"
+            logger.info("   Using external server at %s", server_base_url)
+
+        need_model = backend_name == "hf" or not server_base_url
+        logger.info("   [1/3] Loading resources (model: %s)...", need_model)
+        load_start = time.time()
+        _, tokenizer, model = self._load_evaluation_resources(for_hf_backend=need_model)
+        logger.info(f"   ✓ Resources loaded in {time.time() - load_start:.2f}s")
+
+        logger.info("   [2/3] Creating evaluator service...")
+        evaluator = EvaluatorService(
+            model=model,
+            tokenizer=tokenizer,
+            env_factory=env_factory,
+            config=self._eval_cfg,
+            monitor=self._context.monitor,
+            device="cuda",
+            server_base_url=server_base_url,
+            server_model_name=None,
+        )
+        logger.info("   ✓ Evaluator created")
+
+        try:
+            logger.info("   [3/3] Running evaluation cycle...")
+            eval_start = time.time()
+            metrics = await self._run_evaluation_cycle(
+                plan=plan,
+                window_number=window_number,
+                env_factory=env_factory,
+                evaluator=evaluator,
+            )
+            logger.info(f"   ✓ Evaluation cycle complete in {time.time() - eval_start:.2f}s")
+            return metrics
+        finally:
+            logger.info("   Cleaning up evaluation resources...")
+            cleanup_start = time.time()
+            self._cleanup_evaluation_resources(evaluator, tokenizer, model)
+            logger.info(f"   ✓ Cleanup complete in {time.time() - cleanup_start:.2f}s")
+
+    async def _run_evaluation_cycle(
+        self,
+        *,
+        plan: Any,
+        window_number: int,
+        env_factory: Any,
+        evaluator: EvaluatorService,
+    ) -> dict[str, float]:
+        """Run evaluation cycle with given plan and evaluator.
+
+        Args:
+            plan: Evaluation plan with task IDs and seeds
+            window_number: Current window number for logging
+            env_factory: Factory function to create evaluation environments
+            evaluator: Pre-configured evaluator instance
+
+        Returns:
+            Dictionary of evaluation metrics
+        """
+        is_startup_eval = self._eval_last_run_window_number is None
+        eval_reason = (
+            "startup" if is_startup_eval else f"after {self._windows_since_last_eval} windows"
+        )
+
+        logger.info("")
+        logger.info("🧪 RUNNING EVALUATION CYCLE")
+        logger.info(f"   Window: {window_number}")
+        logger.info(f"   Tasks: {len(plan.ids)}")
+        logger.info(f"   Replicates: {plan.replicates}")
+        logger.info(f"   Total prompts: {len(plan.ids) * plan.replicates}")
+        logger.info(f"   Split: {self._eval_cfg.split}")
+        logger.info(f"   Backend: {self._eval_cfg.backend}")
+        logger.info(f"   Reason: {eval_reason}")
+        logger.info("")
+
+        cycle_start = time.time()
+        metrics = await evaluator.run_cycle(
+            plan, start_offset=0, heartbeat=self.heartbeat, window_number=window_number
+        )
+        logger.info(f"🧪 Evaluation cycle finished in {time.time() - cycle_start:.2f}s")
+        return metrics
+
+    # ────────────────────────────────────────────────────────────────────────────
+    # Helper Methods
+    # ────────────────────────────────────────────────────────────────────────────
+
+    def _serialize_wallet(self) -> dict[str, str]:
+        """Serialize wallet for pickling to child process.
+
+        Returns:
+            Dictionary of wallet arguments
+        """
+        return {
+            "name": self._context.wallet.name,
+            "hotkey": self._context.wallet.hotkey_str,
+            "path": self._context.wallet.path,
+        }
+
+    def _prepare_monitor_config(self, *, subprocess_label: str) -> dict[str, Any]:
+        """Prepare monitoring config for child process.
+
+        Returns:
+            Dictionary of monitoring configuration
+        """
+        if not self._context.monitor:
+            return {}
+
+        # Copy from backend.config (not manager._config) to get run_name and updated settings
+        # The backend.config is updated by start_run() with run_name, while manager._config
+        # contains only the initial config from CLI initialization.
+        if hasattr(self._context.monitor, "backend") and hasattr(
+            self._context.monitor.backend, "config"
+        ):
+            monitor_config = self._context.monitor.backend.config.copy()
+            # Add backend_type from backend class name (needed by subprocess)
+            backend_class_name = self._context.monitor.backend.__class__.__name__
+            if "WandB" in backend_class_name:
+                monitor_config["backend_type"] = "wandb"
+            elif "Null" in backend_class_name:
+                monitor_config["backend_type"] = "null"
+
+            # If using shared mode, subprocess is a worker (not primary)
+            if monitor_config.get("wandb_shared_mode"):
+                monitor_config["wandb_x_primary"] = False
+                monitor_config["wandb_x_label"] = subprocess_label
+                logger.debug(
+                    "Subprocess %s will use WandB shared mode as worker",
+                    subprocess_label,
+                )
+        else:
+            # Fallback to manager config if backend doesn't have config
+            monitor_config = self._context.monitor._config.copy()
+
+        if hasattr(self._context.monitor, "backend") and hasattr(
+            self._context.monitor.backend, "run"
+        ):
+            wandb_run = self._context.monitor.backend.run
+            if wandb_run and hasattr(wandb_run, "id"):
+                monitor_config["run_id"] = wandb_run.id
+                logger.info(
+                    "Passing W&B run ID %s to %s for multi-process logging",
+                    wandb_run.id,
+                    subprocess_label,
+                )
+
+        # Debug log to verify config contents
+        logger.debug(
+            "Monitor config for subprocess: backend_type=%s run_name=%s run_id=%s entity=%s project=%s",
+            monitor_config.get("backend_type"),
+            monitor_config.get("run_name"),
+            monitor_config.get("run_id"),
+            monitor_config.get("entity"),
+            monitor_config.get("project"),
+        )
+        logger.debug("Full monitor config keys being passed: %s", list(monitor_config.keys()))
+
+        # Warn if critical parameters are missing
+        if not monitor_config.get("entity"):
+            logger.warning("⚠️  entity not in monitor_config passed to subprocess!")
+        if not monitor_config.get("project"):
+            logger.warning("⚠️  project not in monitor_config passed to subprocess!")
+
+        return monitor_config
+
+    def _log_gpu_memory(self, context: str) -> None:
+        """Log GPU memory usage.
+
+        Args:
+            context: Context string for logging
+        """
+        if torch.cuda.is_available():
+            free_gb, total_gb = torch.cuda.mem_get_info()
+            logger.info(
+                "GPU memory %s: %.2f GB free / %.2f GB total",
+                context,
+                free_gb / (1024**3),
+                total_gb / (1024**3),
+            )
+
+    def _get_chat_template_path(self, snapshot_path: str) -> str | None:
+        """Get chat template path from snapshot.
+
+        Args:
+            snapshot_path: Path to snapshot directory
+
+        Returns:
+            Path to chat template or None if not found
+        """
+        chat_template_path = os.path.join(snapshot_path, "chat_template.jinja")
+        if not os.path.isfile(chat_template_path):
+            logger.warning("chat_template.jinja not found, server may use default")
+            return None
+        return chat_template_path
+
+    def _cleanup_evaluation_resources(
+        self,
+        evaluator: EvaluatorService,
+        tokenizer: Any,
+        model: Any | None,
+    ) -> None:
+        """Cleanup evaluation resources and free GPU memory.
+
+        Args:
+            evaluator: Evaluator service to shutdown
+            tokenizer: Tokenizer to delete
+            model: Model to delete (or None)
+        """
+        logger.info("Cleaning up evaluator and freeing GPU memory...")
+        evaluator.shutdown()
+        del tokenizer
+        if model:
+            del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    async def _log_evaluation_metrics(
+        self,
+        metrics: dict[str, float],
+        duration: float,
+    ) -> None:
+        """Log evaluation metrics to monitoring system.
+
+        Args:
+            metrics: Evaluation metrics
+            duration: Evaluation duration in seconds
+        """
+        if not self._context.monitor:
+            return
+
+        await self._context.monitor.log_counter("eval/cycle_completed")
+        for key, val in metrics.items():
+            await self._context.monitor.log_gauge(f"eval/{key}", float(val))
+
+        logger.info("🧪 Total evaluation time: %.2fs (setup + run + cleanup)", duration)
+        await self._context.monitor.log_gauge("profiling/eval_total_time", duration)
+
+        # Emit structured JSON for Grafana trainer dashboard
+        eval_payload: dict[str, float | int | str] = {
+            "duration_sec": duration,
+        }
+        tasks = metrics.get("tasks", 0)
+        if tasks and duration > 0:
+            eval_payload["tasks_per_sec"] = float(tasks) / duration
+        eval_payload.update(metrics)
+        eval_logger.emit(eval_payload)
+
+    async def _log_evaluation_failure(self, duration: float) -> None:
+        """Log evaluation failure metrics.
+
+        Args:
+            duration: Time spent before failure in seconds
+        """
+        logger.info("🧪 Evaluation failed after %.2fs", duration)
+        if self._context.monitor:
+            await self._context.monitor.log_gauge("profiling/eval_total_time_failed", duration)
+
+    async def _initialize_chain_manager(self) -> None:
+        """Initialize chain manager for miner data fetching."""
+        # Fail fast if hotkey is not registered on the subnet
+        await self.ensure_registered(self._context.wallet, NETUID, role="trainer")
+
+        subtensor = await self.get_subtensor()
+        metagraph = await subtensor.metagraph(NETUID)
+
+        config = SimpleNamespace(netuid=NETUID)
+        chain_manager = GrailChainManager(
+            config,
+            self._context.wallet,
+            metagraph,
+            subtensor,
+            self._context.credentials,
+        )
+
+        await chain_manager.initialize()
+        self._context.chain_manager = chain_manager
+        logger.info("Initialized chain manager for trainer lifetime")
+
+        self.register_shutdown_callback(self._cleanup_chain_manager)
+
+    def _cleanup_chain_manager(self) -> None:
+        """Clean up chain manager on shutdown."""
+        if self._context.chain_manager:
+            try:
+                self._context.chain_manager.stop()
+                logger.info("Stopped chain manager")
+            except Exception as exc:
+                logger.warning("Error stopping chain manager: %s", exc)

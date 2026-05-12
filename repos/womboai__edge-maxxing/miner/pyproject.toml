@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools >= 75.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "edge-maxxing-miner"
+description = "The miner which provides optimized models and checkpoints"
+requires-python = ">=3.10,<3.13"
+version = "1.0.0"
+dependencies = [
+    "edge-maxxing-base"
+]
+
+[tool.uv.sources]
+edge-maxxing-base = { path = "../base", editable = true }
+
+[tool.uv]
+override-dependencies = ["toml>=0.10.0"]
+
+[dependency-groups]
+dev = [
+    "pytype==2024.10.11"
+]
+
+[tool.pytype]
+inputs = ["miner"]
+
+[project.scripts]
+submit_model = "miner.submit:main"
+
+[tool.setuptools]
+packages = [
+    "miner",
+]

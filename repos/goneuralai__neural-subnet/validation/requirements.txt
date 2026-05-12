@@ -1,0 +1,16 @@
+numpy==1.25.2
+opencv_python==4.10.0.82
+Pillow==10.4.0
+scikit-image
+torch
+torchvision
+fastapi
+uvicorn
+transformers
+trimesh
+open-clip-torch==2.23.0
+setuptools==69.5.1
+sentence-transformers==3.4.1
+python-dotenv>=1.0.0
+SciPy==1.15.2
+pytesseract

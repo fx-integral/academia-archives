@@ -1,0 +1,301 @@
+"""
+Announcement queue and Discord posting for king changes.
+"""
+import json
+import logging
+import time
+
+from eval.state import RECENT_KINGS_MAX, ValidatorState
+from scripts.validator.config import DISTIL_ROLE_ID, PAIRED_TEST_ALPHA, EVAL_PROMPTS_H2H
+from scripts.validator.composite import (
+    ARENA_V3_AXIS_WEIGHTS,
+    BENCH_AXIS_WEIGHTS,
+    COMPOSITE_FINAL_BOTTOM_WEIGHT,
+    COMPOSITE_SHADOW_VERSION,
+    WORST_3_MEAN_K,
+)
+from scripts.validator.single_eval import SINGLE_EVAL_DETHRONE_MARGIN
+
+
+def _formula_text() -> str:
+    """Return the live ``composite.final`` formula as a Discord-ready string.
+
+    Rendered against the *running* ``COMPOSITE_FINAL_BOTTOM_WEIGHT`` and
+    ``WORST_3_MEAN_K`` so a tuning change (e.g. v31.1's K=3 → K=5,
+    v30.6's α=0.7 → α=0.85) cannot leave the announcement text stale.
+    The previous hard-coded ``0.7 × worst_3_mean`` was off-by-α and
+    off-by-K against the live validator (Discord users `pudding_dev6`
+    and `hklark.1` flagged the mismatch on 2026-05-10).
+    """
+    a = COMPOSITE_FINAL_BOTTOM_WEIGHT
+    k = WORST_3_MEAN_K
+    return f"{a:.2f} × worst_{k}_mean + {1.0 - a:.2f} × weighted"
+
+logger = logging.getLogger("distillation.remote_validator")
+
+
+# Structural / relative axes are always part of the composite dethrone gate
+# regardless of which bench axes are weighted in the current schema. Listing
+# them keeps the public Discord text honest (we *do* score chat behaviour,
+# KL, judge probes, etc) without implying they're optional.
+_STRUCTURAL_AXES = (
+    "on_policy_rkl",
+    "kl",
+    "capability",
+    "judge_probe",
+    "chat_turns_probe",
+    "length",
+    "degeneracy",
+    "reasoning_density",
+)
+
+
+def _active_axis_summary() -> tuple[int, str]:
+    """Return ``(count, comma-separated names)`` of axes with non-zero composite
+    weight, computed live from ``BENCH_AXIS_WEIGHTS`` + ``ARENA_V3_AXIS_WEIGHTS``
+    plus the always-on structural axes.
+
+    Used by the Discord announcement so the axis list can never drift after a
+    schema bump (v27 → v28 muted six bench axes and the literal text was left
+    stale, which surfaced in Discord as inaccurate axis attribution).
+    """
+    active_bench = [k for k, w in BENCH_AXIS_WEIGHTS.items() if w > 0]
+    active_arena = [k for k, w in ARENA_V3_AXIS_WEIGHTS.items() if w > 0]
+    names = active_bench + active_arena + list(_STRUCTURAL_AXES)
+    pretty = ", ".join(n.replace("_bench", "") for n in names)
+    return len(names), pretty
+
+
+def announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl,
+                      state: ValidatorState, paired_prompts=None, total_prompts=None,
+                      p_value=None, *, new_composite_worst=None,
+                      new_composite_weighted=None, new_limiting_axis=None,
+                      old_composite_worst=None, old_composite_weighted=None,
+                      new_composite_final=None, old_composite_final=None,
+                      new_composite_worst_3_mean=None,
+                      old_composite_worst_3_mean=None):
+    """Write a pending announcement to state for async Discord posting.
+
+    v30.2 (2026-04-29): the canonical ranking key is ``composite.final``
+    (= α × worst_K_mean + (1 − α) × weighted) where α and K live in
+    ``COMPOSITE_FINAL_BOTTOM_WEIGHT`` and ``WORST_3_MEAN_K`` (current
+    runtime: ``α = 0.85, K = 5`` after the v31.1 variance-reduction
+    sweep). When ``new_composite_final`` is provided, the headline
+    leads with ``Composite final`` and demotes ``worst`` to a
+    "limiting axis" telemetry line. Falls back to the legacy
+    ``Composite worst`` headline for callers that haven't migrated yet.
+    """
+    import os as _os
+    single_eval_active = bool(int(_os.environ.get("SINGLE_EVAL_MODE", "0") or 0))
+
+    # Compute the new king's actual emission share under the v30.4
+    # multi-king payout policy: emission is split equally across the
+    # ``RECENT_KINGS_MAX`` (=5) most-recent distinct king UIDs. The
+    # caller (``post_round`` → ``_record_king_change``) has already
+    # pushed ``new_uid`` to ``state.recent_kings[0]`` before invoking
+    # this function, so the live recent-kings queue is the source of
+    # truth here. We dedupe + cap defensively in case a legacy caller
+    # invoked us pre-record. Honors ``MULTI_KING_PAYOUT_ENABLED=0`` for
+    # the legacy winner-takes-all override.
+    distinct_kings: list[int] = []
+    for u in (getattr(state, "recent_kings", []) or []):
+        try:
+            u_i = int(u)
+        except (TypeError, ValueError):
+            continue
+        if u_i < 0 or u_i in distinct_kings:
+            continue
+        distinct_kings.append(u_i)
+        if len(distinct_kings) >= RECENT_KINGS_MAX:
+            break
+    try:
+        new_uid_i = int(new_uid)
+        if new_uid_i >= 0 and new_uid_i not in distinct_kings:
+            distinct_kings.insert(0, new_uid_i)
+            distinct_kings = distinct_kings[:RECENT_KINGS_MAX]
+    except (TypeError, ValueError):
+        pass
+    multi_king_enabled = bool(int(_os.environ.get("MULTI_KING_PAYOUT_ENABLED", "1") or 1))
+    n_kings = max(1, len(distinct_kings)) if multi_king_enabled else 1
+
+    earnings_line = ""
+    try:
+        import urllib.request
+        resp = urllib.request.urlopen("https://api.arbos.life/api/price", timeout=10)
+        price_data = json.loads(resp.read())
+        tao_per_day = price_data.get("miners_tao_per_day", 0)
+        tao_usd = price_data.get("tao_usd", 0)
+        if tao_per_day > 0 and tao_usd > 0:
+            king_tao_per_day = tao_per_day / n_kings
+            king_usd_per_day = king_tao_per_day * tao_usd
+            usd_per_day = tao_per_day * tao_usd
+            share_pct = 100.0 / n_kings
+            steady_pct = 100.0 / RECENT_KINGS_MAX
+            if not multi_king_enabled:
+                earnings_line = (
+                    f"\n💰 **King earns ~{tao_per_day:.1f} τ/day "
+                    f"(${usd_per_day:,.0f}/day)** — winner takes all "
+                    f"(`MULTI_KING_PAYOUT_ENABLED=0`).\n"
+                )
+            elif n_kings == 1:
+                earnings_line = (
+                    f"\n💰 **UID {new_uid} earns ~{king_tao_per_day:.1f} τ/day "
+                    f"(${king_usd_per_day:,.0f}/day)** — currently 100% of the "
+                    f"~{tao_per_day:.1f} τ/day crown pool. Emission auto-splits "
+                    f"equally across the {RECENT_KINGS_MAX} most-recent distinct "
+                    f"kings, so this share dilutes toward ~{steady_pct:.0f}% as "
+                    f"new kings are crowned.\n"
+                )
+            else:
+                earnings_line = (
+                    f"\n💰 **UID {new_uid} earns ~{king_tao_per_day:.1f} τ/day "
+                    f"(${king_usd_per_day:,.0f}/day)** — {share_pct:.0f}% of the "
+                    f"~{tao_per_day:.1f} τ/day crown pool, split equally across "
+                    f"the {n_kings} most-recent distinct kings (cap "
+                    f"{RECENT_KINGS_MAX}).\n"
+                )
+    except Exception as e:
+        logger.warning(f"Failed to fetch price data for announcement: {e}")
+
+    role_ping = f"<@&{DISTIL_ROLE_ID}>"
+    prompt_count = paired_prompts or total_prompts or EVAL_PROMPTS_H2H
+
+    # Wording branch: in single-eval mode the king is selected cross-round from
+    # composite_scores (different prompts per challenger), so "paired prompts"
+    # is misleading. Show the per-challenger prompt count instead and explain
+    # the actual gate. In legacy paired-t-test mode keep the old wording.
+    if single_eval_active:
+        prompt_line = f"🧪 Scored on {prompt_count} block-seeded prompts"
+        n_axes, axis_list = _active_axis_summary()
+        gate_explainer = (
+            f"Dethronement uses `composite.final = {_formula_text()}` "
+            f"across {n_axes} axes ({axis_list}). Challenger must clear the king on "
+            f"`final` by >{int(round(SINGLE_EVAL_DETHRONE_MARGIN * 100))}%. "
+            f"KL shown above is one of N axes — not the ranking key. "
+            f"One eval per commitment; the king is paired-re-evaluated every round "
+            f"on the same procedural items as challengers (composite schema "
+            f"v{COMPOSITE_SHADOW_VERSION})."
+        )
+    else:
+        prompt_line = f"🧪 Compared on {prompt_count} paired prompts"
+        if total_prompts and paired_prompts and total_prompts != paired_prompts:
+            prompt_line = f"🧪 Compared on {paired_prompts}/{total_prompts} paired prompts"
+        gate_explainer = (
+            f"Dethronement uses one-sided paired t-test (p<{PAIRED_TEST_ALPHA})."
+        )
+    p_line = f" (p={p_value:.4f})" if isinstance(p_value, (int, float)) else ""
+
+    # Build the headline. v30.2 (2026-04-29) made ``composite.final`` the
+    # ranking key (= α × worst_K_mean + (1 − α) × weighted). When ``final``
+    # is available, lead with it and surface ``worst_K_mean``, ``worst``
+    # (as the limiting-axis telemetry line), ``weighted``, and KL.
+    # The ``worst-K`` label is rendered against the live ``WORST_3_MEAN_K``
+    # so v31.1's K=3 → K=5 bump can never leak as ``worst-3 mean: …``
+    # in Discord (which it did during the 2026-05-10 transition window
+    # and which Discord users `pudding_dev6` and `hklark.1` flagged).
+    # Falls back to the legacy worst-led headline for legacy callers.
+    if new_composite_final is not None:
+        final_line = f"📊 **Composite final: {new_composite_final:.3f}** (ranking key)"
+        if old_composite_final is not None:
+            final_line += f" — previous king: {old_composite_final:.3f}"
+        breakdown_parts = []
+        if new_composite_worst_3_mean is not None:
+            w3 = f"worst-{WORST_3_MEAN_K} mean: {new_composite_worst_3_mean:.3f}"
+            if old_composite_worst_3_mean is not None:
+                w3 += f" (was {old_composite_worst_3_mean:.3f})"
+            breakdown_parts.append(w3)
+        if new_composite_weighted is not None:
+            ww = f"weighted: {new_composite_weighted:.3f}"
+            if old_composite_weighted is not None:
+                ww += f" (was {old_composite_weighted:.3f})"
+            breakdown_parts.append(ww)
+        breakdown_line = ""
+        if breakdown_parts:
+            breakdown_line = "\n📐 " + " · ".join(breakdown_parts)
+        worst_telemetry = ""
+        if new_composite_worst is not None:
+            worst_telemetry = f"\n└ Worst-axis floor: {new_composite_worst:.3f}"
+            if new_limiting_axis:
+                axis_pretty = new_limiting_axis.replace("_bench", "").replace("_", " ")
+                worst_telemetry += f" ({axis_pretty})"
+        kl_part = f"\n└ KL component: {new_kl:.6f} (one of N axes — not the ranking key)"
+        headline = final_line + breakdown_line + worst_telemetry + kl_part
+    elif new_composite_worst is not None:
+        worst_line = f"📊 **Composite worst: {new_composite_worst:.3f}** (legacy ranking)"
+        if new_limiting_axis:
+            axis_pretty = new_limiting_axis.replace("_bench", "").replace("_", " ")
+            worst_line += f" (limiting axis: {axis_pretty})"
+        if old_composite_worst is not None:
+            worst_line += f" — previous king: {old_composite_worst:.3f}"
+        weighted_part = ""
+        if new_composite_weighted is not None:
+            weighted_part = f"\n📐 Weighted mean: {new_composite_weighted:.3f}"
+            if old_composite_weighted is not None:
+                weighted_part += f" (was {old_composite_weighted:.3f})"
+        kl_part = f"\n└ KL component: {new_kl:.6f} (one of N axes — not the ranking key)"
+        headline = worst_line + weighted_part + kl_part
+    else:
+        # Backward-compat path. Lead with KL but explicitly note it's
+        # one of N axes so the framing isn't misleading even here.
+        headline = (
+            f"📊 **KL: {new_kl:.6f}** (one of N axes; previous king's KL: {old_kl:.6f})"
+        )
+
+    # 2026-05-04 — cold-start crowning: ``old_uid`` is None when this is
+    # the first king of a new era (e.g. immediately after a teacher
+    # cutover that reset all composite scores). Render a different
+    # headline that doesn't pretend there was a "previous king" to
+    # dethrone, but still surfaces the same composite/KL telemetry so
+    # miners can see what bar the new king cleared.
+    is_cold_start = old_uid is None
+    if is_cold_start:
+        title_line = "## 🏆 First King of the Kimi-K2.6 era!"
+        action_line = (
+            f"**UID {new_uid}** is the first miner to clear the post-cutover "
+            f"composite gate and take the crown."
+        )
+        prev_line = (
+            "👑 Previous king: *(none — fresh state after the 2026-05-02 "
+            "Qwen → Kimi-K2.6 teacher cutover)*"
+        )
+    else:
+        title_line = "## 🏆 New King of Distil SN97!"
+        action_line = f"**UID {new_uid}** has dethroned **UID {old_uid}**"
+        prev_line = (
+            f"👑 Previous king: [{old_model}]"
+            f"(<https://huggingface.co/{old_model}>)"
+        )
+    announcement = {
+        "type": "new_king",
+        "timestamp": time.time(),
+        "posted": False,
+        "message": (
+            f"{role_ping}\n"
+            f"{title_line}\n\n"
+            f"{action_line}\n\n"
+            f"{headline}\n"
+            f"{prompt_line}{p_line}\n"
+            f"🤗 Model: [{new_model}](<https://huggingface.co/{new_model}>)\n"
+            f"{prev_line}\n"
+            f"{earnings_line}\n"
+            f"{gate_explainer} "
+            f"Check the [mining guide](<https://github.com/unarbos/distil#mining-guide>) to get started.\n\n"
+            f"📈 [Live Dashboard](<https://distil.arbos.life>)"
+        ),
+        "data": {
+            "new_uid": new_uid, "new_model": new_model, "new_kl": new_kl,
+            "old_uid": old_uid, "old_model": old_model, "old_kl": old_kl,
+            "new_composite_final": new_composite_final,
+            "old_composite_final": old_composite_final,
+            "new_composite_worst_3_mean": new_composite_worst_3_mean,
+            "old_composite_worst_3_mean": old_composite_worst_3_mean,
+            "new_composite_worst": new_composite_worst,
+            "new_composite_weighted": new_composite_weighted,
+            "new_limiting_axis": new_limiting_axis,
+            "old_composite_worst": old_composite_worst,
+            "old_composite_weighted": old_composite_weighted,
+            "single_eval_mode": single_eval_active,
+        },
+    }
+    state.save_announcement(announcement)
+    logger.info(f"Announcement written: UID {new_uid} dethroned UID {old_uid}")

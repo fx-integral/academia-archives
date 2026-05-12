@@ -1,0 +1,111 @@
+{
+  "netuid": 24,
+  "project": {
+    "name": "Quasar",
+    "company": "SILX",
+    "website": "https://silxinc.com",
+    "twitter": "https://x.com/QuasarModels",
+    "github": "https://github.com",
+    "huggingface": "https://huggingface.co"
+  },
+  "student": {
+    "baseModel": "silx-ai/Quasar-3B-A1B-Preview",
+    "revision": "main",
+    "architecture": "quasar",
+    "totalParams": 3000000000,
+    "activeParams": 1000000000,
+    "maxStudentParams": 3500000000,
+    "vocabSize": 248320,
+    "dModel": 1536,
+    "nHeads": 12,
+    "nLayers": 24,
+    "dFf": 4096,
+    "headDim": 128,
+    "numSharedExperts": 1,
+    "numRoutedExperts": 64,
+    "topK": 4,
+    "sharedExpertSize": 3072,
+    "routedExpertSize": 256,
+    "quasarLayers": 4,
+    "gatedLayers": 2,
+    "denseInputLayers": 4,
+    "maxSeqLen": 16384,
+    "dropout": 0.0,
+    "rmsNormEps": 0.000001,
+    "initializerRange": 0.02,
+    "useCache": true,
+    "tieWordEmbeddings": false,
+    "useGlaFirst": false,
+    "useShortConv": true,
+    "convSize": 4,
+    "convBias": false,
+    "allowNegEigval": false,
+    "attnMode": "chunk",
+    "expandK": 0.5,
+    "expandV": 1.0,
+    "glaMode": "chunk",
+    "memorySlots": 128,
+    "memoryDim": 128,
+    "moeType": "bigmac",
+    "bigmacR": 0.25,
+    "moeZLossCoeff": 0.0001,
+    "moeAuxLossCoeff": 0.0001,
+    "smebuKappa": 2.0,
+    "smebuLambda": 0.002,
+    "smebuBeta": 0.5,
+    "numLoops": 1,
+    "useLoopedInjection": false,
+    "loopedInjectionInit": 0.1,
+    "ropeTheta": 1000000.0,
+    "hiddenAct": "silu",
+    "residualScale": 0.1,
+    "bosTokenId": 1,
+    "eosTokenId": 2,
+    "autoMap": {
+      "AutoConfig": "configuration_quasar.QuasarConfig",
+      "AutoModelForCausalLM": "modeling_quasar.QuasarForCausalLM"
+    },
+    "chatTemplateHash": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
+    "allowedCustomCodeFiles": [
+      "configuration_quasar.py",
+      "modeling_quasar.py"
+    ]
+  },
+  "teacher": {
+    "model": "Qwen/Qwen3.5-4B",
+    "architecture": "qwen3_5",
+    "totalParams": 4000000000,
+    "activeParams": 4000000000,
+    "vocabSize": 248044,
+    "configVocabSize": 248320
+  },
+  "validator": {
+    "maxKlThreshold": 2.0,
+    "maxNewTokens": 8192,
+    "maxPromptTokens": 1024,
+    "evalPromptsFull": 60,
+    "evalPromptsH2h": 300,
+    "vllmConcurrency": 32,
+    "epsilon": 0.03,
+    "pairedTestAlpha": 0.03,
+    "staleH2hEpochs": 50,
+    "topNAlwaysInclude": 5,
+    "referenceModel": "silx-ai/Quasar-3B-A1B-Preview",
+    "referenceUid": -1,
+    "activationCopyThreshold": 0.99999,
+    "roleId": ""
+  },
+  "chat": {
+    "appPort": 8100
+  },
+  "api": {
+    "cacheTtl": 60,
+    "publicUrl": "http://localhost:3710",
+    "dashboardUrl": "http://localhost:3720",
+    "allowedOrigins": [
+      "http://localhost:3720",
+      "http://localhost:3000"
+    ],
+    "tmcBase": "https://api.taomarketcap.com"
+  }
+}

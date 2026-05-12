@@ -1,0 +1,29 @@
+# Bittensor
+bittensor>=7.0.0
+bittensor-cli>=9.15.0
+# HTTP client for API calls
+httpx>=0.25.0
+
+# PyTorch (required by bittensor)
+torch>=2.0.0
+
+# Utilities
+python-dotenv>=1.0.0
+
+# Database
+alembic>=1.13.0
+sqlalchemy>=2.0.0
+
+# Code formatting and linting (for CI)
+black>=23.0.0
+flake8>=7.0.0
+
+# Testing
+pytest>=8.0.0
+
+# Validation
+pydantic>=2.0.0
+
+# Data processing
+pandas>=2.0.0
+numpy>=1.26.0

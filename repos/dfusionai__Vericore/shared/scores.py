@@ -1,0 +1,45 @@
+from shared.veridex_protocol import EvidenceCategory
+
+UNREACHABLE_MINER_SCORE = -10
+NO_STATEMENTS_PROVIDED_SCORE = -5
+INVALID_RESPONSE_MINER_SCORE = -10
+SSL_DOMAIN_REQUIRED = -2
+APPROVED_URL_MULTIPLIER = 3 #
+
+EXCERPT_TOO_SIMILAR = -5
+BLACKLISTED_URL_SCORE =-5
+SNIPPET_NOT_VERIFIED_IN_URL = -1
+SNIPPET_NOT_CONTEXT_SIMILAR = 0 # NOT PENALIZING
+NO_SNIPPET_PROVIDED = -5
+USING_SEARCH_AS_EVIDENCE = -5
+FAKE_MINER_URL = -5
+FAKE_SNIPPET = -5
+UNRELATED_PAGE_SNIPPET = 0
+INVALID_SNIPPET_EXCERPT = -5
+IS_SEARCH_WEB_PAGE = -5
+DUPLICATE_EXACT_MINER_STATEMENTS = 0
+COULD_NOT_GET_PAGE_TEXT_FROM_URL=0
+DOMAIN_REGISTERED_RECENTLY = -1
+
+# Gaming responses
+SNIPPET_SAME_AS_STATEMENT = -10
+
+# Desearch (miner-level, applied once per miner response)
+DESEARCH_PROOF_VALID_BONUS = 2
+DESEARCH_PROOF_INVALID_PENALTY = -5
+# Desearch snippet: evidence URL/excerpt not found in response body
+DESEARCH_EVIDENCE_NOT_IN_RESPONSE = -1
+
+# Social bonus (per desearch snippet only): x.com → +1, reddit.com → +0.5
+SOCIAL_BONUS_DOMAIN_X = 1.0
+SOCIAL_BONUS_DOMAIN_REDDIT = 0.5
+SOCIAL_BONUS_DOMAINS_X = ("x.com", "twitter.com")  # domains that receive SOCIAL_BONUS_DOMAIN_X
+SOCIAL_BONUS_DOMAIN_REDDIT_NAME = "reddit.com"
+
+
+def evidence_category_for_domain(domain: str) -> EvidenceCategory:
+    """Return EvidenceCategory.SOCIAL for x.com/twitter.com/reddit.com, else EvidenceCategory.WEB."""
+    domain_lower = (domain or "").lower()
+    if domain_lower in SOCIAL_BONUS_DOMAINS_X or domain_lower == SOCIAL_BONUS_DOMAIN_REDDIT_NAME:
+        return EvidenceCategory.SOCIAL
+    return EvidenceCategory.WEB

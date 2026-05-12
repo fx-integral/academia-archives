@@ -1,0 +1,113 @@
+# =============================================================================
+# StoryNet Narrative Evaluation Config - EXAMPLE
+# =============================================================================
+#
+# This is an EXAMPLE configuration file.
+#
+# For production use, copy this file to one of these locations:
+#   - ~/.storynet/narrative_config.yaml  (recommended, user-specific)
+#   - /etc/storynet/narrative_config.yaml (system-wide)
+#
+# The actual evaluation prompts should be customized and kept private.
+# Do NOT commit your real config to git.
+#
+# =============================================================================
+
+# Enable/disable AI evaluation
+enabled: true
+
+# Backend selection: "ollama", "openai", "zhipu", "custom"
+backend: ollama
+
+# Ollama settings (if backend: ollama)
+ollama_url: "http://localhost:11434"
+model: "qwen2.5:7b"
+
+# OpenAI settings (if backend: openai)
+# Requires OPENAI_API_KEY environment variable
+openai_model: "gpt-4o-mini"
+
+# Zhipu settings (if backend: zhipu)
+# Requires ZHIPU_API_KEY environment variable
+zhipu_model: "glm-4-flash"
+
+# Custom HTTP endpoint (if backend: custom)
+# custom_url: "http://your-api-endpoint/evaluate"
+# custom_headers:
+#   Authorization: "Bearer your-token"
+
+# Request settings
+timeout: 30
+max_retries: 2
+
+# Caching
+cache_enabled: true
+
+# Fallback score (0-20) when AI evaluation fails
+fallback_score: 10.0
+
+# Dimension weights (must sum to 1.0)
+dimension_weights:
+  narrative_flow: 0.30
+  emotional_impact: 0.25
+  creative_originality: 0.25
+  internal_consistency: 0.20
+
+# =============================================================================
+# EVALUATION PROMPT
+# =============================================================================
+# This is the core of your competitive advantage.
+# Customize this prompt to match your quality standards.
+# External miners cannot see this prompt, so they cannot game it directly.
+#
+# Available template variables:
+#   {content} - The story content to evaluate
+#   {context} - Additional context (blueprint, user input, etc.)
+# =============================================================================
+
+evaluation_prompt: |
+  You are a senior story editor at a major publishing house.
+  Your job is to evaluate the quality of story content with a critical eye.
+
+  Evaluate the following content on these dimensions:
+
+  1. Narrative Flow (0-5):
+     - Does the story progress smoothly?
+     - Are transitions between scenes natural?
+     - Is the pacing appropriate?
+
+  2. Emotional Impact (0-5):
+     - Does the content evoke genuine emotions?
+     - Are character struggles relatable?
+     - Is there emotional depth beyond surface-level drama?
+
+  3. Creative Originality (0-5):
+     - Are the ideas fresh and interesting?
+     - Does it avoid clichés or use them cleverly?
+     - Is there a unique voice or perspective?
+
+  4. Internal Consistency (0-5):
+     - Is the story logically coherent?
+     - Do character actions match their established personalities?
+     - Are there plot holes or contradictions?
+
+  === CONTENT TO EVALUATE ===
+  {content}
+
+  === CONTEXT ===
+  {context}
+
+  === IMPORTANT NOTES ===
+  - Be critical but fair
+  - A score of 3 is "average/acceptable"
+  - Reserve 5 for truly exceptional work
+  - Reserve 0-1 for serious quality issues
+
+  Respond with ONLY a JSON object in this exact format:
+  {{
+      "narrative_flow": <score 0-5>,
+      "emotional_impact": <score 0-5>,
+      "creative_originality": <score 0-5>,
+      "internal_consistency": <score 0-5>,
+      "brief_notes": "<1-2 sentence summary of key observations>"
+  }}

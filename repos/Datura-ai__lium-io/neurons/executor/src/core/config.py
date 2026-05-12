@@ -1,0 +1,41 @@
+from typing import Optional
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+# This hotkey is used to verify the validator signature. 
+# This shouldn't be overridden by the environment variable. 
+VALIDATOR_HOTKEY_SS58 = "5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13p"
+try:
+    from core.config_override import _VALIDATOR_HOTKEY_SS58 
+    VALIDATOR_HOTKEY_SS58 = _VALIDATOR_HOTKEY_SS58
+except Exception as e:
+    pass
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    PROJECT_NAME: str = "compute-subnet-executor"
+
+    INTERNAL_PORT: int = Field(env="INTERNAL_PORT", default=8001)
+    SSH_PORT: int = Field(env="SSH_PORT", default=2200)
+    SSH_PUBLIC_PORT: Optional[int] = Field(env="SSH_PUBLIC_PORT", default=None)
+
+    MINER_HOTKEY_SS58_ADDRESS: str = Field(env="MINER_HOTKEY_SS58_ADDRESS")
+    DEFAULT_MINER_HOTKEY: str = Field(
+        env="DEFAULT_MINER_HOTKEY",
+        default="5D4jX4TqUkZwNwKAjjYrbk2FHFNN2U1TgFF6ZMuNPnjnKJVU"
+    )
+
+    RENTING_PORT_RANGE: Optional[str] = Field(env="RENTING_PORT_RANGE", default=None)
+    RENTING_PORT_MAPPINGS: Optional[str] = Field(env="RENTING_PORT_MAPPINGS", default=None)
+
+    ENV: str = Field(env="ENV", default="dev")
+
+    DB_URI: str = Field(env="DB_URI")
+
+    ENABLE_TDX_ATTESTATION: bool = Field(env="ENABLE_TDX_ATTESTATION", default=False)
+    TDX_QUOTE_TIMEOUT: int = Field(env="TDX_QUOTE_TIMEOUT", default=60)
+    SSH_HOST_KEY_PATH: str = Field(env="SSH_HOST_KEY_PATH", default="/etc/ssh/ssh_host_ed25519_key.pub")
+
+
+settings = Settings()

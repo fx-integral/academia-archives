@@ -1,0 +1,551 @@
+"""HuggingFace model downloader with retry and circuit breaker."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import shutil
+import tempfile
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub.utils import (
+    EntryNotFoundError,
+    HfHubHTTPError,
+    RepositoryNotFoundError,
+)
+
+from ..data.config_encoder import parse_feature_config
+from ..data.errors import FeatureConfigError
+from .cache import ModelCache
+from .errors import (
+    CircuitBreakerOpenError,
+    FeatureConfigValidationError,
+    InsufficientDiskSpaceError,
+    ModelDownloadError,
+)
+from .models import CachedModel
+from .verifier import ModelVerifier
+
+if TYPE_CHECKING:
+    from ..chain.models import ChainModelMetadata
+    from ..data.config_encoder import FeatureConfig
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class DownloadConfig:
+    """Configuration for model downloads."""
+
+    max_model_size_bytes: int = 200 * 1024 * 1024  # 200 MB
+    max_retries: int = 4
+    initial_retry_delay_seconds: int = 30  # 30s -> 1min -> 2min -> 4min
+    circuit_breaker_threshold: int = 5  # consecutive failures to open circuit
+    circuit_breaker_pause_minutes: int = 5
+    download_timeout_seconds: int = 300
+
+
+@dataclass(frozen=True)
+class ModelDownloadResult:
+    """Result of a successful model download."""
+
+    path: Path
+    commit_block: int  # Block number from Pylon chain query (trusted source)
+    feature_config: FeatureConfig | None = None  # Parsed feature config (if provided)
+    license_type: str | None = None  # Verified license type (e.g. "exclusive")
+
+
+@dataclass
+class _CircuitBreakerState:
+    """Internal state for circuit breaker."""
+
+    consecutive_failures: int = 0
+    open_until: datetime | None = None
+
+
+class ModelDownloader:
+    """
+    Download and cache ONNX models from HuggingFace.
+
+    Features:
+    - Pre-download checks (license, size) via HF API
+    - Extrinsic verification before download
+    - Hash verification after download
+    - Exponential backoff retry (30s -> 1min -> 2min -> 4min)
+    - Circuit breaker for rate limiting (5 failures -> pause 5 min)
+    - Atomic file operations (temp -> move)
+
+    Note: ONNX integrity is verified later in the sandboxed Docker evaluator.
+    """
+
+    def __init__(
+        self,
+        config: DownloadConfig,
+        cache: ModelCache,
+        verifier: ModelVerifier,
+        hf_token: str | None = None,
+    ):
+        """
+        Initialize downloader.
+
+        Args:
+            config: Download configuration
+            cache: Model cache for storing downloads
+            verifier: Verifier for pre/post-download checks
+            hf_token: Optional HuggingFace API token for authenticated downloads
+        """
+        self._config = config
+        self._cache = cache
+        self._verifier = verifier
+        self._hf_token = hf_token
+        self._circuit_breaker = _CircuitBreakerState()
+
+    async def download_model(
+        self, commitment: ChainModelMetadata
+    ) -> ModelDownloadResult:
+        """
+        Download and cache a model.
+
+        Steps:
+        1. Check circuit breaker
+        2. Check cache (skip if hash matches)
+        3. Check license via HF API
+        4. Check size via HF API
+        5. Verify extrinsic_record.json (get commit block from Pylon)
+        6. Download to temp file
+        7. Verify hash matches commitment
+        8. Atomic move to cache
+
+        Args:
+            commitment: Chain commitment with hotkey, hf_repo_id, model_hash
+
+        Returns:
+            ModelDownloadResult with path and commit block (from Pylon)
+
+        Raises:
+            CircuitBreakerOpenError: If circuit breaker is open
+            LicenseError: If license check fails
+            ModelTooLargeError: If model exceeds size limit
+            ExtrinsicVerificationError: If extrinsic check fails
+            HashMismatchError: If hash doesn't match
+            ModelDownloadError: If download fails after retries
+        """
+        hotkey = commitment.hotkey
+        hf_repo_id = commitment.hf_repo_id
+        expected_hash = commitment.model_hash
+
+        if self._is_circuit_breaker_open():
+            remaining = self._get_circuit_breaker_remaining_seconds()
+            raise CircuitBreakerOpenError(
+                f"Circuit breaker open. Retry in {remaining:.0f} seconds."
+            )
+
+        if self._cache.is_valid(hotkey, expected_hash):
+            cached = self._cache.get(hotkey)
+            if cached:
+                # Evict cache entries without exclusive license so they
+                # get re-downloaded with full license verification.
+                if cached.metadata.license_type != "exclusive":
+                    logger.info(
+                        f"Evicting cached model for {hotkey}: "
+                        f"license_type='{cached.metadata.license_type}', "
+                        f"re-downloading to verify license"
+                    )
+                    self._cache.remove(hotkey)
+                else:
+                    logger.info(f"Using cached model for {hotkey}")
+                    # Restore feature_config from cache metadata if available.
+                    # Parse failure here is a version-skew defense — the cache
+                    # was written by an older downloader whose schema rules
+                    # differ from the current one. Evict the entry and raise so
+                    # the scheduler records a failure and the next retry
+                    # re-downloads (since is_valid will now be False).
+                    cached_feature_config = None
+                    if cached.metadata.feature_config is not None:
+                        try:
+                            cached_feature_config = parse_feature_config(
+                                cached.metadata.feature_config
+                            )
+                        except FeatureConfigError as e:
+                            self._cache.remove(hotkey)
+                            raise FeatureConfigValidationError(
+                                f"Cached feature_config for {hotkey} no longer "
+                                f"validates against current schema: {e}. "
+                                "Evicted cache entry; will re-download on retry."
+                            ) from e
+                    return ModelDownloadResult(
+                        path=cached.path,
+                        commit_block=cached.metadata.commit_block,
+                        feature_config=cached_feature_config,
+                        license_type=cached.metadata.license_type,
+                    )
+
+        logger.info(f"Downloading model for {hotkey} from {hf_repo_id}")
+
+        license_type = await self._verifier.check_license(hf_repo_id)
+
+        # Single API call to find ONNX file and feature_config.json
+        onnx_filename, size, feature_config_info = await self._verifier.find_repo_files(
+            hf_repo_id
+        )
+        self._verifier.check_model_size(
+            size, self._config.max_model_size_bytes, onnx_filename
+        )
+
+        disk_buffer = 100_000_000  # 100MB safety margin
+        free_space = self._cache.get_free_disk_space()
+        if free_space < size + disk_buffer:
+            raise InsufficientDiskSpaceError(
+                f"Insufficient disk space: {free_space} bytes free, "
+                f"need {size + disk_buffer} bytes ({size} + {disk_buffer} buffer)"
+            )
+
+        # 6. Verify extrinsic record and get commit block from Pylon
+        commit_block = await self._verifier.verify_extrinsic_record(
+            hotkey=hotkey,
+            hf_repo_id=hf_repo_id,
+            expected_hash=expected_hash,
+        )
+
+        # 7. Download and validate feature_config.json before the ONNX model
+        # so a bad config doesn't waste the full model transfer.
+        feature_config = None
+        feature_config_raw = None
+        if feature_config_info is not None:
+            config_temp_dir = await self._download_with_retry_batch(
+                hf_repo_id, ["feature_config.json"]
+            )
+            config_path = config_temp_dir / "feature_config.json"
+            try:
+                with open(config_path) as f:
+                    feature_config_raw = json.load(f)
+            except json.JSONDecodeError as e:
+                raise FeatureConfigValidationError(
+                    f"Invalid feature_config.json for {hotkey}: {e}"
+                ) from e
+            finally:
+                self._cleanup_temp_dir(str(config_temp_dir))
+
+            feature_config = self._verifier.validate_feature_config(feature_config_raw)
+            feature_config_raw = {
+                "version": feature_config_raw.get("version"),
+                "features": feature_config_raw.get("features"),
+            }
+            logger.info(
+                f"Feature config validated for {hotkey}: "
+                f"{len(feature_config.features)} features"
+            )
+
+        # 8. Download the ONNX model (only reached if feature_config was
+        # absent OR validated successfully)
+        temp_dir_path = await self._download_with_retry_batch(
+            hf_repo_id, [onnx_filename]
+        )
+        temp_path = temp_dir_path / onnx_filename
+
+        try:
+            # 9. Verify hash
+            self._verifier.verify_hash(temp_path, expected_hash)
+
+            # 10. Move to cache
+            actual_size = temp_path.stat().st_size
+            temp_dir = temp_path.parent
+            cached_path = self._cache.put(
+                hotkey=hotkey,
+                temp_model_path=temp_path,
+                model_hash=expected_hash,
+                size_bytes=actual_size,
+                commit_block=commit_block,
+                feature_config=feature_config_raw,
+                license_type=license_type,
+            )
+
+            # 11. Clean up temp directory (file was moved, dir may have HF cache files)
+            self._cleanup_temp_dir(str(temp_dir))
+
+            self._record_success()
+            logger.info(f"Successfully downloaded and cached model for {hotkey}")
+            return ModelDownloadResult(
+                path=cached_path,
+                commit_block=commit_block,
+                feature_config=feature_config,
+                license_type=license_type,
+            )
+
+        except Exception:
+            # Clean up temp file and directory on any verification failure
+            self._cleanup_temp_dir(str(temp_path.parent))
+            raise
+
+    async def _download_with_retry(self, hf_repo_id: str, filename: str) -> Path:
+        """
+        Download ONNX model with exponential backoff retry.
+
+        Args:
+            hf_repo_id: HuggingFace repository ID
+            filename: Name of the ONNX file to download
+
+        Returns:
+            Path to downloaded file in temp directory
+
+        Raises:
+            ModelDownloadError: If all retries exhausted
+        """
+        last_error: Exception | None = None
+        delay = self._config.initial_retry_delay_seconds
+
+        for attempt in range(self._config.max_retries):
+            temp_dir: str | None = None
+            try:
+                temp_dir = tempfile.mkdtemp(prefix="model_download_")
+
+                # Run synchronous hf_hub_download in thread pool with timeout
+                downloaded_path = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        hf_hub_download,
+                        repo_id=hf_repo_id,
+                        filename=filename,
+                        local_dir=temp_dir,
+                        token=self._hf_token,
+                    ),
+                    timeout=self._config.download_timeout_seconds,
+                )
+
+                return Path(downloaded_path)
+
+            except RepositoryNotFoundError as e:
+                self._cleanup_temp_dir(temp_dir)
+                # Don't record failure - this is a permanent config error, not transient
+                raise ModelDownloadError(f"Repository not found: {hf_repo_id}") from e
+
+            except EntryNotFoundError as e:
+                self._cleanup_temp_dir(temp_dir)
+                # Don't record failure - this is a permanent config error, not transient
+                raise ModelDownloadError(f"{filename} not found in {hf_repo_id}") from e
+
+            except asyncio.TimeoutError as e:
+                self._cleanup_temp_dir(temp_dir)
+                last_error = e
+                self._record_failure()
+
+                if attempt < self._config.max_retries - 1:
+                    logger.warning(
+                        f"Download attempt {attempt + 1} timed out for {hf_repo_id} "
+                        f"(>{self._config.download_timeout_seconds}s). Retrying in {delay}s..."
+                    )
+                    await asyncio.sleep(delay)
+                    delay *= 2  # Exponential backoff
+
+            except HfHubHTTPError as e:
+                self._cleanup_temp_dir(temp_dir)
+                last_error = e
+                self._record_failure()
+
+                if attempt < self._config.max_retries - 1:
+                    logger.warning(
+                        f"Download attempt {attempt + 1} failed for {hf_repo_id}: {e}. "
+                        f"Retrying in {delay}s..."
+                    )
+                    await asyncio.sleep(delay)
+                    delay *= 2  # Exponential backoff
+
+            except Exception as e:
+                self._cleanup_temp_dir(temp_dir)
+                last_error = e
+                self._record_failure()
+
+                if attempt < self._config.max_retries - 1:
+                    logger.warning(
+                        f"Download attempt {attempt + 1} failed for {hf_repo_id}: {e}. "
+                        f"Retrying in {delay}s..."
+                    )
+                    await asyncio.sleep(delay)
+                    delay *= 2
+
+        raise ModelDownloadError(
+            f"Failed to download model from {hf_repo_id} after "
+            f"{self._config.max_retries} attempts: {last_error}"
+        )
+
+    async def _download_with_retry_batch(
+        self, hf_repo_id: str, allow_patterns: list[str]
+    ) -> Path:
+        """
+        Download multiple files from HuggingFace in one call with retry.
+
+        Uses snapshot_download with allow_patterns to fetch all needed files
+        (e.g. ONNX model + feature_config.json) in a single operation.
+
+        Args:
+            hf_repo_id: HuggingFace repository ID
+            allow_patterns: List of filenames/patterns to download
+
+        Returns:
+            Path to temp directory containing downloaded files
+
+        Raises:
+            ModelDownloadError: If all retries exhausted
+        """
+        last_error: Exception | None = None
+        delay = self._config.initial_retry_delay_seconds
+
+        for attempt in range(self._config.max_retries):
+            temp_dir: str | None = None
+            try:
+                temp_dir = tempfile.mkdtemp(prefix="model_download_")
+
+                await asyncio.wait_for(
+                    asyncio.to_thread(
+                        snapshot_download,
+                        repo_id=hf_repo_id,
+                        allow_patterns=allow_patterns,
+                        local_dir=temp_dir,
+                        token=self._hf_token,
+                    ),
+                    timeout=self._config.download_timeout_seconds,
+                )
+
+                return Path(temp_dir)
+
+            except RepositoryNotFoundError as e:
+                self._cleanup_temp_dir(temp_dir)
+                raise ModelDownloadError(f"Repository not found: {hf_repo_id}") from e
+
+            except EntryNotFoundError as e:
+                self._cleanup_temp_dir(temp_dir)
+                raise ModelDownloadError(f"File not found in {hf_repo_id}: {e}") from e
+
+            except asyncio.TimeoutError as e:
+                self._cleanup_temp_dir(temp_dir)
+                last_error = e
+                self._record_failure()
+
+                if attempt < self._config.max_retries - 1:
+                    logger.warning(
+                        f"Download attempt {attempt + 1} timed out for {hf_repo_id} "
+                        f"(>{self._config.download_timeout_seconds}s). "
+                        f"Retrying in {delay}s..."
+                    )
+                    await asyncio.sleep(delay)
+                    delay *= 2
+
+            except HfHubHTTPError as e:
+                self._cleanup_temp_dir(temp_dir)
+                last_error = e
+                self._record_failure()
+
+                if attempt < self._config.max_retries - 1:
+                    logger.warning(
+                        f"Download attempt {attempt + 1} failed for {hf_repo_id}: "
+                        f"{e}. Retrying in {delay}s..."
+                    )
+                    await asyncio.sleep(delay)
+                    delay *= 2
+
+            except Exception as e:
+                self._cleanup_temp_dir(temp_dir)
+                last_error = e
+                self._record_failure()
+
+                if attempt < self._config.max_retries - 1:
+                    logger.warning(
+                        f"Download attempt {attempt + 1} failed for {hf_repo_id}: "
+                        f"{e}. Retrying in {delay}s..."
+                    )
+                    await asyncio.sleep(delay)
+                    delay *= 2
+
+        raise ModelDownloadError(
+            f"Failed to download from {hf_repo_id} after "
+            f"{self._config.max_retries} attempts: {last_error}"
+        )
+
+    @staticmethod
+    def _cleanup_temp_dir(temp_dir: str | None) -> None:
+        """Remove temp directory if it exists."""
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def _is_circuit_breaker_open(self) -> bool:
+        """Check if circuit breaker is currently open."""
+        state = self._circuit_breaker
+
+        if state.open_until is None:
+            return False
+
+        now = datetime.now(UTC)
+        if now < state.open_until:
+            return True
+
+        # Circuit breaker has expired - reset
+        logger.info("Circuit breaker closed, resuming downloads")
+        state.open_until = None
+        state.consecutive_failures = 0
+        return False
+
+    def _get_circuit_breaker_remaining_seconds(self) -> float:
+        """Get seconds until circuit breaker closes."""
+        state = self._circuit_breaker
+        if state.open_until is None:
+            return 0.0
+        remaining = (state.open_until - datetime.now(UTC)).total_seconds()
+        return max(0.0, remaining)
+
+    def _record_failure(self) -> None:
+        """Record a download failure, potentially opening circuit breaker."""
+        state = self._circuit_breaker
+        state.consecutive_failures += 1
+
+        if state.consecutive_failures >= self._config.circuit_breaker_threshold:
+            state.open_until = datetime.now(UTC) + timedelta(
+                minutes=self._config.circuit_breaker_pause_minutes
+            )
+            logger.warning(
+                f"Circuit breaker opened after {state.consecutive_failures} "
+                f"consecutive failures. Pausing downloads for "
+                f"{self._config.circuit_breaker_pause_minutes} minutes."
+            )
+
+    def _record_success(self) -> None:
+        """Record a successful download, resetting failure counter."""
+        self._circuit_breaker.consecutive_failures = 0
+
+    def is_cached(self, hotkey: str, expected_hash: str) -> bool:
+        """Check if model is cached with matching hash."""
+        return self._cache.is_valid(hotkey, expected_hash)
+
+    def get_cached(self, hotkey: str) -> CachedModel | None:
+        """Get cached model with metadata if exists."""
+        return self._cache.get(hotkey)
+
+    def evict_cached(self, hotkey: str) -> bool:
+        """Remove a cached model entry by hotkey.
+
+        Used when the cached file is technically valid (hash matches chain)
+        but its sidecar metadata (e.g. feature_config) is no longer compatible
+        with the current schema. Eviction forces a fresh download on the next
+        cycle so the metadata is re-fetched and re-validated.
+        """
+        return self._cache.remove(hotkey)
+
+    def get_cached_path(self, hotkey: str) -> Path | None:
+        """Get path to cached model if exists."""
+        cached = self._cache.get(hotkey)
+        return cached.path if cached else None
+
+    def cleanup_stale_cache(self, active_hotkeys: set[str]) -> list[str]:
+        """
+        Remove cached models for hotkeys no longer on chain.
+
+        Args:
+            active_hotkeys: Set of hotkeys with current commitments
+
+        Returns:
+            List of removed hotkeys
+        """
+        return self._cache.cleanup_stale(active_hotkeys)

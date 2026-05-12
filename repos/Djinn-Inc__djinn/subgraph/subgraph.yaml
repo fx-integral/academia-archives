@@ -1,0 +1,206 @@
+specVersion: 1.0.0
+indexerHints:
+  prune: auto
+schema:
+  file: ./schema.graphql
+dataSources:
+  - kind: ethereum
+    name: SignalCommitment
+    network: base-sepolia
+    source:
+      address: "0x4712479Ba57c9ED40405607b2B18967B359209C0"
+      abi: SignalCommitment
+      startBlock: 38024000
+    mapping:
+      kind: ethereum/events
+      apiVersion: 0.0.9
+      language: wasm/assemblyscript
+      entities:
+        - Signal
+        - Genius
+        - ProtocolStats
+      abis:
+        - name: SignalCommitment
+          file: ./abis/SignalCommitment.json
+      eventHandlers:
+        - event: SignalCommitted(indexed uint256,indexed
+            address,string,uint256,uint256,uint256,uint256)
+          handler: handleSignalCommitted
+        - event: SignalCancelled(indexed uint256,indexed address)
+          handler: handleSignalCancelled
+        - event: SignalStatusUpdated(indexed uint256,uint8)
+          handler: handleSignalStatusUpdated
+      file: ./src/signal-commitment.ts
+  - kind: ethereum
+    name: Escrow
+    network: base-sepolia
+    source:
+      address: "0xb43BA175a6784973eB3825acF801Cd7920ac692a"
+      abi: Escrow
+      startBlock: 38024000
+    mapping:
+      kind: ethereum/events
+      apiVersion: 0.0.9
+      language: wasm/assemblyscript
+      entities:
+        - Purchase
+        - Idiot
+        - Genius
+        - Signal
+        - ProtocolStats
+      abis:
+        - name: Escrow
+          file: ./abis/Escrow.json
+      eventHandlers:
+        - event: Deposited(indexed address,uint256)
+          handler: handleDeposited
+        - event: Withdrawn(indexed address,uint256)
+          handler: handleWithdrawn
+        - event: SignalPurchased(indexed uint256,indexed
+            address,uint256,uint256,uint256,uint256,uint256)
+          handler: handleSignalPurchased
+        - event: OutcomeUpdated(indexed uint256,uint8)
+          handler: handleOutcomeUpdated
+        - event: FeesClaimed(indexed address,indexed address,uint256,uint256)
+          handler: handleFeesClaimed
+        - event: Refunded(indexed address,indexed address,uint256,uint256)
+          handler: handleRefunded
+      file: ./src/escrow.ts
+  - kind: ethereum
+    name: Collateral
+    network: base-sepolia
+    source:
+      address: "0x71F0a8c6BBFc4C83c5203807fAdd305B0C0F4C88"
+      abi: Collateral
+      startBlock: 38024000
+    mapping:
+      kind: ethereum/events
+      apiVersion: 0.0.9
+      language: wasm/assemblyscript
+      entities:
+        - CollateralPosition
+        - Genius
+        - ProtocolStats
+      abis:
+        - name: Collateral
+          file: ./abis/Collateral.json
+      eventHandlers:
+        - event: Deposited(indexed address,uint256)
+          handler: handleCollateralDeposited
+        - event: Withdrawn(indexed address,uint256)
+          handler: handleCollateralWithdrawn
+        - event: Locked(indexed uint256,indexed address,uint256)
+          handler: handleCollateralLocked
+        - event: Released(indexed uint256,indexed address,uint256)
+          handler: handleCollateralReleased
+        - event: Slashed(indexed address,uint256,indexed address)
+          handler: handleCollateralSlashed
+      file: ./src/collateral.ts
+  - kind: ethereum
+    name: Account
+    network: base-sepolia
+    source:
+      address: "0x4546354Dd32a613B76Abf530F81c8359e7cE440B"
+      abi: Account
+      startBlock: 38024000
+    mapping:
+      kind: ethereum/events
+      apiVersion: 0.0.9
+      language: wasm/assemblyscript
+      entities:
+        - Account
+        - Genius
+        - Idiot
+      abis:
+        - name: Account
+          file: ./abis/Account.json
+      eventHandlers:
+        - event: PurchaseRecorded(indexed address,indexed address,uint256,uint256)
+          handler: handlePurchaseRecorded
+        - event: OutcomeRecorded(indexed address,indexed address,uint256,uint8)
+          handler: handleOutcomeRecorded
+        - event: NewCycleStarted(indexed address,indexed address,uint256)
+          handler: handleNewCycleStarted
+        - event: SettledChanged(indexed address,indexed address,bool)
+          handler: handleSettledChanged
+      file: ./src/account.ts
+  - kind: ethereum
+    name: Audit
+    network: base-sepolia
+    source:
+      address: "0xCa7e642FE31BA83a7a857644E8894c1B93a2a44E"
+      abi: Audit
+      startBlock: 38024000
+    mapping:
+      kind: ethereum/events
+      apiVersion: 0.0.9
+      language: wasm/assemblyscript
+      entities:
+        - AuditResult
+        - Genius
+        - Idiot
+        - Account
+        - ProtocolStats
+      abis:
+        - name: Audit
+          file: ./abis/Audit.json
+      eventHandlers:
+        - event: AuditSettled(indexed address,indexed
+            address,uint256,int256,uint256,uint256,uint256)
+          handler: handleAuditSettled
+        - event: EarlyExitSettled(indexed address,indexed address,uint256,int256,uint256)
+          handler: handleEarlyExitSettled
+      file: ./src/audit.ts
+  - kind: ethereum
+    name: CreditLedger
+    network: base-sepolia
+    source:
+      address: "0xA65296cd11B65629641499024AD905FAcAB64C3E"
+      abi: CreditLedger
+      startBlock: 38024000
+    mapping:
+      kind: ethereum/events
+      apiVersion: 0.0.9
+      language: wasm/assemblyscript
+      entities:
+        - CreditBalance
+        - Idiot
+        - ProtocolStats
+      abis:
+        - name: CreditLedger
+          file: ./abis/CreditLedger.json
+      eventHandlers:
+        - event: CreditsMinted(indexed address,uint256)
+          handler: handleCreditsMinted
+        - event: CreditsBurned(indexed address,uint256)
+          handler: handleCreditsBurned
+      file: ./src/credit-ledger.ts
+  # v1747: LineOutcomeRegistry. Deployed to Base Sepolia 2026-05-09 via
+  # contracts/script/DeployLineOutcomeRegistry.s.sol. The mappings index every
+  # LineAttested + LineFinalized + LineForceVoided emission for the public
+  # /verify/[lineHash] verifiability page.
+  - kind: ethereum
+    name: LineOutcomeRegistry
+    network: base-sepolia
+    source:
+      address: "0x2AB6ef76464D25713dfc3b9613f6AD2d07218352"
+      abi: LineOutcomeRegistry
+      startBlock: 41282134
+    mapping:
+      kind: ethereum/events
+      apiVersion: 0.0.9
+      language: wasm/assemblyscript
+      entities:
+        - Line
+        - LineAttestation
+      abis:
+        - name: LineOutcomeRegistry
+          file: ./abis/LineOutcomeRegistry.json
+      eventHandlers:
+        - event: LineAttested(indexed bytes32,indexed address,uint8)
+          handler: handleLineAttested
+        - event: LineFinalized(indexed bytes32,uint8,uint64)
+          handler: handleLineFinalized
+        - event: LineForceVoided(indexed bytes32,string)
+          handler: handleLineForceVoided
+      file: ./src/line-outcome-registry.ts

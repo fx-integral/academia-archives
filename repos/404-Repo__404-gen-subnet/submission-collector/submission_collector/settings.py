@@ -1,0 +1,122 @@
+from pydantic import Field, SecretStr, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        # Pod hosts (Runpod etc.) inject their own env vars (RUNPOD_API_KEY etc.) which
+        # would otherwise crash the service on startup. Service-owned typos in .env are
+        # a tradeoff: most service config has a defined field below.
+        extra="ignore",
+    )
+
+    github_token: SecretStr = Field(..., alias="GITHUB_TOKEN", description="GitHub personal access token")
+    github_repo: str = Field(
+        ...,
+        alias="GITHUB_REPO",
+        description="Git repo with the current competition state",
+    )
+    github_branch: str = Field(default="main", alias="GITHUB_BRANCH", description="Git branch to commit to")
+
+    network: str = Field(
+        default="finney",
+        alias="SUBTENSOR_NETWORK",
+        description="Bittensor subtensor endpoint",
+    )
+    netuid: int = Field(default=17, alias="NETUID", description="Network ID")
+    subtensor_timeout_seconds: int = Field(
+        default=120,
+        alias="SUBTENSOR_TIMEOUT",
+        description="Timeout in seconds for individual subtensor RPC calls (default 120s)",
+    )
+
+    min_check_state_interval_seconds: int = Field(
+        default=120,
+        alias="MIN_CHECK_STATE_INTERVAL",
+        description="Minimum interval between competition stage checks in seconds (default 2 min)",
+    )
+    max_check_state_interval_seconds: int = Field(
+        default=1800,
+        alias="MAX_CHECK_STATE_INTERVAL",
+        description="Maximum interval between competition stage checks in seconds (default 30 min)",
+    )
+
+    max_concurrent_downloads: int = Field(
+        default=10,
+        alias="MAX_CONCURRENT_DOWNLOADS",
+        description="Maximum number of concurrent submission downloads",
+    )
+    download_jitter_seconds: int = Field(
+        default=300,
+        alias="DOWNLOAD_JITTER_SECONDS",
+        description="Max random delay before each download to spread load across CDNs (default 5 min)",
+    )
+    max_js_size_bytes: int = Field(
+        default=1 * 1024 * 1024,
+        alias="MAX_JS_SIZE_BYTES",
+        description=(
+            "Maximum .js module size in bytes (default 1 MB; matches orchestrator "
+            "MAX_JS_BYTES and the miner output spec)"
+        ),
+    )
+
+    r2_access_key_id: SecretStr = Field(..., alias="R2_ACCESS_KEY_ID", description="R2 access key ID")
+    r2_secret_access_key: SecretStr = Field(..., alias="R2_SECRET_ACCESS_KEY", description="R2 secret access key")
+    r2_endpoint: SecretStr = Field(..., alias="R2_ENDPOINT", description="R2 endpoint")
+
+    render_service_url: str = Field(
+        default="http://localhost:8000", alias="RENDER_URL", description="Render service base URL"
+    )
+    render_api_key: SecretStr | None = Field(
+        default=None,
+        alias="RENDER_API_KEY",
+        description="Bearer token sent to the render service (e.g. Runpod serverless key). None = no auth.",
+    )
+    hf_token: SecretStr | None = Field(
+        default=None,
+        alias="HF_TOKEN",
+        description="Hugging Face token for gated models (DINOv3 embeddings).",
+    )
+
+    storage_key_template: str = Field(
+        default="rounds/{round}/{hotkey}/submitted/{filename}",
+        alias="STORAGE_KEY_TEMPLATE",
+        description="Storage key template for uploaded files",
+    )
+    cdn_url: str = Field(
+        default="https://subnet404.xyz", alias="CDN_URL", description="CDN base URL for uploaded files"
+    )
+
+    pause_on_stage_end: bool = Field(
+        default=False, alias="PAUSE_ON_STAGE_END", description="Pause for inspection or intervention on stage end"
+    )
+
+    render_alert_min_failures: int = Field(
+        default=20,
+        alias="RENDER_ALERT_MIN_FAILURES",
+        description="Minimum render failures before alerting",
+    )
+    render_alert_min_hotkeys: int = Field(
+        default=3,
+        alias="RENDER_ALERT_MIN_HOTKEYS",
+        description="Minimum distinct hotkeys with render failures before alerting",
+    )
+    render_alert_cooldown_seconds: int = Field(
+        default=600,
+        alias="RENDER_ALERT_COOLDOWN_SECONDS",
+        description="Minimum seconds between render failure alerts",
+    )
+
+    discord_webhook_url: str | None = Field(
+        default=None, alias="DISCORD_WEBHOOK_URL", description="Discord webhook URL for status notifications"
+    )
+
+    log_level: str = Field(default="DEBUG", alias="LOG_LEVEL", description="Logging level")
+
+    @field_validator("render_service_url", "cdn_url")
+    @classmethod
+    def normalize_url(cls, v: str) -> str:
+        return v.rstrip("/")

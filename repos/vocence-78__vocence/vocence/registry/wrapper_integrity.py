@@ -1,0 +1,135 @@
+"""
+Owner-side wrapper integrity check for Vocence chutes.
+
+The owner (not validators) fetches the deployed chute's Python source from the Chutes API,
+masks the four approved variables (VOCENCE_REPO, VOCENCE_REVISION, VOCENCE_CHUTES_USER, VOCENCE_CHUTE_ID),
+normalizes both canonical and deployed source (AST dump), and compares hashes.
+If fetch fails or hash mismatch, the participant is marked invalid.
+"""
+
+import ast
+import hashlib
+import re
+from pathlib import Path
+from typing import Tuple
+
+# Approved variables miners may change; we mask their values before hashing
+APPROVED_VAR_PATTERNS = [
+    (re.compile(r'VOCENCE_REPO\s*=\s*["\'].*?["\']', re.DOTALL), 'VOCENCE_REPO = ""'),
+    (re.compile(r'VOCENCE_REVISION\s*=\s*["\'].*?["\']', re.DOTALL), 'VOCENCE_REVISION = ""'),
+    (re.compile(r'VOCENCE_CHUTES_USER\s*=\s*["\'].*?["\']', re.DOTALL), 'VOCENCE_CHUTES_USER = ""'),
+    (re.compile(r'VOCENCE_CHUTE_ID\s*=\s*["\'].*?["\']', re.DOTALL), 'VOCENCE_CHUTE_ID = ""'),
+]
+
+APPROVED_VAR_NAMES = (
+    "VOCENCE_REPO",
+    "VOCENCE_REVISION",
+    "VOCENCE_CHUTES_USER",
+    "VOCENCE_CHUTE_ID",
+)
+
+# A valid HuggingFace commit revision is a 40-char lowercase hex git sha.
+_HF_SHA_PATTERN = re.compile(r'^[0-9a-f]{40}$')
+
+
+def is_valid_hf_revision(revision: str) -> bool:
+    """Return True iff revision is a 40-char lowercase hex git sha (no branches/tags)."""
+    return bool(_HF_SHA_PATTERN.match(revision or ""))
+
+
+def extract_approved_variables(source: str) -> dict[str, str]:
+    """Extract the four approved variable values from a deploy script.
+
+    Walks the module-level AST so that lookalike text inside comments, docstrings,
+    or other expressions cannot fool the extractor (a regex match would happily
+    read a sha out of `# VOCENCE_REVISION = "..."` and miss the real binding).
+
+    Only `Name = Constant(str)` assignments at module top level are recognized,
+    which is exactly the shape the canonical wrapper uses — anything else would
+    fail wrapper integrity anyway.
+
+    Returns a dict mapping each var name to its declared string value. Missing
+    variables map to "" so callers can compare directly without KeyError.
+    """
+    out: dict[str, str] = {name: "" for name in APPROVED_VAR_NAMES}
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return out
+    targets = set(APPROVED_VAR_NAMES)
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name) or target.id not in targets:
+            continue
+        if not isinstance(node.value, ast.Constant) or not isinstance(node.value.value, str):
+            continue
+        out[target.id] = node.value.value
+    return out
+
+
+def _load_canonical_source() -> str:
+    """Load canonical wrapper source (template with empty placeholder values)."""
+    template_path = Path(__file__).resolve().parent / "canonical_wrapper_template.jinja2"
+    if not template_path.is_file():
+        raise FileNotFoundError(f"Canonical template not found: {template_path}")
+    text = template_path.read_text(encoding="utf-8")
+    # Replace Jinja placeholders with empty string so masked form matches miner-deployed
+    text = text.replace('"{{ huggingface_repository_name }}"', '""')
+    text = text.replace('"{{ huggingface_repository_revision }}"', '""')
+    text = text.replace('"{{ chute_username }}"', '""')
+    text = text.replace('"{{ chute_name }}"', '""')
+    return text
+
+
+def _mask_approved_variables(source: str) -> str:
+    """Replace approved variable values with empty string so hash ignores miner-specific values."""
+    out = source
+    for pattern, replacement in APPROVED_VAR_PATTERNS:
+        out = pattern.sub(replacement, out)
+    return out
+
+
+def _normalize_python(source: str) -> str:
+    """Parse source as Python and return normalized AST dump (ignores formatting)."""
+    try:
+        tree = ast.parse(source)
+        return ast.dump(tree, include_attributes=False)
+    except SyntaxError:
+        return ""
+
+
+def _normalized_hash(source: str) -> str:
+    """SHA-256 of normalized (masked) Python source."""
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+def get_canonical_normalized_hash() -> str:
+    """Return the hash of the canonical wrapper (masked + normalized). Used for comparison."""
+    canonical = _load_canonical_source()
+    masked = _mask_approved_variables(canonical)
+    normalized = _normalize_python(masked)
+    return _normalized_hash(normalized)
+
+
+def check_wrapper_integrity(deployed_source: str) -> Tuple[bool, str | None]:
+    """Compare deployed chute source to canonical wrapper.
+
+    Args:
+        deployed_source: Raw Python source from Chutes GET /chutes/code/{chute_id}
+
+    Returns:
+        (True, None) if hash matches canonical; (False, reason) otherwise.
+    """
+    if not deployed_source or not deployed_source.strip():
+        return False, "empty_deploy_script"
+    canonical_hash = get_canonical_normalized_hash()
+    masked_deployed = _mask_approved_variables(deployed_source)
+    normalized_deployed = _normalize_python(masked_deployed)
+    if not normalized_deployed:
+        return False, "deploy_script_syntax_error"
+    deployed_hash = _normalized_hash(normalized_deployed)
+    if deployed_hash != canonical_hash:
+        return False, "wrapper_hash_mismatch"
+    return True, None

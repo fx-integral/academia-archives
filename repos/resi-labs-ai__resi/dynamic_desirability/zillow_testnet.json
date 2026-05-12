@@ -1,0 +1,13 @@
+[
+    {
+        "id": "zillow_testnet_all",
+        "weight": 1.0,
+        "params": {
+            "keyword": null,
+            "platform": "zillow",
+            "label": null,
+            "post_start_datetime": null,
+            "post_end_datetime": null
+        }
+    }
+]

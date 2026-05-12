@@ -1,0 +1,46 @@
+# The MIT License (MIT)
+# Copyright © 2023 Yuma Rao
+# Copyright © 2025 ShiftLayer
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+# documentation files (the “Software”), to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
+# and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+# the Software.
+
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+# THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+# Define the version of the module.
+__version__ = "2.4.1"
+version_split = __version__.split(".")
+__spec_version__ = (
+    (1000 * int(version_split[0]))
+    + (10 * int(version_split[1]))
+    + (1 * int(version_split[2]))
+)
+__image_hash__ = "4b9ba675ef3c8ca8b8e41dfe7636b5c72c507711befe76562d18326572efcfef"
+__mario_image_hash__ = (
+    "4b9ba675ef3c8ca8b8e41dfe7636b5c72c507711befe76562d18326572efcfef"
+)
+
+_IMAGE_HASH_BY_COMPETITION = {
+    "mario": __mario_image_hash__,
+    "supermario": __mario_image_hash__,
+}
+
+
+def get_image_hash_for_competition(competition: str | None) -> str:
+    normalized = (competition or "").strip().lower()
+    return _IMAGE_HASH_BY_COMPETITION.get(normalized, __image_hash__)
+
+
+# Import all submodules.
+from . import protocol
+from . import base
+from . import validator

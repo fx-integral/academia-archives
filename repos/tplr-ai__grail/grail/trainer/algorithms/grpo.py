@@ -1,0 +1,3193 @@
+"""GRPO (Group Relative Policy Optimization) with consolidated data loading and training.
+
+This module consolidates:
+- Data classes for GRPO groups and rollouts
+- Loader for fetching and validating miner data
+- Computation utilities for logprobs and entropy
+- Training algorithm implementation
+"""
+
+from __future__ import annotations
+
+import logging
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from accelerate import Accelerator
+
+from grail.protocol.constants import ROLLOUTS_PER_PROBLEM
+from grail.shared.config import (
+    GRPO_RANKING_REWARD_WEIGHT,
+    GRPO_RANKING_VARIANCE_WEIGHT,
+    IMPORTANCE_SAMPLING_LEVEL,
+    is_kl_enabled,
+)
+from grail.trainer.advantages import compute_advantages as compute_group_advantages
+from grail.trainer.dashboard_logger import data_logger, step_logger
+from grail.trainer.metrics import (
+    KMetricsAggregator,
+    TaskReplicateResult,
+    derive_k_values,
+)
+from grail.trainer.param_tracker import (
+    ParamChangeTracker,
+    log_param_change_metrics,
+)
+from grail.trainer.sparse_quality import (
+    SparseQualityAnalyzer,
+    log_sparse_quality_metrics,
+)
+
+from .base import TrainingAlgorithm
+
+if TYPE_CHECKING:
+    from grail.infrastructure.chain import GrailChainManager
+    from grail.shared.schemas import BucketCredentials
+    from grail.trainer.config import TrainingConfig
+
+logger = logging.getLogger(__name__)
+
+
+async def fetch_multiple_miners_data(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    """Fetch miner window data (lazy import).
+
+    Keeping this import lazy prevents `grail.trainer.algorithms.grpo` from pulling in
+    bittensor/networking dependencies during offline usage (e.g., research/offline_trainer).
+    """
+    try:
+        from grail.infrastructure.miner_data import fetch_multiple_miners_data as _impl
+    except Exception as exc:  # pragma: no cover - optional in offline mode
+        raise RuntimeError("Miner data fetching is unavailable in offline mode.") from exc
+
+    return await _impl(*args, **kwargs)
+
+
+class AdaptiveKLController:
+    """Stateful controller for adaptive KL coefficient.
+
+    Maintains a persistent KL penalty coefficient and updates it after each
+    optimizer step based on observed KL relative to a target range.
+    """
+
+    def __init__(
+        self,
+        *,
+        initial: float,
+        target: float,
+        min_value: float,
+        max_value: float,
+        adapt_rate: float,
+    ) -> None:
+        self.value: float = float(initial)
+        self.target: float = float(target)
+        self.min_value: float = float(min_value)
+        self.max_value: float = float(max_value)
+        self.adapt_rate: float = float(adapt_rate)
+
+    def update(self, observed_kl: float) -> float:
+        """Update and return the current KL coefficient based on observed KL.
+
+        The update is multiplicative outside a tolerance band around the target.
+        """
+        try:
+            kl = float(observed_kl)
+        except Exception:  # noqa: BLE001
+            return self.value
+
+        upper = self.target * 1.2
+        lower = self.target * 0.8
+        if kl > upper:
+            self.value = min(self.max_value, self.value * self.adapt_rate)
+        elif kl < lower:
+            self.value = max(self.min_value, self.value / self.adapt_rate)
+        return self.value
+
+    def state_dict(self) -> dict[str, float]:
+        return {"value": float(self.value)}
+
+    def load_state_dict(self, state: dict[str, float]) -> None:
+        try:
+            self.value = float(state.get("value", self.value))
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _print_decoded_rollout_samples(
+    miner_data: dict[str, dict], max_samples_per_miner: int = 100, max_tokens_to_show: int = 1000
+) -> None:
+    """Decode and print sample tokens from miner rollouts for inspection.
+
+    Helpful for debugging: shows what tokens/text was sent by miners.
+
+    Args:
+        miner_data: Dict mapping hotkey -> window_data from miners
+        max_samples_per_miner: Max number of rollouts to show per miner
+        max_tokens_to_show: Max number of tokens to display from each rollout
+    """
+    try:
+        from transformers import AutoTokenizer
+    except ImportError:
+        logger.debug("transformers not available; skipping token decoding")
+        return
+
+    if not miner_data:
+        logger.info("No miner data to decode")
+        return
+
+    # Try to infer tokenizer from first rollout's model info
+    tokenizer = None
+    model_name = None
+    for _miner_hotkey, window_data in miner_data.items():
+        if isinstance(window_data, dict):
+            inferences = window_data.get("inferences", [])
+            if inferences and isinstance(inferences[0], dict):
+                commit = inferences[0].get("commit", {})
+                model_info = commit.get("model", {})
+                model_name = model_info.get("name")
+                break
+
+    if not model_name:
+        logger.debug("Could not infer model name from rollouts; skipping decoding")
+        return
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+    except Exception as e:
+        logger.debug("Failed to load tokenizer for %s: %s", model_name, e)
+        return
+
+    logger.info("=" * 100, extra={"markup": False})
+    logger.info("DECODED ROLLOUT SAMPLES (Model: %s)", model_name, extra={"markup": False})
+    logger.info("=" * 100, extra={"markup": False})
+
+    for miner_hotkey, window_data in miner_data.items():
+        if not isinstance(window_data, dict):
+            continue
+
+        inferences = window_data.get("inferences", [])
+        if not isinstance(inferences, list):
+            continue
+
+        logger.info(
+            "\nMiner: %s | Total rollouts: %d",
+            miner_hotkey[:16],
+            len(inferences),
+            extra={"markup": False},
+        )
+
+        for idx, rollout in enumerate(inferences[:max_samples_per_miner]):
+            if not isinstance(rollout, dict):
+                continue
+
+            commit = rollout.get("commit", {})
+            tokens = commit.get("tokens", [])
+            rollout_data = commit.get("rollout", {})
+            prompt_length = rollout_data.get("prompt_length", 0)
+            completion_length = rollout_data.get("completion_length", 0)
+            success = rollout_data.get("success", False)
+            reward = rollout_data.get("total_reward", 0.0)
+
+            logger.info(
+                "  Rollout %d | Prompt: %d tokens | Completion: %d tokens | "
+                "Success: %s | Reward: %.3f",
+                idx,
+                prompt_length,
+                completion_length,
+                success,
+                reward,
+                extra={"markup": False},
+            )
+
+            if tokens and isinstance(tokens, list):
+                # Decode prompt
+                prompt_tokens = tokens[:prompt_length] if prompt_length <= len(tokens) else tokens
+                try:
+                    prompt_text = tokenizer.decode(
+                        prompt_tokens[:max_tokens_to_show], skip_special_tokens=False
+                    )
+                    logger.info(
+                        "    [PROMPT (first %d tokens)]:\n%s",
+                        min(max_tokens_to_show, len(prompt_tokens)),
+                        prompt_text,
+                        extra={"markup": False},
+                    )
+                except Exception as e:
+                    logger.debug("Failed to decode prompt: %s", e, extra={"markup": False})
+
+                # Decode completion
+                if completion_length > 0 and prompt_length < len(tokens):
+                    comp_tokens = tokens[
+                        prompt_length : min(prompt_length + max_tokens_to_show, len(tokens))
+                    ]
+                    try:
+                        comp_text = tokenizer.decode(comp_tokens, skip_special_tokens=False)
+                        logger.info(
+                            "    [COMPLETION (first %d tokens)]:\n%s",
+                            len(comp_tokens),
+                            comp_text[:500],
+                            extra={"markup": False},
+                        )
+                    except Exception as e:
+                        logger.debug("Failed to decode completion: %s", e, extra={"markup": False})
+            else:
+                logger.info("    [No tokens available]", extra={"markup": False})
+
+    logger.info("=" * 100, extra={"markup": False})
+
+
+@dataclass
+class GRPORollout:
+    """Single rollout from a GRPO group."""
+
+    tokens: list[int]
+    prompt_length: int
+    completion_length: int
+    advantage: float
+    reward: float
+    success: bool
+    nonce: int
+    rollout_group: str
+    token_logprobs: list[float] | None = None
+
+
+@dataclass
+class GRPOGroup:
+    """Collection of rollouts associated with one SAT problem."""
+
+    group_id: str
+    rollouts: list[GRPORollout]
+
+    def is_valid(
+        self, advantage_tolerance: float, rollouts_per_problem: int = ROLLOUTS_PER_PROBLEM
+    ) -> bool:
+        """Validate group size and zero-sum advantage condition."""
+        if len(self.rollouts) != rollouts_per_problem:
+            return False
+        advantage_sum = sum(r.advantage for r in self.rollouts)
+        return abs(advantage_sum) < advantage_tolerance
+
+
+def _chunked_lm_head_logprobs(
+    lm_head: torch.nn.Module,
+    shift_hidden: torch.Tensor,
+    shift_labels: torch.Tensor,
+    chunk_size: int,
+    return_entropy: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Apply LM head in chunks and extract per-token logprobs (and optionally entropy).
+
+    Processes the vocabulary projection in sequence-dimension chunks to avoid
+    materializing the full [batch, seq_len, vocab_size] logits tensor. Uses
+    flash-attn's Triton cross-entropy kernel when entropy is not needed (4.5x
+    faster), falling back to fp32 log_softmax + gather otherwise.
+
+    Args:
+        lm_head: The model's language model head (linear projection to vocab).
+        shift_hidden: Hidden states shifted for next-token prediction [B, S-1, D].
+        shift_labels: Token IDs shifted for next-token prediction [B, S-1].
+        chunk_size: Number of sequence positions per LM head chunk.
+        return_entropy: Whether to compute per-token entropy alongside logprobs.
+
+    Returns:
+        token_log_probs: [B, S-1] per-token log-probabilities.
+        entropy_per_token: [B, S-1] per-token entropy, or None if not requested.
+    """
+    batch_size, shifted_seq_len = shift_labels.shape
+    device = shift_labels.device
+
+    token_log_probs = torch.zeros(batch_size, shifted_seq_len, device=device)
+    entropy_per_token: torch.Tensor | None = None
+    if return_entropy:
+        entropy_per_token = torch.zeros(batch_size, shifted_seq_len, device=device)
+
+    _triton_ce = None
+    try:
+        from flash_attn.ops.triton.cross_entropy import (  # type: ignore[import-not-found]
+            cross_entropy_loss as _triton_ce,
+        )
+    except ImportError:
+        pass
+
+    for chunk_start in range(0, shifted_seq_len, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, shifted_seq_len)
+
+        chunk_hidden = shift_hidden[:, chunk_start:chunk_end, :]
+        chunk_logits = lm_head(chunk_hidden)
+        chunk_labels = shift_labels[:, chunk_start:chunk_end]
+
+        if _triton_ce is not None and not return_entropy:
+            # Fast path: Triton fused CE extracts logprobs without materializing
+            # the full [B, chunk, V] log_softmax tensor (~4.5x faster).
+            # Only available when entropy is not needed.
+            B_c, T_c, V_c = chunk_logits.shape
+            ce_loss, _ = _triton_ce(
+                chunk_logits.reshape(B_c * T_c, V_c),
+                chunk_labels.reshape(B_c * T_c),
+            )
+            token_log_probs[:, chunk_start:chunk_end] = (-ce_loss).reshape(B_c, T_c)
+            del ce_loss
+        else:
+            # Standard path: log_softmax reused for both logprobs and entropy
+            # in a single pass over the [B, chunk, V] tensor.
+            chunk_log_probs = F.log_softmax(chunk_logits.float(), dim=-1)
+            token_log_probs[:, chunk_start:chunk_end] = chunk_log_probs.gather(
+                2, chunk_labels.unsqueeze(-1)
+            ).squeeze(-1)
+            if return_entropy and entropy_per_token is not None:
+                entropy_per_token[:, chunk_start:chunk_end] = -(
+                    chunk_log_probs.exp() * chunk_log_probs
+                ).sum(dim=-1)
+            del chunk_log_probs
+
+        del chunk_logits
+
+    return token_log_probs, entropy_per_token
+
+
+def _partition_by_token_budget(
+    rollouts: list[tuple],
+    max_tokens: int,
+    max_length: int,
+) -> list[list[tuple]]:
+    """Partition rollouts into micro-batches targeting a token budget per batch.
+
+    Uses Greedy LPT (Longest Processing Time first): sort rollouts by length
+    descending, assign each to the micro-batch with the fewest total tokens.
+    This achieves <0.1% imbalance across micro-batches.
+
+    When a rollout would cause a micro-batch to exceed max_tokens, a new
+    micro-batch is created instead (bin-packing constraint).
+
+    Args:
+        rollouts: List of (GRPORollout, group_id) tuples.
+        max_tokens: Token budget per micro-batch.
+        max_length: Maximum sequence length (for truncation accounting).
+
+    Returns:
+        List of micro-batches, each a list of (rollout, group_id) tuples.
+    """
+    import heapq
+
+    if not rollouts:
+        return []
+
+    # Sort longest-first for Greedy LPT
+    indexed = [(min(len(r[0].tokens), max_length), i, r) for i, r in enumerate(rollouts)]
+    indexed.sort(key=lambda x: x[0], reverse=True)
+
+    # Min-heap: (total_tokens, batch_index, rollout_list)
+    batches: list[tuple[int, int, list[tuple]]] = []
+    batch_counter = 0
+
+    for seq_len, _, rollout in indexed:
+        # Try to fit in the lightest existing batch
+        if batches and batches[0][0] + seq_len <= max_tokens:
+            total, idx, batch_list = heapq.heappop(batches)
+            batch_list.append(rollout)
+            heapq.heappush(batches, (total + seq_len, idx, batch_list))
+        else:
+            # Start a new batch
+            heapq.heappush(batches, (seq_len, batch_counter, [rollout]))
+            batch_counter += 1
+
+    # Return in creation order for deterministic training
+    return [batch_list for _, _, batch_list in sorted(batches, key=lambda x: x[1])]
+
+
+@dataclass
+class _ModelArchInfo:
+    """Cached model architecture info for FLOPs computation."""
+
+    num_params: int
+    num_layers: int
+    num_heads: int
+    head_dim: int
+    linear_flops_per_token: float  # 6 * P (forward + backward)
+
+    @classmethod
+    def from_model(cls, model: Any) -> _ModelArchInfo | None:
+        """Extract architecture info from an HF model. Returns None on failure."""
+        try:
+            cfg = model.config
+            num_params = sum(p.numel() for p in model.parameters())
+            return cls(
+                num_params=num_params,
+                num_layers=cfg.num_hidden_layers,
+                num_heads=cfg.num_attention_heads,
+                head_dim=cfg.hidden_size // cfg.num_attention_heads,
+                linear_flops_per_token=6.0 * num_params,
+            )
+        except Exception:  # noqa: BLE001
+            return None
+
+    def compute_mfu(
+        self,
+        total_tokens: int,
+        avg_seq_len: float,
+        step_time_sec: float,
+        gpu_peak_tflops: float,
+    ) -> dict[str, float]:
+        """Compute MFU for one optimizer step.
+
+        Uses the PaLM/Megatron convention: 6P per token for linear layers
+        (2P forward + 4P backward) plus 12 * H * D * L * seq_len per token
+        for attention (4*H*D*L forward, times 3 for fwd+bwd). GC recomputation
+        is excluded because MFU measures model efficiency, not implementation.
+
+        Args:
+            total_tokens: All tokens processed through the model (prompt + completion).
+            avg_seq_len: Average sequence length (for attention FLOPs).
+            step_time_sec: Wall-clock time for this optimizer step.
+            gpu_peak_tflops: GPU peak in TFLOPS (e.g., 2250 for B200 BF16).
+        """
+        if step_time_sec <= 0 or total_tokens <= 0:
+            return {}
+
+        linear_flops = self.linear_flops_per_token * total_tokens
+        attn_flops = (
+            12.0 * self.num_heads * self.head_dim * avg_seq_len * self.num_layers * total_tokens
+        )
+        total_flops = linear_flops + attn_flops
+        tflops = total_flops / step_time_sec / 1e12
+        mfu = tflops / gpu_peak_tflops if gpu_peak_tflops > 0 else 0.0
+
+        return {
+            "mfu": round(mfu, 4),
+            "tflops": round(tflops, 1),
+            "tokens_per_sec": round(total_tokens / step_time_sec, 1),
+        }
+
+
+def _has_reward_variance(group: GRPOGroup) -> bool:
+    """Check if a GRPO group has variance in reward values.
+
+    Groups with identical rewards across all rollouts produce zero-variance
+    advantages under any estimation strategy and provide no learning signal.
+
+    Args:
+        group: The GRPO group to check
+
+    Returns:
+        True if the group has reward variance, False if all rewards are identical
+    """
+    if not group.rollouts:
+        return False
+
+    rewards = [r.reward for r in group.rollouts]
+    first_reward = rewards[0]
+    return any(rew != first_reward for rew in rewards)
+
+
+def _apply_advantages_to_groups(groups: list[GRPOGroup], estimator: str) -> None:
+    """Compute and assign advantages from rewards for each group.
+
+    Args:
+        groups: List of GRPO groups with rewards already populated.
+        estimator: Advantage estimation strategy name.
+    """
+    for group in groups:
+        rewards = [r.reward for r in group.rollouts]
+        advantages = compute_group_advantages(rewards, estimator=estimator)
+        for rollout, adv in zip(group.rollouts, advantages, strict=True):
+            rollout.advantage = adv
+
+
+def _is_valid_logprobs(logprobs: list[float] | None) -> bool:
+    """Validate that logprobs list contains only finite numeric values.
+
+    Args:
+        logprobs: List of logprob values to validate
+
+    Returns:
+        True if logprobs is a non-empty list of numeric values with all finite floats, False otherwise
+    """
+    if not isinstance(logprobs, list) or not logprobs:
+        return False
+    try:
+        arr = np.asarray(logprobs, dtype=np.float64)
+    except (TypeError, ValueError):
+        return False
+    if arr.ndim != 1:
+        return False
+    return bool(np.isfinite(arr).all())
+
+
+def _group_rollouts(raw_rollouts: list[dict[str, Any]]) -> dict[str, list[GRPORollout]]:
+    """Group raw rollout dicts into rollout objects by group_id.
+
+    Entire groups are filtered if any rollout has invalid logprobs to ensure
+    data consistency and training stability.
+
+    Args:
+        raw_rollouts: List of raw rollout dictionaries from miners
+
+    Returns:
+        Dict mapping group_id to list of GRPORollout objects (only valid groups)
+    """
+    # First pass: collect all rollouts, tracking groups with invalid logprobs
+    ungrouped: dict[str, list[GRPORollout]] = {}
+    invalid_logprobs_groups: set[str] = set()
+
+    for rollout_dict in raw_rollouts:
+        group_id = str(rollout_dict.get("rollout_group", ""))
+        if not group_id:
+            continue
+
+        commit = rollout_dict.get("commit", {})
+        rollout_meta = commit.get("rollout", {})
+
+        # Extract and validate token logprobs during loading
+        tlp = rollout_meta.get("token_logprobs", None)
+        # Require behavior logprobs to exist and be well-formed
+        if tlp is None:
+            logger.warning(
+                "Missing token_logprobs; marking group for filter",
+                extra={"group_id": group_id},
+            )
+            invalid_logprobs_groups.add(group_id)
+        elif not isinstance(tlp, list):
+            logger.warning(
+                "Invalid token_logprobs type; marking group for filter",
+                extra={
+                    "group_id": group_id,
+                    "logprobs_type": type(tlp).__name__,
+                },
+            )
+            invalid_logprobs_groups.add(group_id)
+        elif not _is_valid_logprobs(tlp):
+            logger.warning(
+                "Non-finite token_logprobs detected; marking group for filter",
+                extra={
+                    "group_id": group_id,
+                    "logprobs_len": len(tlp),
+                },
+            )
+            invalid_logprobs_groups.add(group_id)
+        else:
+            # Validate length consistency with provided lengths
+            orig_prompt_len = int(rollout_meta.get("prompt_length", 0))
+            orig_comp_len = int(rollout_meta.get("completion_length", 0) or 0)
+            expected_total = max(0, orig_prompt_len) + max(0, orig_comp_len)
+            tlp_len = len(tlp)
+            if not (tlp_len >= expected_total or tlp_len == orig_comp_len):
+                logger.warning(
+                    "token_logprobs length inconsistent with prompt/completion; marking group for filter",
+                    extra={
+                        "group_id": group_id,
+                        "logprobs_len": tlp_len,
+                        "expected_total": expected_total,
+                        "prompt_len": orig_prompt_len,
+                        "completion_len": orig_comp_len,
+                    },
+                )
+                invalid_logprobs_groups.add(group_id)
+
+        try:
+            rollout = GRPORollout(
+                tokens=list(commit.get("tokens", [])),
+                prompt_length=int(rollout_meta.get("prompt_length", 0)),
+                completion_length=int(rollout_meta.get("completion_length", 0) or 0),
+                advantage=float(rollout_meta.get("advantage", 0.0)),
+                reward=float(rollout_meta.get("total_reward", 0.0)),
+                success=bool(rollout_meta.get("success", False)),
+                nonce=int(rollout_dict.get("nonce", 0)),
+                rollout_group=group_id,
+                token_logprobs=(list(tlp) if _is_valid_logprobs(tlp) else None),
+            )
+            ungrouped.setdefault(group_id, []).append(rollout)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "Failed to parse rollout for group %s: %s",
+                group_id,
+                exc,
+            )
+            invalid_logprobs_groups.add(group_id)
+
+    # Second pass: keep only groups with all valid logprobs
+    grouped: dict[str, list[GRPORollout]] = {}
+    for group_id, rollouts in ungrouped.items():
+        if group_id in invalid_logprobs_groups:
+            logger.info(
+                "Filtering entire group due to invalid logprobs in any rollout",
+                extra={
+                    "group_id": group_id,
+                    "num_rollouts": len(rollouts),
+                },
+            )
+        else:
+            grouped[group_id] = rollouts
+
+    if invalid_logprobs_groups:
+        logger.info(
+            "Filtered %d groups with invalid logprobs during loading",
+            len(invalid_logprobs_groups),
+        )
+
+    return grouped
+
+
+def _compute_training_metrics(
+    groups: list[GRPOGroup],
+    window: int,
+    eos_token_id: int | None = None,
+    rollouts_per_problem: int | None = None,
+) -> dict[str, Any]:
+    """Compute and log pre-training data quality metrics for GRPO groups.
+
+    Args:
+        groups: List of GRPO groups
+        window: Training window number
+        eos_token_id: Optional EOS token ID to determine terminated completions
+        rollouts_per_problem: Number of rollouts per problem (for k-metric derivation)
+
+    Returns:
+        Dictionary of computed metrics keyed by metric name (with pass@k, mean@k, etc.)
+    """
+    if rollouts_per_problem is None:
+        rollouts_per_problem = 5  # Fallback default
+
+    try:
+        report_ks = derive_k_values(rollouts_per_problem)
+    except Exception:  # noqa: BLE001
+        report_ks = [1, 5, 10]
+        if groups:
+            report_ks.append(len(groups[0].rollouts))
+        report_ks = sorted(set(report_ks))
+
+    aggregator = KMetricsAggregator(report_ks=report_ks)
+
+    # Track completion lengths
+    all_completion_lengths: list[int] = []
+    terminated_completion_lengths: list[int] = []
+
+    for group in groups:
+        # Define replicate order deterministically by nonce
+        ordered = sorted(group.rollouts, key=lambda r: r.nonce)
+        for idx, r in enumerate(ordered):
+            aggregator.add(
+                TaskReplicateResult(
+                    task_id=group.group_id,
+                    replicate_idx=idx,
+                    reward=float(r.reward),
+                    success=bool(r.success),
+                )
+            )
+
+            # Track completion lengths
+            completion_len = r.completion_length
+            all_completion_lengths.append(completion_len)
+
+            # Check if completion is terminated with EOS
+            if eos_token_id is not None and completion_len > 0:
+                # Get the last token of the completion
+                prompt_len = r.prompt_length
+                if len(r.tokens) >= prompt_len + completion_len:
+                    last_completion_token = r.tokens[prompt_len + completion_len - 1]
+                    if last_completion_token == eos_token_id:
+                        terminated_completion_lengths.append(completion_len)
+
+    prefilter_metrics = aggregator.summarize()
+
+    # Add length-related metrics
+    if all_completion_lengths:
+        prefilter_metrics["mean_length"] = float(np.mean(all_completion_lengths))
+        prefilter_metrics["min_length"] = float(np.min(all_completion_lengths))
+        prefilter_metrics["max_length"] = float(np.max(all_completion_lengths))
+
+    # Add terminated completion metrics if we have EOS token ID
+    if terminated_completion_lengths:
+        prefilter_metrics["mean_terminated_length"] = float(np.mean(terminated_completion_lengths))
+        prefilter_metrics["min_terminated_length"] = float(np.min(terminated_completion_lengths))
+        prefilter_metrics["max_terminated_length"] = float(np.max(terminated_completion_lengths))
+    if prefilter_metrics:
+        # Log a concise, stable set of key indicators
+        # Align k-values with ROLLOUTS_PER_PROBLEM for readability
+        k_keys = [k for k in report_ks if f"pass@{k}" in prefilter_metrics]
+        summary_bits = [f"pass@{k}={prefilter_metrics.get(f'pass@{k}', 0.0):.3f}" for k in k_keys]
+        # Include ordered diagnostics for transparency (ordering-sensitive)
+        summary_bits.extend(
+            [
+                f"pass_ordered@{k}={prefilter_metrics.get(f'pass_ordered@{k}', 0.0):.3f}"
+                for k in k_keys
+            ]
+        )
+        # Prefer full-group mean over first-RPP window for readability
+        full_k = max(report_ks) if report_ks else 1
+        mean_full = prefilter_metrics.get(f"mean@{full_k}", 0.0)
+        summary_bits.append(f"mean@{full_k}={mean_full:.3f}")
+        summary_bits.append(f"reward_mean={prefilter_metrics.get('reward_mean_all', 0.0):.3f}")
+        summary_bits.append(f"reward_std={prefilter_metrics.get('reward_std_all', 0.0):.3f}")
+        summary_bits.append(f"success_rate={prefilter_metrics.get('success_rate_all', 0.0):.3f}")
+        # Add length metrics to summary
+        if "mean_length" in prefilter_metrics:
+            summary_bits.append(f"mean_length={prefilter_metrics.get('mean_length', 0.0):.1f}")
+        if "mean_terminated_length" in prefilter_metrics:
+            summary_bits.append(
+                f"mean_terminated_length={prefilter_metrics.get('mean_terminated_length', 0.0):.1f}"
+            )
+        logger.info(
+            "Training data metrics (pre-filter, window %s): %s",
+            window,
+            ", ".join(summary_bits),
+        )
+
+    # Emit structured JSON for Grafana dashboard
+    if prefilter_metrics:
+        data_payload: dict[str, Any] = {"window": window}
+        data_payload.update(prefilter_metrics)
+        data_logger.emit(data_payload)
+
+    # Return metrics with metadata for async logging by caller
+    return prefilter_metrics
+
+
+def _group_reward_per_token(group: GRPOGroup) -> float:
+    """Calculate mean reward per completion token for a GRPO group (GFPO).
+
+    Args:
+        group: The GRPO group to calculate reward/token for
+
+    Returns:
+        Mean reward per completion token across all rollouts
+    """
+    totals: list[float] = []
+    for rollout in group.rollouts:
+        denominator: int = max(1, int(rollout.completion_length))
+        totals.append(float(rollout.reward) / float(denominator))
+    return float(sum(totals) / max(1, len(totals)))
+
+
+def _group_advantage_variance(group: GRPOGroup) -> float:
+    """Calculate advantage variance for a GRPO group (learning signal strength).
+
+    Higher variance indicates stronger learning signal - diverse outcomes that
+    provide clear policy gradient direction.
+
+    Args:
+        group: The GRPO group to calculate advantage variance for
+
+    Returns:
+        Variance of advantages across rollouts (0.0 if insufficient rollouts)
+    """
+    if len(group.rollouts) < 2:
+        return 0.0
+    advantages = [r.advantage for r in group.rollouts]
+    mean_adv = sum(advantages) / len(advantages)
+    return sum((a - mean_adv) ** 2 for a in advantages) / len(advantages)
+
+
+def _group_efficiency_score(
+    group: GRPOGroup, reward_weight: float = 0.7, variance_weight: float = 0.3
+) -> float:
+    """Compute combined efficiency score for group ranking (GFPO + variance).
+
+    Combines token efficiency (reward/token) with learning signal strength
+    (advantage variance) using configurable weights. Groups are ranked by this
+    score for top-k selection.
+
+    Args:
+        group: The GRPO group to score
+        reward_weight: Weight for reward/token component (default: 0.7)
+        variance_weight: Weight for advantage variance component (default: 0.3)
+
+    Returns:
+        Combined efficiency score (normalized, higher is better)
+    """
+    reward_per_token = _group_reward_per_token(group)
+    adv_variance = _group_advantage_variance(group)
+    return reward_weight * reward_per_token + variance_weight * adv_variance
+
+
+def _filter_valid_groups(
+    groups: list[GRPOGroup],
+    advantage_tolerance: float,
+    window: int,
+    config: TrainingConfig | None = None,
+) -> list[GRPOGroup]:
+    """Filter and refine GRPO groups using multi-stage pipeline.
+
+    Implements filtering techniques from recent research (DAPO, GFPO, 2025):
+    1. Structural validation (group size and zero-sum advantage condition)
+    2. DAPO filtering: Remove uninformative groups (zero advantage variance)
+    3. Completion token constraints (optional, from config)
+    4. GFPO refinement: Success rate, reward/token thresholds, quantile dropping
+    5. Top-k ranking: Combined efficiency score (reward/token + advantage variance)
+
+    Args:
+        groups: List of GRPO groups to filter
+        advantage_tolerance: Maximum allowed sum of advantages in a group
+        window: Training window number (for logging purposes)
+        config: Optional training config with filtering parameters
+
+    Returns:
+        List of filtered and refined GRPO groups (up to max_groups)
+    """
+    # Stage 1: Fast structural validation
+    valid_groups: list[GRPOGroup] = [
+        group for group in groups if group.is_valid(advantage_tolerance)
+    ]
+    invalid_count: int = len(groups) - len(valid_groups)
+    if invalid_count > 0:
+        logger.warning(
+            "Filtered out %s invalid GRPO groups for window %s",
+            invalid_count,
+            window,
+        )
+
+    # Stage 2: DAPO filtering - remove uninformative groups (zero advantage variance)
+    # Groups where all rollouts have identical rewards provide no learning signal
+    groups_with_variance: list[GRPOGroup] = [
+        group for group in valid_groups if _has_reward_variance(group)
+    ]
+    zero_variance_count: int = len(valid_groups) - len(groups_with_variance)
+    if zero_variance_count > 0:
+        logger.warning(
+            "DAPO: Filtered out %s uninformative groups (zero variance) for window %s",
+            zero_variance_count,
+            window,
+        )
+
+    # Stage 3: Optional structural cap on completion tokens (fast check)
+    if config is not None and getattr(config, "grpo_max_completion_tokens", None):
+        max_completion: int = int(config.grpo_max_completion_tokens)
+        before: int = len(groups_with_variance)
+        groups_with_variance = [
+            group
+            for group in groups_with_variance
+            if all(0 <= rollout.completion_length <= max_completion for rollout in group.rollouts)
+        ]
+        if len(groups_with_variance) < before:
+            logger.warning(
+                "Filtered out %s groups exceeding max completion tokens (%s) for window %s",
+                before - len(groups_with_variance),
+                max_completion,
+                window,
+            )
+
+    # Stage 4: Refinement filters (quality/efficiency)
+    refined_groups: list[GRPOGroup] = groups_with_variance
+    if config is not None:
+        # Success fraction gate
+        min_success_fraction: float = max(
+            0.0, float(getattr(config, "grpo_min_success_fraction", 0.0))
+        )
+        if min_success_fraction > 0.0:
+            before = len(refined_groups)
+            refined_groups = [
+                group
+                for group in refined_groups
+                if (
+                    sum(1 for rollout in group.rollouts if rollout.success)
+                    / max(1, len(group.rollouts))
+                )
+                >= min_success_fraction
+            ]
+            if len(refined_groups) < before:
+                logger.warning(
+                    "Filtered out %s groups below min success fraction=%.2f for window %s",
+                    before - len(refined_groups),
+                    min_success_fraction,
+                    window,
+                )
+
+        # Reward per token threshold
+        min_reward_per_token: float = float(getattr(config, "grpo_min_reward_per_token", 0.0))
+        if min_reward_per_token > 0.0:
+            before = len(refined_groups)
+            refined_groups = [
+                group
+                for group in refined_groups
+                if _group_reward_per_token(group) >= min_reward_per_token
+            ]
+            if len(refined_groups) < before:
+                logger.warning(
+                    "Filtered out %s groups below min reward/token=%.4f for window %s",
+                    before - len(refined_groups),
+                    min_reward_per_token,
+                    window,
+                )
+
+        # Drop lowest quantile by reward/token if configured
+        quantile_drop: float = float(getattr(config, "grpo_reward_per_token_drop_quantile", 0.0))
+        if 0.0 < quantile_drop < 1.0 and refined_groups:
+            scored: list[tuple[GRPOGroup, float]] = [
+                (group, _group_reward_per_token(group)) for group in refined_groups
+            ]
+            # Sort ascending by score and drop lowest quantile
+            scored.sort(key=lambda item: item[1])
+            drop_count: int = int(len(scored) * quantile_drop)
+            if drop_count > 0:
+                refined_groups = [group for group, _ in scored[drop_count:]]
+                logger.warning(
+                    "Dropped %s groups (lowest %.0f%% by reward/token) for window %s",
+                    drop_count,
+                    quantile_drop * 100.0,
+                    window,
+                )
+
+        # Stage 5: Rank by combined efficiency score and select top-k groups
+        max_groups: int = int(getattr(config, "grpo_max_groups", 10000))
+        if len(refined_groups) > max_groups:
+            # Get ranking weights from config or fall back to constants
+            reward_weight: float = float(
+                getattr(config, "grpo_ranking_reward_weight", GRPO_RANKING_REWARD_WEIGHT)
+            )
+            variance_weight: float = float(
+                getattr(config, "grpo_ranking_variance_weight", GRPO_RANKING_VARIANCE_WEIGHT)
+            )
+            # Score each group with combined efficiency metric (GFPO + variance)
+            scored = [
+                (group, _group_efficiency_score(group, reward_weight, variance_weight))
+                for group in refined_groups
+            ]
+            scored.sort(key=lambda item: item[1], reverse=True)
+            refined_groups = [group for group, _ in scored[:max_groups]]
+            logger.info(
+                "Selected top %s/%s groups by efficiency score (reward_wt=%.2f, var_wt=%.2f) "
+                "for window %s",
+                max_groups,
+                len(scored),
+                reward_weight,
+                variance_weight,
+                window,
+            )
+    else:
+        # Backward-compatible cap when no config provided
+        max_groups = 8
+        if len(refined_groups) > max_groups:
+            refined_groups = refined_groups[:max_groups]
+            logger.warning(
+                "Limiting GRPO groups from %s to %s for window %s",
+                len(groups_with_variance),
+                max_groups,
+                window,
+            )
+
+    logger.info(
+        "Loaded %s valid GRPO groups for window %s",
+        len(refined_groups),
+        window,
+    )
+
+    return refined_groups
+
+
+async def load_grpo_groups(
+    window: int,
+    advantage_tolerance: float,
+    trusted_miner_hotkeys: set[str] | None = None,
+    credentials: BucketCredentials | Any = None,
+    chain_manager: GrailChainManager | None = None,
+    uid_by_hotkey: dict[str, int] | None = None,
+    config: TrainingConfig | None = None,
+    monitor: Any | None = None,
+    eos_token_id: int | None = None,
+) -> list[GRPOGroup]:
+    """Load and validate GRPO groups directly from trusted miners.
+
+    Args:
+        window: Training window number
+        advantage_tolerance: Maximum allowed sum of advantages in a group
+        trusted_miner_hotkeys: Set of trusted miner hotkeys to load from
+        credentials: R2 credentials for bucket access
+        chain_manager: Chain manager for miner bucket discovery
+        uid_by_hotkey: Mapping of hotkey to UID for readable logging
+        monitor: Optional monitor for logging metrics to wandb
+        eos_token_id: Optional EOS token ID to determine terminated completions
+
+    Returns:
+        List of valid GRPO groups
+    """
+    # Require trusted miners and credentials for direct miner fetching
+    if not trusted_miner_hotkeys:
+        logger.warning(
+            "No trusted miners for window %s; skipping data load",
+            window,
+        )
+        return []
+
+    if credentials is None:
+        logger.error("Credentials required for loading miner data")
+        return []
+
+    # Build UID list for logging
+    trusted_uids = []
+    if uid_by_hotkey:
+        trusted_uids = sorted(
+            [uid_by_hotkey[hk] for hk in trusted_miner_hotkeys if hk in uid_by_hotkey]
+        )
+
+    # Fetch window data from all trusted miners in parallel
+    logger.info(
+        "Fetching data from %d trusted miners (UIDs=%s) for window %s",
+        len(trusted_miner_hotkeys),
+        trusted_uids if trusted_uids else "N/A",
+        window,
+    )
+
+    miner_data = await fetch_multiple_miners_data(
+        miner_hotkeys=trusted_miner_hotkeys,
+        window=window,
+        credentials=credentials,
+        chain_manager=chain_manager,
+        max_concurrent=10,
+    )
+
+    if not miner_data:
+        logger.warning(
+            "No data fetched from any trusted miner for window %s",
+            window,
+        )
+        return []
+
+    # Debug: Decode and print sample tokens
+    _print_decoded_rollout_samples(miner_data, max_samples_per_miner=100, max_tokens_to_show=1000)
+
+    # Extract all rollouts from all miners
+    raw_rollouts = []
+    for miner_hotkey, window_data in miner_data.items():
+        miner_uid = uid_by_hotkey.get(miner_hotkey) if uid_by_hotkey else None
+        miner_ident = f"UID {miner_uid}" if miner_uid is not None else miner_hotkey[:12]
+
+        if not isinstance(window_data, dict):
+            logger.debug("Invalid window data format from miner %s", miner_ident)
+            continue
+
+        inferences = window_data.get("inferences", [])
+        if not isinstance(inferences, list):
+            logger.debug("Invalid inferences format from miner %s", miner_ident)
+            continue
+
+        # Tag each rollout with the miner hotkey
+        for rollout in inferences:
+            if isinstance(rollout, dict):
+                rollout["hotkey"] = miner_hotkey
+                raw_rollouts.append(rollout)
+
+    logger.info(
+        "Loaded %d raw rollouts from %d miners for window %s",
+        len(raw_rollouts),
+        len(miner_data),
+        window,
+    )
+
+    grouped = _group_rollouts(raw_rollouts)
+
+    # Construct GRPOGroup objects
+    groups: list[GRPOGroup] = [
+        GRPOGroup(group_id, rollouts) for group_id, rollouts in grouped.items()
+    ]
+
+    # Compute advantages from raw rewards (trainer-side, ignoring miner-provided values)
+    adv_estimator = config.adv_estimator if config else "grpo"
+    _apply_advantages_to_groups(groups, adv_estimator)
+
+    # Compute training-set metrics BEFORE filtering invalid groups
+    rollouts_per_problem = config.rollouts_per_problem if config else 5
+    prefilter_metrics = _compute_training_metrics(
+        groups, window, eos_token_id, rollouts_per_problem
+    )
+
+    # Log prefilter metrics to monitor with distinct namespace
+    if monitor is not None and prefilter_metrics:
+        for key, value in prefilter_metrics.items():
+            try:
+                await monitor.log_gauge(
+                    f"training/prefilter/{key}",
+                    float(value),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Failed to log prefilter metric %s: %s", key, exc)
+
+    # Apply comprehensive filtering stages
+    refined_groups = _filter_valid_groups(groups, advantage_tolerance, window, config)
+
+    return refined_groups
+
+
+def _is_finite_tensor(tensor: torch.Tensor) -> bool:
+    """Return True if all elements are finite (no NaN/Inf)."""
+    return bool(torch.isfinite(tensor).all().item())
+
+
+def _unwrap_for_chunked_logits(
+    model: Any,
+) -> tuple[Any, Any] | None:
+    """Extract (base_model, lm_head) from a causal LM for chunked logit computation.
+
+    Returns None if the model structure is incompatible (e.g., DDP/FSDP wrappers
+    or non-standard architectures), signaling the caller to fall back to the
+    standard full-forward path.
+    """
+    # Reject DDP/FSDP wrappers — calling sub-modules directly would bypass
+    # their forward hooks and break gradient sync / parameter gathering.
+    try:
+        from torch.nn.parallel import DistributedDataParallel
+
+        if isinstance(model, DistributedDataParallel):
+            return None
+    except ImportError:
+        pass
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel
+
+        if isinstance(model, FullyShardedDataParallel):
+            return None
+    except ImportError:
+        pass
+
+    # Reject FSDP2 (fully_shard) — wrapped modules become FSDPModule subclasses.
+    # Calling model.model directly would bypass root-level all-gather/reduce-scatter
+    # hooks, desynchronizing NCCL collectives across ranks.
+    try:
+        from torch.distributed.fsdp import FSDPModule  # type: ignore[attr-defined]
+
+        if isinstance(model, FSDPModule):
+            return None
+    except ImportError:
+        pass
+
+    # Standard HuggingFace CausalLM: model.model (base) + model.lm_head
+    base_model_prefix = getattr(model, "base_model_prefix", "")
+    base = getattr(model, base_model_prefix, None) if base_model_prefix else None
+    lm_head = getattr(model, "lm_head", None)
+
+    if base is not None and lm_head is not None:
+        return base, lm_head
+
+    return None
+
+
+def _compute_logprobs_chunked(
+    base_model: Any,
+    lm_head: torch.nn.Module,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    prompt_lengths: list[int],
+    completion_lengths: list[int],
+    chunk_size: int,
+    return_per_token: bool = False,
+    return_entropy: bool = False,
+) -> (
+    torch.Tensor
+    | tuple[torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+):
+    """Compute logprobs by applying lm_head in chunks along the sequence dimension.
+
+    Instead of materializing the full [batch, seq_len, vocab_size] logits tensor
+    (~5.4 GB for Qwen3-8B at seq_len=10K), this function:
+    1. Runs the base model to get hidden states [batch, seq, hidden_dim] (~36 MB)
+    2. Applies lm_head in chunks of `chunk_size` tokens along the sequence dimension
+    3. Extracts per-token logprobs and entropy from each chunk immediately
+    4. Frees chunk logits before processing the next chunk
+
+    This is numerically identical to the non-chunked path because lm_head is a
+    linear layer applied independently per position — chunking along the sequence
+    dimension produces exactly the same result.
+
+    Peak memory reduction: ~10 GB → ~312 MB for the logit/log_probs tensors.
+    """
+    # Run base model to get hidden states (no vocab-sized tensors yet)
+    base_out = base_model(
+        input_ids,
+        attention_mask=attention_mask,
+        use_cache=False,
+    )
+    hidden_states = base_out.last_hidden_state  # [batch, seq_len, hidden_dim]
+
+    # Skip prompt tokens for LM head: we only need logprobs for completion tokens.
+    # Due to the shift-by-1 (logits[t] predicts token[t+1]), we need hidden states
+    # starting at position (min_prompt_len - 1) to predict the first completion token.
+    # This avoids running the expensive LM head ([hidden_dim, vocab_size] matmul)
+    # on prompt tokens whose logprobs are never used.
+    min_prompt_len = min(prompt_lengths)
+    keep_from = max(0, min_prompt_len - 1)
+
+    shift_hidden = hidden_states[:, keep_from:-1, :]
+    shift_labels = input_ids[:, keep_from + 1 :]
+
+    token_log_probs, entropy_per_token = _chunked_lm_head_logprobs(
+        lm_head, shift_hidden, shift_labels, chunk_size, return_entropy
+    )
+
+    # Extract completion-token results. Adjust prompt_lengths to account for
+    # the keep_from offset applied above.
+    adjusted_prompt_lengths = [p - keep_from for p in prompt_lengths]
+    return _extract_completion_logprobs(
+        token_log_probs,
+        entropy_per_token,
+        adjusted_prompt_lengths,
+        completion_lengths,
+        return_per_token,
+        return_entropy,
+    )
+
+
+def _extract_completion_logprobs(
+    token_log_probs: torch.Tensor,
+    entropy_per_token: torch.Tensor | None,
+    prompt_lengths: list[int],
+    completion_lengths: list[int],
+    return_per_token: bool,
+    return_entropy: bool,
+) -> (
+    torch.Tensor
+    | tuple[torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+):
+    """Extract completion-token logprobs/entropy from full-sequence tensors.
+
+    Shared by both chunked and non-chunked paths to avoid code duplication.
+
+    Args:
+        token_log_probs: [batch, seq_len-1] per-token log-probabilities
+        entropy_per_token: [batch, seq_len-1] per-token entropy (or None)
+        prompt_lengths: per-sample prompt lengths
+        completion_lengths: per-sample completion lengths
+        return_per_token: if True, return padded per-token logprobs
+        return_entropy: if True, also return mean entropy per sequence
+    """
+    seq_len_minus_1 = token_log_probs.shape[1]
+    device = token_log_probs.device
+
+    if not return_per_token:
+        seq_log_probs: list[torch.Tensor] = []
+        for idx, prompt_len in enumerate(prompt_lengths):
+            completion_len = completion_lengths[idx]
+            start_idx = max(0, prompt_len - 1)
+            end_idx = min(seq_len_minus_1, start_idx + completion_len)
+            if end_idx > start_idx:
+                seq_log_probs.append(token_log_probs[idx, start_idx:end_idx].sum())
+            else:
+                seq_log_probs.append(torch.tensor(0.0, device=device))
+        return torch.stack(seq_log_probs)
+
+    # Return both sums and per-token logprobs with optional entropy
+    max_comp_len = max(completion_lengths) if completion_lengths else 1
+    batch_size = len(prompt_lengths)
+
+    per_token_padded = torch.zeros(batch_size, max_comp_len, device=device)
+    seq_log_probs_tensor = torch.zeros(batch_size, device=device)
+
+    entropies_list: list[torch.Tensor] = []
+
+    for idx, prompt_len in enumerate(prompt_lengths):
+        completion_len = completion_lengths[idx]
+        start_idx = max(0, prompt_len - 1)
+        end_idx = min(seq_len_minus_1, start_idx + completion_len)
+        if end_idx > start_idx:
+            comp_logps = token_log_probs[idx, start_idx:end_idx]
+            per_token_padded[idx, : len(comp_logps)] = comp_logps
+            seq_log_probs_tensor[idx] = comp_logps.sum()
+            if return_entropy and entropy_per_token is not None:
+                entropies_list.append(entropy_per_token[idx, start_idx:end_idx].mean())
+        else:
+            if return_entropy and entropy_per_token is not None:
+                entropies_list.append(torch.tensor(0.0, device=device))
+
+    if return_entropy and entropy_per_token is not None:
+        mean_entropies = torch.stack(entropies_list)
+        return seq_log_probs_tensor, per_token_padded, mean_entropies
+
+    return seq_log_probs_tensor, per_token_padded
+
+
+def _extract_completion_logprobs_packed(
+    token_log_probs: torch.Tensor,
+    entropy_per_token: torch.Tensor | None,
+    seq_lengths: list[int],
+    prompt_lengths: list[int],
+    completion_lengths: list[int],
+    return_per_token: bool,
+    return_entropy: bool,
+) -> (
+    torch.Tensor
+    | tuple[torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+):
+    """Extract per-sequence completion logprobs from packed (flat) token_log_probs.
+
+    The input tensor is [1, total_tokens-1] from a packed forward pass where all
+    sequences are concatenated. This function uses seq_lengths offsets to locate
+    each sequence's completion tokens and re-pads to [B, max_comp_len] for
+    compatibility with all downstream loss computation code.
+
+    The shift-by-1 indexing: logits[t] predicts token[t+1]. For sequence i's
+    k-th completion token at absolute position (offset + prompt_len + k),
+    the logprob is at position (offset + prompt_len + k - 1) in the shifted tensor.
+
+    Cross-boundary positions (last token of seq_i predicting first token of seq_{i+1})
+    are never accessed because extraction starts at offset + prompt_len - 1, which is
+    within the sequence.
+    """
+    device = token_log_probs.device
+    total_shifted = token_log_probs.shape[1]
+    num_seqs = len(seq_lengths)
+
+    if not return_per_token:
+        seq_log_probs: list[torch.Tensor] = []
+        offset = 0
+        for idx in range(num_seqs):
+            start_idx = offset + max(0, prompt_lengths[idx] - 1)
+            end_idx = min(offset + seq_lengths[idx] - 1, start_idx + completion_lengths[idx])
+            end_idx = min(end_idx, total_shifted)
+            if end_idx > start_idx:
+                seq_log_probs.append(token_log_probs[0, start_idx:end_idx].sum())
+            else:
+                seq_log_probs.append(torch.tensor(0.0, device=device))
+            offset += seq_lengths[idx]
+        return torch.stack(seq_log_probs)
+
+    max_comp_len = max(completion_lengths) if completion_lengths else 1
+    per_token_padded = torch.zeros(num_seqs, max_comp_len, device=device)
+    seq_log_probs_tensor = torch.zeros(num_seqs, device=device)
+    entropies_list: list[torch.Tensor] = []
+
+    offset = 0
+    for idx in range(num_seqs):
+        start_idx = offset + max(0, prompt_lengths[idx] - 1)
+        end_idx = min(offset + seq_lengths[idx] - 1, start_idx + completion_lengths[idx])
+        end_idx = min(end_idx, total_shifted)
+        if end_idx > start_idx:
+            comp_logps = token_log_probs[0, start_idx:end_idx]
+            per_token_padded[idx, : len(comp_logps)] = comp_logps
+            seq_log_probs_tensor[idx] = comp_logps.sum()
+            if return_entropy and entropy_per_token is not None:
+                entropies_list.append(entropy_per_token[0, start_idx:end_idx].mean())
+        else:
+            if return_entropy and entropy_per_token is not None:
+                entropies_list.append(torch.tensor(0.0, device=device))
+        offset += seq_lengths[idx]
+
+    if return_entropy and entropy_per_token is not None:
+        mean_entropies = torch.stack(entropies_list)
+        return seq_log_probs_tensor, per_token_padded, mean_entropies
+
+    return seq_log_probs_tensor, per_token_padded
+
+
+def _compute_logprobs_chunked_packed(
+    base_model: Any,
+    lm_head: torch.nn.Module,
+    input_ids: torch.Tensor,
+    position_ids: torch.Tensor,
+    seq_lengths: list[int],
+    prompt_lengths: list[int],
+    completion_lengths: list[int],
+    chunk_size: int,
+    return_per_token: bool = False,
+    return_entropy: bool = False,
+) -> (
+    torch.Tensor
+    | tuple[torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+):
+    """Compute logprobs from packed sequences using chunked LM head.
+
+    Like _compute_logprobs_chunked but for packed [1, total_tokens] inputs.
+    Passes position_ids (with resets) and attention_mask=None so HF auto-detects
+    packing and uses flash_attn_varlen_func.
+    """
+    # Model forward on packed input (attention_mask=None triggers packing detection)
+    base_out = base_model(
+        input_ids,
+        position_ids=position_ids,
+        attention_mask=None,
+        use_cache=False,
+    )
+    hidden_states = base_out.last_hidden_state  # [1, total_tokens, hidden_dim]
+
+    # Shift for next-token prediction
+    shift_hidden = hidden_states[:, :-1, :]
+    shift_labels = input_ids[:, 1:]
+
+    token_log_probs, entropy_per_token = _chunked_lm_head_logprobs(
+        lm_head, shift_hidden, shift_labels, chunk_size, return_entropy
+    )
+
+    return _extract_completion_logprobs_packed(
+        token_log_probs,
+        entropy_per_token,
+        seq_lengths,
+        prompt_lengths,
+        completion_lengths,
+        return_per_token,
+        return_entropy,
+    )
+
+
+def compute_logprobs_packed(
+    model: Any,
+    input_ids: torch.Tensor,
+    position_ids: torch.Tensor,
+    seq_lengths: list[int],
+    prompt_lengths: list[int],
+    completion_lengths: list[int],
+    return_per_token: bool = False,
+    return_entropy: bool = False,
+    *,
+    chunked: bool = False,
+    chunk_size: int = 256,
+) -> (
+    torch.Tensor
+    | tuple[torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+):
+    """Compute logprobs from packed [1, total_tokens] inputs.
+
+    Mirrors compute_logprobs() but for packed sequences. Dispatches to chunked
+    or standard path. Output format is identical: [B, max_comp_len] padded tensors.
+    """
+    if chunked:
+        parts = _unwrap_for_chunked_logits(model)
+        if parts is not None:
+            base_model, lm_head = parts
+            return _compute_logprobs_chunked_packed(
+                base_model,
+                lm_head,
+                input_ids,
+                position_ids,
+                seq_lengths,
+                prompt_lengths,
+                completion_lengths,
+                chunk_size,
+                return_per_token=return_per_token,
+                return_entropy=return_entropy,
+            )
+        logger.warning(
+            "Chunked logits requested but model structure incompatible; "
+            "falling back to standard packed forward"
+        )
+
+    # Standard (non-chunked) packed path
+    outputs = model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        attention_mask=None,
+    )
+    logits = outputs.logits  # [1, total_tokens, vocab_size]
+
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = input_ids[:, 1:].contiguous()
+
+    # Try Triton fused CE (avoids materializing full fp32 log_softmax tensor,
+    # saves ~18 GB for 48K tokens and is ~4.5x faster). Falls back to standard
+    # path when entropy is needed or Triton is unavailable.
+    _triton_ce_fn = None
+    if not return_entropy:
+        try:
+            from flash_attn.ops.triton.cross_entropy import (  # type: ignore[import-not-found]
+                cross_entropy_loss as _triton_ce_fn,
+            )
+        except ImportError:
+            pass
+
+    entropy_per_token = None
+    if _triton_ce_fn is not None:
+        B_s, T_s, V_s = shift_logits.shape
+        ce_loss, _ = _triton_ce_fn(
+            shift_logits.reshape(B_s * T_s, V_s),
+            shift_labels.reshape(B_s * T_s),
+        )
+        token_log_probs = (-ce_loss).reshape(B_s, T_s)
+        del ce_loss
+    else:
+        log_probs = F.log_softmax(shift_logits.float(), dim=-1)
+        token_log_probs = log_probs.gather(2, shift_labels.unsqueeze(-1)).squeeze(-1)
+        if return_entropy:
+            entropy_per_token = -(log_probs.exp() * log_probs).sum(dim=-1)
+        del log_probs
+
+    return _extract_completion_logprobs_packed(
+        token_log_probs,
+        entropy_per_token,
+        seq_lengths,
+        prompt_lengths,
+        completion_lengths,
+        return_per_token,
+        return_entropy,
+    )
+
+
+def compute_logprobs(
+    model: Any,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    prompt_lengths: list[int],
+    completion_lengths: list[int],
+    return_per_token: bool = False,
+    return_entropy: bool = False,
+    *,
+    chunked: bool = False,
+    chunk_size: int = 256,
+) -> (
+    torch.Tensor
+    | tuple[torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+):
+    """Compute log-probabilities (and optionally entropy) over completion tokens.
+
+    Single forward pass serves both logprob and entropy computation, avoiding
+    a redundant forward that would double peak GPU memory from vocab-sized tensors
+    (~6 GB each at seq_len=10K, vocab=152K).
+
+    When ``chunked=True``, applies lm_head in sequence-dimension chunks to avoid
+    materializing the full [batch, seq_len, vocab_size] logits tensor. Falls back
+    to the standard path if the model structure is incompatible.
+
+    This function:
+    1. Runs model forward pass on padded input_ids (right-padded to batch max length)
+    2. Shifts logits left by 1 to align with next-token prediction (standard LM indexing)
+    3. For each sequence, extracts logprobs for completion tokens only
+    4. Optionally computes mean entropy over completion tokens from the same log_softmax
+
+    Key indexing detail: logits[i,j] predicts token[i,j+1], so to get logprob of
+    token[i, prompt_len + k] (k-th completion token), we extract logprobs[i, prompt_len-1+k]
+
+    Args:
+        model: Language model
+        input_ids: [batch_size, seq_len] right-padded token ids
+        attention_mask: [batch_size, seq_len] mask (1=real, 0=pad)
+        prompt_lengths: [batch_size] original prompt length per sample (before padding)
+        completion_lengths: [batch_size] number of completion tokens per sample
+        return_per_token: If True, return per-token logprobs alongside sums
+        return_entropy: If True, also return mean entropy per sequence
+        chunked: If True, apply lm_head in chunks to save ~10 GB peak memory
+        chunk_size: Number of sequence positions per lm_head chunk
+
+    Returns:
+        If return_per_token=False: [batch_size] tensor of sum log-probabilities
+        If return_per_token=True, return_entropy=False: ([batch_size], [batch_size, max_comp_len])
+        If return_per_token=True, return_entropy=True: ([batch_size], [batch_size, max_comp_len], [batch_size])
+    """
+    # Dispatch to chunked path when requested and model is compatible
+    if chunked:
+        parts = _unwrap_for_chunked_logits(model)
+        if parts is not None:
+            base_model, lm_head = parts
+            return _compute_logprobs_chunked(
+                base_model,
+                lm_head,
+                input_ids,
+                attention_mask,
+                prompt_lengths,
+                completion_lengths,
+                chunk_size,
+                return_per_token=return_per_token,
+                return_entropy=return_entropy,
+            )
+        logger.warning(
+            "Chunked logits requested but model structure incompatible; "
+            "falling back to standard forward"
+        )
+
+    # --- Standard (non-chunked) path ---
+    # Precision controlled by caller via accelerator.autocast
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+    )
+    logits = outputs.logits
+
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = input_ids[:, 1:].contiguous()
+
+    # Try Triton fused CE (avoids materializing full fp32 log_softmax tensor,
+    # saves ~18 GB for long sequences and is ~4.5x faster). Falls back to
+    # standard path when entropy is needed or Triton is unavailable.
+    _triton_ce_fn = None
+    if not return_entropy:
+        try:
+            from flash_attn.ops.triton.cross_entropy import (  # type: ignore[import-not-found]
+                cross_entropy_loss as _triton_ce_fn,
+            )
+        except ImportError:
+            pass
+
+    entropy_per_token: torch.Tensor | None = None
+    if _triton_ce_fn is not None:
+        B_s, T_s, V_s = shift_logits.shape
+        ce_loss, _ = _triton_ce_fn(
+            shift_logits.reshape(B_s * T_s, V_s),
+            shift_labels.reshape(B_s * T_s),
+        )
+        token_log_probs = (-ce_loss).reshape(B_s, T_s)
+        del ce_loss
+    else:
+        log_probs = F.log_softmax(shift_logits.float(), dim=-1)
+        token_log_probs = log_probs.gather(2, shift_labels.unsqueeze(-1)).squeeze(-1)
+        if return_entropy:
+            entropy_per_token = -(log_probs.exp() * log_probs).sum(dim=-1)
+        del log_probs
+
+    return _extract_completion_logprobs(
+        token_log_probs,
+        entropy_per_token,
+        prompt_lengths,
+        completion_lengths,
+        return_per_token,
+        return_entropy,
+    )
+
+
+class GRPOAlgorithm(TrainingAlgorithm):
+    """GRPO algorithm implementation with support for multiple loss variants.
+
+    Supported variants:
+    - 'grpo': Group Relative Policy Optimization (default) - averages per-sequence, then batch
+    - 'bnpo': Batch Normalization Policy Optimization - averages over all tokens globally
+    - 'dapo': Distributed Adaptive Policy Optimization - normalizes by total completion tokens
+    - 'dr_grpo': Denominator-Reduced GRPO - normalizes by batch_size × max_completion_length
+
+    Importance Sampling Levels:
+    - 'sequence': Compute one importance sampling ratio per sequence (default)
+        Sums log-probabilities over tokens first, then computes ratio and clips at sequence level.
+        Standard PPO/GRPO approach with sequence-level clipping.
+    - 'token': Compute importance sampling ratio per token independently
+        Computes ratio for each token, then clips each token's contribution independently.
+        More fine-grained clipping that can be more stable for highly variable sequences.
+        Inspired by HuggingFace TRL GRPO implementation.
+    """
+
+    name: str = "grpo"
+
+    def __init__(
+        self,
+        adaptive_kl_enabled: bool = False,
+        grpo_variant: str | None = None,
+        importance_sampling_level: str | None = None,
+        config: TrainingConfig | None = None,
+    ) -> None:
+        super().__init__()
+
+        # Use config if provided, otherwise construct from individual parameters
+        if config is not None:
+            self.config = config
+        else:
+            # Fallback: create minimal config with provided parameters (backward compatibility)
+            from grail.trainer.config import TrainingConfig as TC
+
+            self.config = TC(grpo_variant=grpo_variant or "grpo")
+
+        # Optimizer step counter for parameter change tracking
+        self.optimizer_step_count: int = 0
+
+        # Parameter change tracker (memory-safe, CPU-offloaded)
+        self.param_tracker = ParamChangeTracker.from_config(self.config)
+        if self.param_tracker.is_enabled():
+            logger.info(
+                "Parameter change tracking enabled: measure every %d optimizer steps, "
+                "threshold=%.0e, per_layer=%s, components=%s",
+                self.param_tracker.measure_interval,
+                self.param_tracker.threshold,
+                self.param_tracker.track_per_layer,
+                self.param_tracker.track_components,
+            )
+
+        # Sparse quality analyzer (uses param_tracker's snapshot, runs at same interval)
+        self.sparse_analyzer = SparseQualityAnalyzer.from_config(self.param_tracker, self.config)
+        if self.sparse_analyzer.enabled:
+            logger.info("Sparse quality analysis enabled (runs with param tracking)")
+
+        # Persistent adaptive KL controller across epochs/windows
+        self.kl_controller: AdaptiveKLController = AdaptiveKLController(
+            initial=self.config.kl_coef,
+            target=self.config.kl_target,
+            min_value=self.config.kl_min,
+            max_value=self.config.kl_max,
+            adapt_rate=self.config.kl_adapt_rate,
+        )
+        self.adaptive_kl_enabled: bool = bool(adaptive_kl_enabled)
+
+        # Validate and set loss variant (with common aliases)
+        # If not explicitly provided, use config's default
+        raw_variant = (grpo_variant or self.config.grpo_variant).strip().lower()
+        aliases = {
+            "gspo": "dr_grpo",  # common misnomer maps to denominator-reduced GRPO
+            "dr-grpo": "dr_grpo",
+        }
+        selected_variant = aliases.get(raw_variant, raw_variant)
+        valid_variants = {"grpo", "bnpo", "dapo", "dr_grpo"}
+        if selected_variant not in valid_variants:
+            raise ValueError(
+                f"Invalid grpo_variant '{grpo_variant}'. Must be one of {sorted(valid_variants)}"
+            )
+        self.grpo_variant: str = selected_variant
+        logger.info(f"Using {self.grpo_variant.upper()} loss variant")
+
+        # Validate and set importance sampling level
+        # Controls whether clipping is applied at the sequence or token level
+        # If not explicitly provided, use the environment-configured default
+        raw_is_level = (importance_sampling_level or IMPORTANCE_SAMPLING_LEVEL).strip().lower()
+        valid_is_levels = {"sequence", "token"}
+        if raw_is_level not in valid_is_levels:
+            raise ValueError(
+                f"Invalid importance_sampling_level '{raw_is_level}'. "
+                f"Must be one of {sorted(valid_is_levels)}"
+            )
+        self.importance_sampling_level: str = raw_is_level
+        logger.info(f"Using {self.importance_sampling_level}-level importance sampling")
+
+        # Validate advantage estimation strategy
+        self.adv_estimator: str = self.config.adv_estimator
+        valid_estimators = {"grpo", "dr_grpo", "dapo"}
+        if self.adv_estimator not in valid_estimators:
+            raise ValueError(
+                f"Invalid adv_estimator '{self.adv_estimator}'. "
+                f"Must be one of {sorted(valid_estimators)}"
+            )
+        logger.info("Using %s advantage estimator", self.adv_estimator.upper())
+
+    def _prepare_batch_tensors(
+        self,
+        batch_rollouts: list[GRPORollout],
+        tokenizer: Any,
+        accelerator: Accelerator,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        list[int],
+        list[int],
+        list[float],
+        list[list[float]],
+        list[float],
+    ]:
+        """Prepare batch tensors from rollouts.
+
+        Args:
+            batch_rollouts: List of rollouts for this batch
+            tokenizer: Tokenizer for padding
+            accelerator: Accelerator for device placement
+
+        Returns:
+            Tuple of (input_ids, attention_mask, prompt_lengths, completion_lengths,
+                     advantages, behavior_per_token_logprobs, rewards)
+        """
+        batch_tokens: list[list[int]] = []
+        batch_prompt_lens: list[int] = []
+        batch_comp_lens: list[int] = []
+        batch_advantages: list[float] = []
+        batch_behavior_per_token_logprobs: list[list[float]] = []
+        batch_rewards: list[float] = []
+
+        for rollout in batch_rollouts:
+            tokens = rollout.tokens[: self.config.max_length]
+            batch_tokens.append(tokens)
+
+            # CRITICAL FIX: Recalculate prompt/completion lengths after truncation
+            # Both values must be clamped to valid non-negative ranges
+            #
+            # Case 1: prompt_length > max_length
+            #   - actual_prompt_len = max_length (entire sequence is prompt)
+            #   - actual_comp_len = 0 (no completion tokens in truncated sequence)
+            #
+            # Case 2: prompt_length <= max_length
+            #   - actual_prompt_len = prompt_length (unchanged)
+            #   - actual_comp_len = min(completion_length, max_length - prompt_length)
+            #
+            # The max(0, ...) guards are critical to prevent negative lengths which
+            # would corrupt mask construction and gradient computation.
+            actual_prompt_len = min(rollout.prompt_length, self.config.max_length)
+            actual_comp_len = max(
+                0,
+                min(
+                    rollout.completion_length,
+                    self.config.max_length - rollout.prompt_length,
+                ),
+            )
+            batch_prompt_lens.append(actual_prompt_len)
+            batch_comp_lens.append(actual_comp_len)
+
+            batch_advantages.append(rollout.advantage)
+            batch_rewards.append(rollout.reward)
+
+            # Miner-provided per-token logprobs must exist; extract completion portion
+            tlp: list[float] = list((rollout.token_logprobs or [])[: self.config.max_length])
+            prompt_len = actual_prompt_len
+            comp_len = actual_comp_len
+            expected_len = prompt_len + comp_len
+
+            if len(tlp) >= expected_len:
+                # Extract completion logprobs: indices [prompt_len:prompt_len+comp_len]
+                completion_logprobs = tlp[prompt_len : prompt_len + comp_len]
+            else:
+                # Legacy: miner provided only completion logprobs; respect truncation
+                completion_logprobs = tlp[:comp_len]
+
+            batch_behavior_per_token_logprobs.append(completion_logprobs)
+
+        # Basic structural sanity checks (length mismatches can cause degenerate grads)
+        for i, tokens in enumerate(batch_tokens):
+            expected_len = max(0, batch_prompt_lens[i]) + max(0, batch_comp_lens[i])
+            if len(tokens) < expected_len:
+                logger.warning(
+                    "Sequence shorter than expected after truncation",
+                    extra={
+                        "idx": i,
+                        "len_tokens": len(tokens),
+                        "expected_len": expected_len,
+                        "prompt_len": batch_prompt_lens[i],
+                        "completion_len": batch_comp_lens[i],
+                    },
+                )
+
+        # Pad to fixed max_length so tensor shapes are constant across micro-batches.
+        # This enables torch.compile to reuse compiled graphs and avoids recompilation
+        # per unique seq_len. The attention mask ensures padding tokens are ignored.
+        max_len = (
+            self.config.max_length
+            if self.config.use_torch_compile
+            else max(len(tokens) for tokens in batch_tokens)
+        )
+        # Ensure pad_token_id is set (fallback to eos_token_id if needed)
+        pad_id = tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = tokenizer.eos_token_id
+            logger.warning("pad_token_id is None; using eos_token_id as fallback")
+
+        input_ids = []
+        attention_masks = []
+        for tokens in batch_tokens:
+            pad_length = max_len - len(tokens)
+            input_ids.append(tokens + [pad_id] * pad_length)
+            attention_masks.append([1] * len(tokens) + [0] * pad_length)
+
+        input_ids_tensor = torch.tensor(
+            input_ids,
+            dtype=torch.long,
+            device=accelerator.device,
+        )
+        attention_mask_tensor = torch.tensor(
+            attention_masks,
+            dtype=torch.long,
+            device=accelerator.device,
+        )
+
+        return (
+            input_ids_tensor,
+            attention_mask_tensor,
+            batch_prompt_lens,
+            batch_comp_lens,
+            batch_advantages,
+            batch_behavior_per_token_logprobs,
+            batch_rewards,
+        )
+
+    def _prepare_packed_batch_tensors(
+        self,
+        batch_rollouts: list[GRPORollout],
+        tokenizer: Any,
+        accelerator: Accelerator,
+    ) -> tuple[
+        torch.Tensor,  # input_ids [1, total_tokens]
+        torch.Tensor,  # position_ids [1, total_tokens]
+        list[int],  # prompt_lengths
+        list[int],  # completion_lengths
+        list[float],  # advantages
+        list[list[float]],  # behavior_per_token_logprobs
+        list[float],  # rewards
+        list[int],  # seq_lengths (per-sequence token counts for unpacking)
+    ]:
+        """Pack batch sequences into a single flat tensor for flash_attn_varlen_func.
+
+        Instead of padding all sequences to the longest, concatenates them into
+        [1, total_tokens] with position_ids that reset at each boundary. HF
+        Transformers auto-detects this and uses flash_attn_varlen_func, which
+        processes each sequence independently without cross-boundary attention.
+
+        Output metadata (prompt_lengths, completion_lengths, advantages, etc.)
+        is identical to _prepare_batch_tensors. The seq_lengths list enables
+        downstream code to locate each sequence within the flat tensor.
+        """
+        all_tokens: list[int] = []
+        all_position_ids: list[int] = []
+        seq_lengths: list[int] = []
+        batch_prompt_lens: list[int] = []
+        batch_comp_lens: list[int] = []
+        batch_advantages: list[float] = []
+        batch_behavior_per_token_logprobs: list[list[float]] = []
+        batch_rewards: list[float] = []
+
+        for rollout in batch_rollouts:
+            tokens = rollout.tokens[: self.config.max_length]
+            seq_len = len(tokens)
+
+            # Recalculate prompt/completion after truncation (same as padded path)
+            actual_prompt_len = min(rollout.prompt_length, self.config.max_length)
+            actual_comp_len = max(
+                0,
+                min(
+                    rollout.completion_length,
+                    self.config.max_length - rollout.prompt_length,
+                ),
+            )
+
+            # Concatenate tokens and position_ids
+            all_tokens.extend(tokens)
+            all_position_ids.extend(range(seq_len))
+            seq_lengths.append(seq_len)
+
+            batch_prompt_lens.append(actual_prompt_len)
+            batch_comp_lens.append(actual_comp_len)
+            batch_advantages.append(rollout.advantage)
+            batch_rewards.append(rollout.reward)
+
+            # Extract completion behavior logprobs (same logic as padded path)
+            tlp: list[float] = list((rollout.token_logprobs or [])[: self.config.max_length])
+            expected_len = actual_prompt_len + actual_comp_len
+            if len(tlp) >= expected_len:
+                completion_logprobs = tlp[actual_prompt_len : actual_prompt_len + actual_comp_len]
+            else:
+                completion_logprobs = tlp[:actual_comp_len]
+            batch_behavior_per_token_logprobs.append(completion_logprobs)
+
+        input_ids_tensor = torch.tensor([all_tokens], dtype=torch.long, device=accelerator.device)
+        position_ids_tensor = torch.tensor(
+            [all_position_ids], dtype=torch.long, device=accelerator.device
+        )
+
+        return (
+            input_ids_tensor,
+            position_ids_tensor,
+            batch_prompt_lens,
+            batch_comp_lens,
+            batch_advantages,
+            batch_behavior_per_token_logprobs,
+            batch_rewards,
+            seq_lengths,
+        )
+
+    def _normalize_advantages(self, advantages_tensor: torch.Tensor) -> torch.Tensor:
+        """Normalize advantages with clipping and standardization.
+
+        Args:
+            advantages_tensor: Raw advantages tensor
+
+        Returns:
+            Normalized advantages tensor
+        """
+        # Advantage normalization for stable gradients
+        # IMPORTANT: Normalize advantages to have unit variance while preserving zero-sum
+        # This prevents gradient explosion when advantages have large magnitude
+        # Clip extreme outliers first, then standardize
+        perc_val = float(self.config.adv_clip_percentile)
+        q = max(0.0, min(100.0, perc_val)) / 100.0
+        if 0.0 < q < 1.0:
+            clip_val = torch.quantile(advantages_tensor.abs(), q)
+            if torch.isfinite(clip_val):
+                advantages_tensor = advantages_tensor.clamp(-clip_val, clip_val)
+
+        # We don't normalize advantages since they are already normalized
+        return advantages_tensor
+
+    def _compute_policy_gradient_loss(
+        self,
+        logprobs_current_per_token: torch.Tensor,
+        logprobs_old_per_token: torch.Tensor,
+        advantages_normalized: torch.Tensor,
+        completion_mask: torch.Tensor,
+        batch_size: int,
+        total_completion_tokens: int | None = None,
+    ) -> tuple[torch.Tensor, float, float, torch.Tensor]:
+        """Compute policy gradient loss with importance sampling and PPO clipping.
+
+        Supports both sequence-level and token-level importance sampling based on
+        self.importance_sampling_level:
+        - "sequence": Compute one ratio per sequence (sum logprobs, then compute ratio)
+        - "token": Compute ratio per token independently (more fine-grained clipping)
+
+        Args:
+            logprobs_current_per_token: [batch_size, max_comp_len] current policy per-token logprobs
+            logprobs_old_per_token: [batch_size, max_comp_len] behavior policy per-token logprobs
+            advantages_normalized: [batch_size] normalized advantages
+            completion_mask: [batch_size, max_comp_len] mask (1=real token, 0=padding)
+            batch_size: Number of sequences in batch
+            total_completion_tokens: Total completion tokens across all processes (for DAPO)
+
+        Returns:
+            Tuple of (loss_pg, ratio_clip_frac, ratio_ceiling_frac, ratios_pre_ceiling)
+        """
+        # Compute log-ratios based on importance sampling level
+        if self.importance_sampling_level == "token":
+            # Token-level: compute ratio per token independently
+            # Shape: [batch_size, max_comp_len]
+            log_ratio = logprobs_current_per_token - logprobs_old_per_token
+
+            if not _is_finite_tensor(log_ratio):
+                logger.debug("Non-finite per-token log-ratio before clamp; applying clamp")
+            # Moderate clamp for numerical stability when exponentiating to ratios
+            log_ratio_clamped = torch.clamp(
+                log_ratio, min=-self.config.logratio_clamp, max=self.config.logratio_clamp
+            )
+
+            # For reporting, compute sequence-level ratios (same as original for monitoring)
+            logprobs_current_sum = (logprobs_current_per_token * completion_mask).sum(dim=1)
+            logprobs_old_sum = (logprobs_old_per_token * completion_mask).sum(dim=1)
+            log_ratio_seq = logprobs_current_sum - logprobs_old_sum
+            log_ratio_seq_clamped = torch.clamp(
+                log_ratio_seq, min=-self.config.logratio_clamp, max=self.config.logratio_clamp
+            )
+            ratios_pre_ceiling = torch.exp(log_ratio_seq_clamped)
+
+        elif self.importance_sampling_level == "sequence":
+            # Sequence-level: length-normalized log-ratio (GSPO-style geometric mean).
+            # Without normalization, summing log_ratios across thousands of tokens
+            # produces huge values that saturate PPO clipping on every sequence.
+            # Shape: [batch_size]
+            logprobs_current_sum = (logprobs_current_per_token * completion_mask).sum(dim=1)
+            logprobs_old_sum = (logprobs_old_per_token * completion_mask).sum(dim=1)
+            seq_lengths = completion_mask.sum(dim=1).clamp(min=1.0)
+            log_ratio = (logprobs_current_sum - logprobs_old_sum) / seq_lengths
+
+            if not _is_finite_tensor(log_ratio):
+                logger.debug("Non-finite log-ratio before clamp; applying clamp")
+            # Moderate clamp for numerical stability when exponentiating to ratios
+            log_ratio_clamped = torch.clamp(
+                log_ratio, min=-self.config.logratio_clamp, max=self.config.logratio_clamp
+            )
+            ratios_pre_ceiling = torch.exp(log_ratio_clamped)
+        else:
+            raise ValueError(
+                f"Invalid importance_sampling_level: {self.importance_sampling_level}. "
+                "Must be 'sequence' or 'token'."
+            )
+
+        # Policy gradient loss with importance sampling and PPO-style clipping
+        ratio_clip_frac_val: float = 0.0
+        ratio_ceiling_frac_val: float = 0.0
+
+        if self.config.use_is:
+            # Compute ratios with optional ceiling
+            ratios = torch.exp(log_ratio_clamped)
+
+            # Apply hard ceiling if configured
+            if self.config.is_ratio_max > 0.0:
+                ceiling_mask = ratios > self.config.is_ratio_max
+                ratios = torch.clamp(ratios, max=self.config.is_ratio_max)
+                # Compute ceiling fraction from valid (non-padding) tokens
+                if self.importance_sampling_level == "token":
+                    ratio_ceiling_frac_val = (
+                        (ceiling_mask * completion_mask).sum()
+                        / completion_mask.sum().clamp(min=1.0)
+                    ).item()
+                else:
+                    ratio_ceiling_frac_val = ceiling_mask.float().mean().item()
+            else:
+                ceiling_mask = None
+
+            # Asymmetric PPO-style clipping (DAPO-style): tighter lower bound, relaxed upper bound
+            lower = 1.0 - self.config.ppo_clip_eps
+            upper = 1.0 + self.config.ppo_clip_eps_upper
+            ratios_clipped = torch.clamp(ratios, lower, upper)
+
+            # Track clipping statistics for monitoring
+            clip_mask = (ratios < lower) | (ratios > upper)
+            if self.importance_sampling_level == "token":
+                # For token-level, compute clipping fraction over valid tokens
+                ratio_clip_frac_val = (
+                    (clip_mask * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
+                ).item()
+            else:
+                # For sequence-level, compute clipping fraction over sequences
+                ratio_clip_frac_val = clip_mask.float().mean().item()
+
+            # Compute per-token loss based on importance sampling level
+            if self.importance_sampling_level == "token":
+                # Token-level: ratios and advantages interact per-token
+                # ratios: [batch_size, max_comp_len]
+                # advantages: [batch_size] -> expand to [batch_size, 1] for broadcasting
+                advantages_expanded = advantages_normalized.unsqueeze(1)  # [batch_size, 1]
+
+                pg_unclipped = ratios * advantages_expanded  # [batch_size, max_comp_len]
+                pg_clipped = ratios_clipped * advantages_expanded  # [batch_size, max_comp_len]
+                per_token_loss = -torch.min(pg_unclipped, pg_clipped)  # [batch_size, max_comp_len]
+
+            elif self.importance_sampling_level == "sequence":
+                # Sequence-level: ratios are [batch_size], broadcast to token dimension
+                # Expand advantages to [batch_size, 1] for broadcasting
+                advantages_expanded = advantages_normalized.unsqueeze(1)  # [batch_size, 1]
+                ratios_expanded = ratios.unsqueeze(1)  # [batch_size, 1]
+                ratios_clipped_expanded = ratios_clipped.unsqueeze(1)  # [batch_size, 1]
+
+                pg_unclipped = ratios_expanded * advantages_expanded  # [batch_size, 1]
+                pg_clipped = ratios_clipped_expanded * advantages_expanded  # [batch_size, 1]
+                per_token_loss = -torch.min(pg_unclipped, pg_clipped)  # [batch_size, 1]
+
+                # Expand to [batch_size, max_comp_len] by broadcasting
+                per_token_loss = per_token_loss.expand(-1, completion_mask.size(1))
+            else:
+                raise ValueError(
+                    f"Unknown importance_sampling_level: {self.importance_sampling_level}"
+                )
+
+            # Aggregate using variant-specific strategy
+            max_completion_length = completion_mask.size(1)
+            loss_pg = self._aggregate_policy_loss(
+                per_token_loss,
+                completion_mask,
+                batch_size,
+                max_completion_length,
+                total_completion_tokens,
+            )
+        else:
+            # On-policy: no ratio, just advantage-weighted logprobs
+            if self.importance_sampling_level == "token":
+                # Sum over tokens first for on-policy
+                logprobs_current_sum = (logprobs_current_per_token * completion_mask).sum(dim=1)
+            # else: logprobs_current_sum already computed for sequence-level
+            loss_pg = -(advantages_normalized * logprobs_current_sum).mean()
+
+        return loss_pg, ratio_clip_frac_val, ratio_ceiling_frac_val, ratios_pre_ceiling
+
+    def _compute_kl_divergence_loss(
+        self,
+        logprobs_current_per_token: torch.Tensor,
+        logprobs_ref_per_token: torch.Tensor,
+        batch_comp_lens: list[int],
+        current_kl_coef: float,
+        accelerator: Accelerator,
+    ) -> tuple[torch.Tensor, float]:
+        """Compute KL divergence loss between current and reference policies.
+
+        Args:
+            logprobs_current_per_token: Per-token logprobs from current policy
+            logprobs_ref_per_token: Per-token logprobs from reference policy
+            batch_comp_lens: Completion lengths for each sequence
+            current_kl_coef: Current KL coefficient
+            accelerator: Accelerator for device placement
+
+        Returns:
+            Tuple of (loss_kl, kl_value)
+        """
+        max_comp_len = logprobs_current_per_token.shape[1]
+        comp_lens_tensor = torch.as_tensor(batch_comp_lens, device=accelerator.device)
+        token_positions = torch.arange(max_comp_len, device=accelerator.device)
+        completion_mask = (token_positions.unsqueeze(0) < comp_lens_tensor.unsqueeze(1)).to(
+            torch.float32
+        )
+
+        per_token_log_ratio = logprobs_current_per_token - logprobs_ref_per_token
+        per_token_kl = 0.5 * per_token_log_ratio.pow(2) * completion_mask
+        kl_tensor = per_token_kl.sum() / completion_mask.sum().clamp(min=1.0)
+        loss_kl = current_kl_coef * kl_tensor
+        kl_value = float(kl_tensor.detach().item())
+
+        return loss_kl, kl_value
+
+    def _aggregate_policy_loss(
+        self,
+        per_token_loss: torch.Tensor,
+        completion_mask: torch.Tensor,
+        batch_size: int,
+        max_completion_length: int,
+        total_completion_tokens: int | None = None,
+    ) -> torch.Tensor:
+        """Aggregate per-token policy loss using the selected variant's normalization strategy.
+
+        Args:
+            per_token_loss: [batch_size, max_comp_len] per-token loss values
+            completion_mask: [batch_size, max_comp_len] mask (1=real token, 0=padding)
+            batch_size: Number of sequences in batch
+            max_completion_length: Maximum completion length in batch
+            total_completion_tokens: Total completion tokens across all processes (for DAPO)
+
+        Returns:
+            Aggregated scalar loss
+
+        Normalization strategies:
+            - grpo: Average loss per sequence, then average over batch
+                    → captures per-sequence quality, standard RL approach
+            - bnpo: Average over all valid tokens globally
+                    → treats all tokens equally, reduces variance
+            - dr_grpo: Normalize by fixed denominator (batch_size × max_length)
+                       → stable gradients regardless of actual token counts
+            - dapo: Normalize by total completion tokens across all processes
+                    → scales gradients consistently in distributed training
+        """
+        if self.grpo_variant == "grpo":
+            # Average per-sequence, then batch: sum tokens per seq / seq_length, then mean over batch
+            seq_losses = (per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(
+                dim=1
+            ).clamp(min=1.0)
+            return seq_losses.mean()
+
+        elif self.grpo_variant == "bnpo":
+            # Global token average: sum all tokens / total valid tokens
+            total_loss = (per_token_loss * completion_mask).sum()
+            total_tokens = completion_mask.sum().clamp(min=1.0)
+            return total_loss / total_tokens
+
+        elif self.grpo_variant == "dr_grpo":
+            # Fixed denominator normalization: independent of actual token counts
+            total_loss = (per_token_loss * completion_mask).sum()
+            denominator = batch_size * max_completion_length
+            return total_loss / denominator
+
+        elif self.grpo_variant == "dapo":
+            # Distributed normalization: requires total tokens across all processes
+            if total_completion_tokens is None:
+                raise ValueError("DAPO variant requires total_completion_tokens parameter")
+            total_loss = (per_token_loss * completion_mask).sum()
+            return total_loss / total_completion_tokens
+
+        else:
+            # Should never reach here due to __init__ validation
+            raise ValueError(f"Unknown variant: {self.grpo_variant}")
+
+    def _collect_batch_metrics(
+        self,
+        epoch_metrics: dict[str, list[float]],
+        loss_total: torch.Tensor,
+        loss_pg: torch.Tensor,
+        loss_kl: torch.Tensor,
+        loss_entropy: torch.Tensor,
+        grad_norm_scalar: float | None,
+        advantages_tensor: torch.Tensor,
+        advantages_normalized: torch.Tensor,
+        entropies: torch.Tensor,
+        kl_value: float,
+        ratios_pre_ceiling: torch.Tensor,
+        ratio_clip_frac_val: float,
+        ratio_ceiling_frac_val: float,
+        batch_rewards: list[float],
+    ) -> None:
+        """Collect batch metrics for epoch aggregation.
+
+        Args:
+            epoch_metrics: Dictionary to store metrics in
+            loss_total: Total loss value
+            loss_pg: Policy gradient loss
+            loss_kl: KL divergence loss
+            loss_entropy: Entropy loss
+            grad_norm_scalar: Gradient norm (None if not computed)
+            advantages_tensor: Raw advantages
+            advantages_normalized: Normalized advantages
+            entropies: Entropy values
+            kl_value: KL divergence value
+            ratios_pre_ceiling: Importance sampling ratios before ceiling
+            ratio_clip_frac_val: Fraction of ratios clipped
+            ratio_ceiling_frac_val: Fraction of ratios hitting ceiling
+            batch_rewards: List of rewards for this batch
+        """
+        epoch_metrics["loss_total"].append(loss_total.item())
+        epoch_metrics["loss_pg"].append(loss_pg.item())
+        epoch_metrics["loss_kl"].append(loss_kl.item())
+        epoch_metrics["loss_entropy"].append(loss_entropy.item())
+        epoch_metrics["grad_norm"].append(grad_norm_scalar if grad_norm_scalar is not None else 0.0)
+        epoch_metrics["advantage_mean"].append(advantages_tensor.mean().item())
+        epoch_metrics["advantage_std"].append(advantages_tensor.std().item())
+        epoch_metrics["entropy_mean"].append(entropies.mean().item())
+        # advantages_normalized is now same as advantages_tensor (no batch normalization)
+        epoch_metrics["advantage_mean_normalized"].append(advantages_normalized.mean().item())
+        epoch_metrics["advantage_std_normalized"].append(advantages_normalized.std().item())
+        # Track divergence metrics (use clamped log_ratio for safe exponentiation)
+        epoch_metrics["kl_divergence"].append(kl_value)
+
+        # Pre-ceiling ratio stats (consistent with historical logging)
+        epoch_metrics["ratio_mean"].append(ratios_pre_ceiling.mean().item())
+        epoch_metrics["ratio_std"].append(ratios_pre_ceiling.std().item())
+
+        # Clipping diagnostics (0 when importance sampling disabled)
+        epoch_metrics["ratio_clip_frac"].append(ratio_clip_frac_val)
+        epoch_metrics["ratio_ceiling_frac"].append(ratio_ceiling_frac_val)
+
+        # Track reward curve
+        epoch_metrics["reward_mean"].append(torch.tensor(batch_rewards).mean().item())
+        epoch_metrics["reward_std"].append(torch.tensor(batch_rewards).std().item())
+
+    def _finalize_actual_batch_metrics(
+        self,
+        tracker: dict[str, float],
+        grad_norm_scalar: float | None,
+    ) -> dict[str, float] | None:
+        """Convert accumulated micro-batch stats into a full-batch metrics dict."""
+        micro_batches = int(tracker.get("micro_batches", 0))
+        if micro_batches == 0:
+            return None
+
+        def _safe_mean(total: float, denom: float) -> float:
+            return float(total) / max(denom, 1.0)
+
+        adv_mean = _safe_mean(tracker["adv_sum"], tracker["adv_count"])
+        reward_mean = _safe_mean(tracker["reward_sum"], tracker["reward_count"])
+        entropy_mean = _safe_mean(tracker["entropy_sum"], tracker["entropy_count"])
+        ratio_denominator = (
+            tracker["token_count"]
+            if self.importance_sampling_level == "token"
+            else tracker["sequence_count"]
+        )
+
+        return {
+            "loss_total": _safe_mean(tracker["loss_total_sum"], micro_batches),
+            "loss_pg": _safe_mean(tracker["loss_pg_sum"], micro_batches),
+            "loss_kl": _safe_mean(tracker["loss_kl_sum"], micro_batches),
+            "loss_entropy": _safe_mean(tracker["loss_entropy_sum"], micro_batches),
+            "grad_norm": grad_norm_scalar if grad_norm_scalar is not None else 0.0,
+            "advantage_mean": adv_mean,
+            "reward_mean": reward_mean,
+            "kl_divergence": _safe_mean(tracker["kl_sum"], micro_batches),
+            "entropy_mean": entropy_mean,
+            "ratio_clip_frac": _safe_mean(
+                tracker["ratio_clip_sum"],
+                ratio_denominator,
+            ),
+            "ratio_ceiling_frac": _safe_mean(
+                tracker["ratio_ceiling_sum"],
+                ratio_denominator,
+            ),
+        }
+
+    async def _log_batch_metrics(
+        self,
+        monitor: Any,
+        batch_metrics: dict[str, float] | None,
+    ) -> None:
+        """Log per-batch metrics to monitoring system.
+
+        Args:
+            monitor: Monitoring system instance
+            batch_metrics: Aggregated metrics for the full (effective) batch
+        """
+        if monitor is None or not batch_metrics:
+            return
+
+        # Use global batch counter for smooth, continuous x-axis across all windows
+        self.global_batch_counter += 1
+        for key, value in batch_metrics.items():
+            try:
+                await monitor.log_gauge(
+                    f"training/batch/{key}",
+                    value,
+                    tags={"batch_step": str(self.global_batch_counter)},  # Global counter
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Failed to log batch metric %s: %s", key, exc)
+
+    async def train_epoch(
+        self,
+        model: Any,
+        ref_model: Any,
+        tokenizer: Any,
+        groups: list[GRPOGroup],
+        optimizer: torch.optim.Optimizer,
+        accelerator: Accelerator,
+        monitor: Any | None,
+        window: int,
+        config: TrainingConfig,
+    ) -> dict[str, float]:
+        """Train for one epoch using GRPO algorithm.
+
+        This method orchestrates the training loop by:
+        1. Preparing batches from rollout groups
+        2. Computing policy, reference, and behavior log probabilities
+        3. Computing policy gradient loss with importance sampling and PPO clipping
+        4. Computing KL divergence penalty and entropy regularization
+        5. Performing gradient accumulation and optimization steps
+        6. Tracking and logging training metrics
+
+        Args:
+            model: Current policy model to train
+            ref_model: Reference policy model for KL divergence
+            tokenizer: Tokenizer for batch preparation
+            groups: List of GRPO groups containing rollouts
+            optimizer: Optimizer for model updates
+            accelerator: Accelerator for device management and distributed training
+            monitor: Optional monitoring system for logging metrics
+            window: Current training window number
+            config: Training configuration
+
+        Returns:
+            Dictionary of averaged epoch metrics
+        """
+        # Increment global epoch counter for continuous tracking
+        self.global_epoch_counter += 1
+
+        micro_batch_size = max(1, int(config.micro_batch_size))
+        grad_accum_steps = max(1, self.config.grad_accum_steps)
+
+        model.train()
+        # KL gating: if base coefficient is zero, disable KL entirely
+        kl_enabled: bool = is_kl_enabled()
+        if ref_model is not None:
+            ref_model.eval()
+
+        # Flatten and sort all rollouts by group ID and nonce for deterministic batching
+        all_rollouts: list[tuple] = []
+        for group in groups:
+            for rollout in group.rollouts:
+                all_rollouts.append((rollout, group.group_id))
+
+        all_rollouts.sort(key=lambda item: (item[1], item[0].nonce))
+
+        # Split rollouts into mini-batches (one optimizer step each), then each
+        # mini-batch into micro-batches (forward/backward passes).
+        #
+        # With token-budget mode (max_tokens_per_micro_batch > 0):
+        #   - Mini-batch size = grad_accum_steps * avg_seqs_per_micro_batch ≈ effective batch
+        #   - Micro-batches are variable-sized, targeting a token budget
+        #   - Loss scaled by len(micro) / len(mini_batch) (veRL pattern)
+        #
+        # With fixed mode:
+        #   - Mini-batch size = micro_batch_size * grad_accum_steps
+        #   - Micro-batches are fixed-sized
+        #   - Loss scaled by 1 / grad_accum_steps (equivalent)
+        total_rollouts_count = len(all_rollouts)
+        use_token_budget = config.max_tokens_per_micro_batch > 0
+
+        if use_token_budget:
+            # Token-budget: partition ALL rollouts by token budget first,
+            # then group micro-batches into mini-batches of grad_accum_steps each.
+            all_micro_partitions = _partition_by_token_budget(
+                all_rollouts,
+                max_tokens=config.max_tokens_per_micro_batch,
+                max_length=config.max_length,
+            )
+            num_micro_batches = len(all_micro_partitions)
+
+            # Group micro-batches into mini-batches (each gets one optimizer step).
+            # With token-budget batching, compute from effective_batch_size (rollouts
+            # per optimizer step) rather than fixed grad_accum_steps, since the number
+            # of micro-batches varies per epoch.
+            if config.effective_batch_size > 0:
+                target_steps = max(1, total_rollouts_count // config.effective_batch_size)
+            else:
+                target_steps = max(1, num_micro_batches // grad_accum_steps)
+            # Ceiling division ensures all micro-batches fit in exactly target_steps
+            # groups, preventing tiny remainders with noisy gradients.
+            grad_accum_steps = max(1, -(-num_micro_batches // target_steps))
+
+            mini_batches: list[list[list[tuple]]] = []
+            for i in range(0, num_micro_batches, grad_accum_steps):
+                mini_batches.append(all_micro_partitions[i : i + grad_accum_steps])
+
+            logger.info(
+                "Token-budget batching: %d micro-batches in %d mini-batches "
+                "(budget=%d tokens, accum=%d, %d rollouts)",
+                num_micro_batches,
+                len(mini_batches),
+                config.max_tokens_per_micro_batch,
+                grad_accum_steps,
+                total_rollouts_count,
+            )
+        else:
+            # Fixed mode: chunk rollouts into micro-batches of micro_batch_size,
+            # then group into mini-batches of grad_accum_steps each.
+            all_micro_partitions = []
+            for i in range(0, total_rollouts_count, micro_batch_size):
+                chunk = all_rollouts[i : i + micro_batch_size]
+                all_micro_partitions.append(chunk)
+            num_micro_batches = len(all_micro_partitions)
+
+            mini_batches = []
+            for i in range(0, num_micro_batches, grad_accum_steps):
+                mini_batches.append(all_micro_partitions[i : i + grad_accum_steps])
+
+        epoch_metrics: dict[str, list[float]] = defaultdict(list)
+        grad_accum_counter = 0
+        actual_batch_tracker = {
+            "micro_batches": 0,
+            "sequence_count": 0.0,
+            "token_count": 0.0,
+            "loss_total_sum": 0.0,
+            "loss_pg_sum": 0.0,
+            "loss_kl_sum": 0.0,
+            "loss_entropy_sum": 0.0,
+            "adv_sum": 0.0,
+            "adv_count": 0.0,
+            "reward_sum": 0.0,
+            "reward_count": 0.0,
+            "entropy_sum": 0.0,
+            "entropy_count": 0.0,
+            "kl_sum": 0.0,
+            "ratio_clip_sum": 0.0,
+            "ratio_ceiling_sum": 0.0,
+            "total_model_tokens": 0,
+            "avg_seq_len_sum": 0.0,
+        }
+
+        # MFU computation: extract model architecture once, track step timing
+        import os
+        import time as _time
+
+        _arch_info = _ModelArchInfo.from_model(model)
+        _gpu_peak_tflops = float(os.getenv("GRAIL_GPU_PEAK_TFLOPS", "2250"))
+        _step_start_time = _time.monotonic()
+
+        def reset_actual_batch_tracker() -> None:
+            nonlocal _step_start_time
+            _step_start_time = _time.monotonic()
+            actual_batch_tracker.update(
+                {
+                    "micro_batches": 0,
+                    "sequence_count": 0.0,
+                    "token_count": 0.0,
+                    "loss_total_sum": 0.0,
+                    "loss_pg_sum": 0.0,
+                    "loss_kl_sum": 0.0,
+                    "loss_entropy_sum": 0.0,
+                    "adv_sum": 0.0,
+                    "adv_count": 0.0,
+                    "reward_sum": 0.0,
+                    "reward_count": 0.0,
+                    "entropy_sum": 0.0,
+                    "entropy_count": 0.0,
+                    "kl_sum": 0.0,
+                    "ratio_clip_sum": 0.0,
+                    "ratio_ceiling_sum": 0.0,
+                    "total_model_tokens": 0,
+                    "avg_seq_len_sum": 0.0,
+                }
+            )
+
+        # Adaptive KL coefficient: prefer persistent controller when KL enabled
+        if kl_enabled and self.adaptive_kl_enabled:
+            current_kl_coef = self.kl_controller.value
+        else:
+            current_kl_coef = float(self.config.kl_coef)
+
+        reset_actual_batch_tracker()
+
+        # Track last batch tensors for sparse analysis (may be None if no batches processed)
+        input_ids_tensor: torch.Tensor | None = None
+        attention_mask_tensor: torch.Tensor | None = None
+
+        # Flatten mini-batches back to a flat micro-batch list for the training loop,
+        # but track which mini-batch each micro-batch belongs to for loss scaling.
+        flat_micro_batches: list[list[tuple]] = []
+        micro_to_mini_rollout_count: list[int] = []
+        for mini_batch_micros in mini_batches:
+            mini_rollout_count = sum(len(mb) for mb in mini_batch_micros)
+            for micro in mini_batch_micros:
+                flat_micro_batches.append(micro)
+                micro_to_mini_rollout_count.append(mini_rollout_count)
+        num_micro_batches = len(flat_micro_batches)
+        _local_real_micro_count = num_micro_batches
+
+        # ── FSDP2 collective sync ──
+        # Token-budget packing can produce different micro-batch counts per DP
+        # rank. FSDP2 requires all ranks to execute the same number of
+        # forward/backward passes (each triggers all-gather + reduce-scatter).
+        # Synchronize counts and pad the shorter rank with dummy passes.
+        import torch.distributed as _dist
+
+        if _dist.is_initialized() and _dist.get_world_size() > 1:
+            _sync_dev = accelerator.device
+            _sync_rank = _dist.get_rank()
+            # Sync grad_accum_steps so optimizer steps happen at the same indices
+            _gas_t = torch.tensor([grad_accum_steps], dtype=torch.int64, device=_sync_dev)
+            _dist.all_reduce(_gas_t, op=_dist.ReduceOp.MAX)
+            grad_accum_steps = int(_gas_t.item())
+
+            # Sync micro-batch count, round up to multiple of grad_accum_steps
+            _cnt_t = torch.tensor([num_micro_batches], dtype=torch.int64, device=_sync_dev)
+            _dist.all_reduce(_cnt_t, op=_dist.ReduceOp.MAX)
+            _global_max = int(_cnt_t.item())
+            _padded = -(-_global_max // grad_accum_steps) * grad_accum_steps
+            _num_dummy = _padded - num_micro_batches
+            print(
+                f"[Rank {_sync_rank}] FSDP2 sync: local={num_micro_batches}, "
+                f"global_max={_global_max}, padded={_padded}, dummy={_num_dummy}, "
+                f"accum={grad_accum_steps}",
+                flush=True,
+            )
+            num_micro_batches = _padded
+
+        for micro_idx in range(num_micro_batches):
+            # ── Dummy micro-batch for FSDP2 collective sync ──
+            # Must mirror ALL NCCL collectives from the real path (FSDP2 forward/backward
+            # + DAPO gather + any other distributed ops) to keep ranks in lockstep.
+            if micro_idx >= _local_real_micro_count:
+                with accelerator.autocast():
+                    _dummy_ids = torch.zeros(1, 2, dtype=torch.long, device=accelerator.device)
+                    _dummy_out = model(
+                        input_ids=_dummy_ids,
+                        attention_mask=torch.ones_like(_dummy_ids),
+                    )
+                    _dummy_loss = _dummy_out.logits.sum() * 0.0
+                accelerator.backward(_dummy_loss)
+                del _dummy_ids, _dummy_out, _dummy_loss
+                # Mirror DAPO gather collective (Step 6 in real path)
+                if self.grpo_variant == "dapo":
+                    _zero_tok = torch.zeros(1, device=accelerator.device)
+                    accelerator.gather(_zero_tok)
+                grad_accum_counter += 1
+                if grad_accum_counter >= grad_accum_steps:
+                    # Must mirror clip_grad_norm_ (has FSDP2 all_reduce for total norm)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), self.config.grad_clip)
+                    optimizer.step()
+                    self.optimizer_step_count += 1
+                    optimizer.zero_grad(set_to_none=True)
+                    grad_accum_counter = 0
+                continue
+
+            micro_partition = flat_micro_batches[micro_idx]
+            batch_rollouts = [r[0] for r in micro_partition]
+
+            # Step 1: Prepare batch tensors (packed or padded)
+            _use_packing = config.use_sequence_packing
+            seq_lengths: list[int] = []
+            position_ids_tensor: torch.Tensor | None = None
+            attention_mask_tensor: torch.Tensor | None = None
+
+            if _use_packing:
+                (
+                    input_ids_tensor,
+                    position_ids_tensor,
+                    batch_prompt_lens,
+                    batch_comp_lens,
+                    batch_advantages,
+                    batch_behavior_per_token_logprobs,
+                    batch_rewards,
+                    seq_lengths,
+                ) = self._prepare_packed_batch_tensors(batch_rollouts, tokenizer, accelerator)
+            else:
+                (
+                    input_ids_tensor,
+                    attention_mask_tensor,
+                    batch_prompt_lens,
+                    batch_comp_lens,
+                    batch_advantages,
+                    batch_behavior_per_token_logprobs,
+                    batch_rewards,
+                ) = self._prepare_batch_tensors(batch_rollouts, tokenizer, accelerator)
+
+            advantages_tensor = torch.tensor(
+                batch_advantages,
+                dtype=torch.float32,
+                device=accelerator.device,
+            )
+
+            # Step 2: Compute current policy logprobs and entropy in a single forward pass.
+            # Under FSDP2 (non-chunked path), skip entropy to avoid materializing the
+            # full fp32 log_softmax tensor (~27 GB for 48K tokens). The Triton fused
+            # CE fast path is only available when entropy is not needed.
+            _is_fsdp2 = False
+            try:
+                from torch.distributed.fsdp import FSDPModule  # type: ignore[attr-defined]
+
+                _is_fsdp2 = isinstance(model, FSDPModule)
+            except ImportError:
+                pass
+            _want_entropy = not _is_fsdp2
+            with accelerator.autocast():
+                if _use_packing:
+                    assert position_ids_tensor is not None
+                    _logprob_result = compute_logprobs_packed(
+                        model,
+                        input_ids_tensor,
+                        position_ids_tensor,
+                        seq_lengths,
+                        batch_prompt_lens,
+                        batch_comp_lens,
+                        return_per_token=True,
+                        return_entropy=_want_entropy,
+                        chunked=config.chunked_logits,
+                        chunk_size=config.logit_chunk_size,
+                    )
+                else:
+                    assert attention_mask_tensor is not None
+                    _logprob_result = compute_logprobs(
+                        model,
+                        input_ids_tensor,
+                        attention_mask_tensor,
+                        batch_prompt_lens,
+                        batch_comp_lens,
+                        return_per_token=True,
+                        return_entropy=_want_entropy,
+                        chunked=config.chunked_logits,
+                        chunk_size=config.logit_chunk_size,
+                    )
+            if _want_entropy:
+                assert isinstance(_logprob_result, tuple) and len(_logprob_result) == 3
+                logprobs_current_sum, logprobs_current_per_token, entropies = _logprob_result
+            else:
+                assert isinstance(_logprob_result, tuple) and len(_logprob_result) == 2
+                logprobs_current_sum, logprobs_current_per_token = _logprob_result
+                entropies = None
+
+            if torch.cuda.is_available():
+                _log_batch = len(batch_rollouts)
+                _log_seqlen = (
+                    sum(seq_lengths) // _log_batch if _use_packing else input_ids_tensor.shape[1]
+                )
+                logger.debug(
+                    "MEMORY after_logprobs alloc_gb=%.2f reserved_gb=%.2f seq_len=%d micro_batch=%d packed=%s",
+                    torch.cuda.memory_allocated() / (1024**3),
+                    torch.cuda.memory_reserved() / (1024**3),
+                    _log_seqlen,
+                    _log_batch,
+                    _use_packing,
+                )
+
+            # FSDP2 safety: after the model forward, NEVER skip backward.
+            # FSDP2 reduce-scatter hooks fire during backward; skipping would
+            # desynchronize NCCL collectives across ranks. Instead, flag the
+            # micro-batch as "skip" and run a zero-loss backward at the end.
+            _fsdp2_skip_micro_batch = False
+
+            if not _is_finite_tensor(logprobs_current_sum):
+                cur_min = torch.nan_to_num(logprobs_current_sum).min().item()
+                cur_max = torch.nan_to_num(logprobs_current_sum).max().item()
+                logger.warning(
+                    "Non-finite current logprobs; skipping micro-batch",
+                    extra={"min": float(cur_min), "max": float(cur_max)},
+                )
+                _fsdp2_skip_micro_batch = True
+
+            # Step 3: Prepare behavior policy logprobs and completion mask for importance sampling
+            # Convert per-token behavior logprobs to padded tensor matching completion shape
+            max_comp_len = logprobs_current_per_token.shape[1]
+            logprobs_old_per_token = torch.zeros(
+                len(batch_rollouts), max_comp_len, device=accelerator.device
+            )
+            completion_mask = torch.zeros(
+                len(batch_rollouts), max_comp_len, device=accelerator.device
+            )
+
+            for idx, (logprobs_list, comp_len) in enumerate(
+                zip(batch_behavior_per_token_logprobs, batch_comp_lens, strict=True)
+            ):
+                actual_len = min(len(logprobs_list), max_comp_len)
+                if actual_len > 0:
+                    logprobs_old_per_token[idx, :actual_len] = torch.tensor(
+                        logprobs_list[:actual_len], device=accelerator.device
+                    )
+                    completion_mask[idx, :comp_len] = 1.0
+
+            # Validate behavior logprobs
+            logprobs_old_sum = (logprobs_old_per_token * completion_mask).sum(dim=1)
+            if not _fsdp2_skip_micro_batch and not _is_finite_tensor(logprobs_old_sum):
+                old_min = torch.nan_to_num(logprobs_old_sum).min().item()
+                old_max = torch.nan_to_num(logprobs_old_sum).max().item()
+                logger.warning(
+                    "Non-finite old/behavior logprobs; skipping micro-batch",
+                    extra={"min": float(old_min), "max": float(old_max)},
+                )
+                _fsdp2_skip_micro_batch = True
+
+            # Step 4: Compute reference model logprobs for KL divergence penalty (only if enabled)
+            logprobs_ref_per_token = None
+            if kl_enabled:
+                if ref_model is not None:
+                    with torch.no_grad(), accelerator.autocast():
+                        if _use_packing:
+                            assert position_ids_tensor is not None
+                            _ref_result = compute_logprobs_packed(
+                                ref_model,
+                                input_ids_tensor,
+                                position_ids_tensor,
+                                seq_lengths,
+                                batch_prompt_lens,
+                                batch_comp_lens,
+                                return_per_token=True,
+                                chunked=config.chunked_logits,
+                                chunk_size=config.logit_chunk_size,
+                            )
+                        else:
+                            assert attention_mask_tensor is not None
+                            _ref_result = compute_logprobs(
+                                ref_model,
+                                input_ids_tensor,
+                                attention_mask_tensor,
+                                batch_prompt_lens,
+                                batch_comp_lens,
+                                return_per_token=True,
+                                chunked=config.chunked_logits,
+                                chunk_size=config.logit_chunk_size,
+                            )
+                        assert isinstance(_ref_result, tuple) and len(_ref_result) == 2
+                        logprobs_ref_sum, logprobs_ref_per_token = _ref_result
+                    if not _fsdp2_skip_micro_batch and not _is_finite_tensor(logprobs_ref_sum):
+                        ref_min = torch.nan_to_num(logprobs_ref_sum).min().item()
+                        ref_max = torch.nan_to_num(logprobs_ref_sum).max().item()
+                        logger.warning(
+                            "Non-finite reference logprobs; skipping micro-batch",
+                            extra={"min": float(ref_min), "max": float(ref_max)},
+                        )
+                        _fsdp2_skip_micro_batch = True
+                    # Delete reference sum to free memory (only need per-token)
+                    del logprobs_ref_sum
+                else:
+                    # If no ref model, set ref per-token logprobs equal to current (zero KL)
+                    logprobs_ref_per_token = logprobs_current_per_token.detach()
+
+            # Step 5: Normalize advantages for stable gradients
+            advantages_normalized = self._normalize_advantages(advantages_tensor)
+
+            # Step 6: Compute total completion tokens for DAPO variant
+            total_completion_tokens = None
+            if self.grpo_variant == "dapo":
+                local_completion_tokens = completion_mask.sum()  # Keep as tensor
+                # Gather across all processes with proper shape [1] for each process
+                all_tokens = accelerator.gather(local_completion_tokens.unsqueeze(0))
+                # accelerator.gather returns Tensor but Pyright thinks it could be Mapping
+                if isinstance(all_tokens, torch.Tensor):
+                    total_completion_tokens = int(all_tokens.sum().item())
+                else:
+                    total_completion_tokens = int(local_completion_tokens.item())
+
+            # Step 7: Compute policy gradient loss with importance sampling and PPO clipping
+            loss_pg, ratio_clip_frac_val, ratio_ceiling_frac_val, ratios_pre_ceiling = (
+                self._compute_policy_gradient_loss(
+                    logprobs_current_per_token,
+                    logprobs_old_per_token,
+                    advantages_normalized,
+                    completion_mask,
+                    len(batch_rollouts),
+                    total_completion_tokens,
+                )
+            )
+
+            # Step 8: Compute KL divergence penalty (only when enabled)
+            if kl_enabled and logprobs_ref_per_token is not None:
+                loss_kl, kl_value = self._compute_kl_divergence_loss(
+                    logprobs_current_per_token,
+                    logprobs_ref_per_token,
+                    batch_comp_lens,
+                    current_kl_coef,
+                    accelerator,
+                )
+            else:
+                loss_kl = torch.tensor(0.0, device=logprobs_current_sum.device)
+                kl_value = 0.0
+
+            # Step 9: Entropy regularization (already computed in Step 2's forward pass)
+            if entropies is not None:
+                if not _fsdp2_skip_micro_batch and not _is_finite_tensor(entropies):
+                    logger.warning("Non-finite entropies; skipping micro-batch")
+                    _fsdp2_skip_micro_batch = True
+                loss_entropy = (
+                    -self.config.entropy_coef * entropies.mean()
+                    if not _fsdp2_skip_micro_batch
+                    else torch.tensor(0.0, device=accelerator.device)
+                )
+            else:
+                entropies = torch.zeros(len(batch_rollouts), device=accelerator.device)
+                loss_entropy = torch.tensor(0.0, device=accelerator.device)
+
+            # Step 10: Aggregate total loss
+            # Zero-loss fallback flows through the model graph so backward()
+            # still touches every parameter (required for FSDP2 collectives).
+            _zero_loss = logprobs_current_sum.sum() * 0.0
+            if _fsdp2_skip_micro_batch:
+                loss_total = _zero_loss
+            else:
+                loss_total = loss_pg + loss_kl + loss_entropy
+                if not torch.isfinite(loss_total):
+                    logger.warning(
+                        "Non-finite total loss; skipping micro-batch",
+                        extra={
+                            "loss_pg": float(torch.nan_to_num(loss_pg).item()),
+                            "loss_kl": float(torch.nan_to_num(loss_kl).item()),
+                            "loss_entropy": float(torch.nan_to_num(loss_entropy).item()),
+                        },
+                    )
+                    _fsdp2_skip_micro_batch = True
+                    loss_total = _zero_loss
+
+            if not _fsdp2_skip_micro_batch:
+                micro_sequence_count = len(batch_rollouts)
+                micro_token_count = float(completion_mask.sum().item())
+                reward_sum = float(sum(batch_rewards)) if batch_rewards else 0.0
+
+                # Track total tokens through the model (prompt+completion) and avg seq_len for MFU
+                micro_total_tokens = input_ids_tensor.numel()  # B*S or 1*total_packed
+                actual_batch_tracker["total_model_tokens"] += micro_total_tokens
+                if _use_packing and seq_lengths:
+                    actual_batch_tracker["avg_seq_len_sum"] += sum(seq_lengths)
+                else:
+                    actual_batch_tracker["avg_seq_len_sum"] += float(
+                        input_ids_tensor.shape[1] * micro_sequence_count
+                    )
+
+                actual_batch_tracker["micro_batches"] += 1
+                actual_batch_tracker["sequence_count"] += float(micro_sequence_count)
+                actual_batch_tracker["token_count"] += micro_token_count
+                actual_batch_tracker["loss_total_sum"] += float(loss_total.item())
+                actual_batch_tracker["loss_pg_sum"] += float(loss_pg.item())
+                actual_batch_tracker["loss_kl_sum"] += float(loss_kl.item())
+                actual_batch_tracker["loss_entropy_sum"] += float(loss_entropy.item())
+                actual_batch_tracker["adv_sum"] += float(advantages_tensor.sum().item())
+                actual_batch_tracker["adv_count"] += float(advantages_tensor.numel())
+                actual_batch_tracker["reward_sum"] += reward_sum
+                actual_batch_tracker["reward_count"] += float(len(batch_rewards))
+                actual_batch_tracker["entropy_sum"] += float(entropies.sum().item())
+                actual_batch_tracker["entropy_count"] += float(entropies.numel())
+                actual_batch_tracker["kl_sum"] += float(kl_value)
+                ratio_weight = (
+                    micro_token_count
+                    if self.importance_sampling_level == "token"
+                    else float(micro_sequence_count)
+                )
+                actual_batch_tracker["ratio_clip_sum"] += ratio_clip_frac_val * ratio_weight
+                actual_batch_tracker["ratio_ceiling_sum"] += ratio_ceiling_frac_val * ratio_weight
+
+            # Step 11: Gradient accumulation with veRL-style loss scaling.
+            # Each micro-batch's loss is scaled by its rollout count relative to
+            # the mini-batch total. This ensures each sequence contributes equally
+            # regardless of micro-batch sizes (critical for token-budget batching).
+            # With fixed batching this is equivalent to 1/grad_accum_steps.
+            if grad_accum_counter == 0:
+                optimizer.zero_grad(set_to_none=True)
+            mini_rollout_count = micro_to_mini_rollout_count[micro_idx]
+            loss_scale = len(batch_rollouts) / max(1, mini_rollout_count)
+            scaled_loss = loss_total * loss_scale
+            accelerator.backward(scaled_loss)
+            grad_accum_counter += 1
+
+            if torch.cuda.is_available():
+                logger.debug(
+                    "MEMORY after_backward alloc_gb=%.2f reserved_gb=%.2f",
+                    torch.cuda.memory_allocated() / (1024**3),
+                    torch.cuda.memory_reserved() / (1024**3),
+                )
+
+            grad_norm_scalar = None
+            # Step optimizer at mini-batch boundaries (every grad_accum_steps micro-batches)
+            if grad_accum_counter >= grad_accum_steps:
+                # Clip gradients in fp32 (no mixed precision)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    self.config.grad_clip,
+                )
+                grad_norm_scalar = grad_norm.item()
+
+                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                    # Build diagnostic info for NaN/Inf gradient detection
+                    logprobs_current_sum = (logprobs_current_per_token * completion_mask).sum(dim=1)
+                    logprobs_old_sum = (logprobs_old_per_token * completion_mask).sum(dim=1)
+                    log_ratio = logprobs_current_sum - logprobs_old_sum
+                    loss_tot_v = torch.nan_to_num(loss_total).item()
+                    lr_mean = torch.nan_to_num(log_ratio).mean().item()
+                    lr_std = torch.nan_to_num(log_ratio).std().item()
+                    adv_mean = advantages_tensor.mean().item()
+                    adv_std = advantages_tensor.std().item()
+                    logger.warning(
+                        "NaN/Inf gradient norm detected; skipping optimizer step",
+                        extra={
+                            "loss_total": float(loss_tot_v),
+                            "log_ratio_mean": float(lr_mean),
+                            "log_ratio_std": float(lr_std),
+                            "adv_mean": float(adv_mean),
+                            "adv_std": float(adv_std),
+                        },
+                    )
+                    grad_accum_counter = 0
+                    reset_actual_batch_tracker()
+                    continue
+
+                # Standard optimizer step in fp32
+                optimizer.step()
+                self.optimizer_step_count += 1
+
+                # Parameter change tracking: measure diff between step t and step t-k
+                # Snapshot persists across k steps, then we measure and update snapshot
+                if (
+                    self.param_tracker.is_enabled()
+                    and self.optimizer_step_count % self.param_tracker.measure_interval == 0
+                ):
+                    # If we have a snapshot from k steps ago, compute metrics
+                    if self.param_tracker.has_snapshot():
+                        # Basic param change metrics
+                        try:
+                            param_metrics = self.param_tracker.compute_metrics(model)
+                            await log_param_change_metrics(
+                                param_metrics, monitor, self.optimizer_step_count
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("Failed to compute param change metrics: %s", exc)
+
+                        # Sparse quality analysis (uses same snapshot)
+                        if (
+                            self.sparse_analyzer.enabled
+                            and input_ids_tensor is not None
+                            and attention_mask_tensor is not None
+                        ):
+                            try:
+                                sparse_metrics = self.sparse_analyzer.analyze(
+                                    model, input_ids_tensor, attention_mask_tensor
+                                )
+                                await log_sparse_quality_metrics(
+                                    sparse_metrics, monitor, self.optimizer_step_count
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                logger.warning("Failed to compute sparse quality metrics: %s", exc)
+
+                    # Capture new snapshot for next k-step measurement
+                    self.param_tracker.clear_snapshot()
+                    self.param_tracker.capture_snapshot(model)
+
+                # Log comprehensive optimizer step summary
+                logger.info(
+                    "Optimizer step %d | loss=%.4f (pg=%.4f, kl=%.4f, ent=%.4f) | "
+                    "grad_norm=%.3f | kl_div=%.4f | kl_coef=%.4f | "
+                    "clip_frac=%.2f%% | ceiling_frac=%.2f%%",
+                    self.optimizer_step_count,
+                    loss_total.item(),
+                    loss_pg.item(),
+                    loss_kl.item(),
+                    loss_entropy.item(),
+                    grad_norm_scalar if grad_norm_scalar is not None else 0.0,
+                    kl_value,
+                    current_kl_coef,
+                    ratio_clip_frac_val * 100.0,
+                    ratio_ceiling_frac_val * 100.0,
+                    extra={
+                        "optimizer_step": self.optimizer_step_count,
+                        "window": window,
+                        "loss_total": loss_total.item(),
+                        "loss_pg": loss_pg.item(),
+                        "loss_kl": loss_kl.item(),
+                        "loss_entropy": loss_entropy.item(),
+                        "grad_norm": grad_norm_scalar,
+                        "kl_divergence": kl_value,
+                        "kl_coef": current_kl_coef,
+                        "ratio_clip_frac": ratio_clip_frac_val,
+                        "ratio_ceiling_frac": ratio_ceiling_frac_val,
+                        "micro_batch": micro_idx + 1,
+                        "total_micro_batches": num_micro_batches,
+                    },
+                )
+
+                # Adaptive KL adjustment after each optimizer step based on observed KL
+                if kl_enabled and self.adaptive_kl_enabled:
+                    current_kl_coef = self.kl_controller.update(kl_value)
+                grad_accum_counter = 0
+
+                batch_metrics = self._finalize_actual_batch_metrics(
+                    actual_batch_tracker,
+                    grad_norm_scalar,
+                )
+                await self._log_batch_metrics(monitor, batch_metrics)
+
+                # Emit structured JSON for Grafana trainer dashboard
+                step_payload: dict[str, Any] = {
+                    "optimizer_step": self.optimizer_step_count,
+                    "window": window,
+                }
+                if batch_metrics:
+                    step_payload.update(batch_metrics)
+                # Add learning rate and KL coefficient
+                try:
+                    step_payload["lr"] = optimizer.param_groups[0]["lr"]
+                except (IndexError, KeyError):
+                    pass
+                step_payload["kl_coef"] = current_kl_coef
+
+                # Compute and log MFU (Model FLOPs Utilization)
+                if _arch_info is not None:
+                    step_time = _time.monotonic() - _step_start_time
+                    total_model_toks = int(actual_batch_tracker["total_model_tokens"])
+                    seq_count = actual_batch_tracker["sequence_count"]
+                    avg_seq = (
+                        actual_batch_tracker["avg_seq_len_sum"] / max(1.0, seq_count)
+                        if seq_count > 0
+                        else 0.0
+                    )
+                    mfu_metrics = _arch_info.compute_mfu(
+                        total_tokens=total_model_toks,
+                        avg_seq_len=avg_seq,
+                        step_time_sec=step_time,
+                        gpu_peak_tflops=_gpu_peak_tflops,
+                    )
+                    step_payload.update(mfu_metrics)
+
+                step_logger.emit(step_payload)
+
+                reset_actual_batch_tracker()
+
+            # Step 12: Collect batch metrics for epoch aggregation (skip for dropped micro-batches)
+            if _fsdp2_skip_micro_batch:
+                continue
+            self._collect_batch_metrics(
+                epoch_metrics,
+                loss_total,
+                loss_pg,
+                loss_kl,
+                loss_entropy,
+                grad_norm_scalar,
+                advantages_tensor,
+                advantages_normalized,
+                entropies,
+                kl_value,
+                ratios_pre_ceiling,
+                ratio_clip_frac_val,
+                ratio_ceiling_frac_val,
+                batch_rewards,
+            )
+
+        # Handle remaining accumulated gradients at epoch end
+        if grad_accum_counter > 0:
+            final_grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                self.config.grad_clip,
+            )
+            if not (torch.isnan(final_grad_norm) or torch.isinf(final_grad_norm)):
+                optimizer.step()
+                self.optimizer_step_count += 1
+
+                # Parameter change tracking at epoch end (same logic as main loop)
+                if (
+                    self.param_tracker.is_enabled()
+                    and self.optimizer_step_count % self.param_tracker.measure_interval == 0
+                ):
+                    if self.param_tracker.has_snapshot():
+                        try:
+                            param_metrics = self.param_tracker.compute_metrics(model)
+                            await log_param_change_metrics(
+                                param_metrics, monitor, self.optimizer_step_count
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("Failed to compute param change metrics: %s", exc)
+
+                        # Sparse quality analysis (uses same snapshot)
+                        if (
+                            self.sparse_analyzer.enabled
+                            and input_ids_tensor is not None
+                            and attention_mask_tensor is not None
+                        ):
+                            try:
+                                sparse_metrics = self.sparse_analyzer.analyze(
+                                    model, input_ids_tensor, attention_mask_tensor
+                                )
+                                await log_sparse_quality_metrics(
+                                    sparse_metrics, monitor, self.optimizer_step_count
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                logger.warning("Failed to compute sparse quality metrics: %s", exc)
+
+                    self.param_tracker.clear_snapshot()
+                    self.param_tracker.capture_snapshot(model)
+
+                batch_metrics = self._finalize_actual_batch_metrics(
+                    actual_batch_tracker,
+                    final_grad_norm.item(),
+                )
+                await self._log_batch_metrics(monitor, batch_metrics)
+
+                # Emit structured JSON for Grafana trainer dashboard (epoch-end leftover)
+                epoch_end_payload: dict[str, Any] = {
+                    "optimizer_step": self.optimizer_step_count,
+                    "window": window,
+                }
+                if batch_metrics:
+                    epoch_end_payload.update(batch_metrics)
+                try:
+                    epoch_end_payload["lr"] = optimizer.param_groups[0]["lr"]
+                except (IndexError, KeyError):
+                    pass
+                epoch_end_payload["kl_coef"] = current_kl_coef
+                step_logger.emit(epoch_end_payload)
+
+            reset_actual_batch_tracker()
+            grad_accum_counter = 0
+
+        return {
+            metric: sum(values) / len(values) if values else 0.0
+            for metric, values in epoch_metrics.items()
+        }

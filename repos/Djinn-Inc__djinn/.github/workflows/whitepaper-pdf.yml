@@ -1,0 +1,44 @@
+name: Generate Whitepaper PDF
+
+on:
+  push:
+    paths:
+      - 'docs/whitepaper.md'
+      - 'docs/images/**'
+      - 'docs/pdf-style.css'
+      - '.github/workflows/whitepaper-pdf.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-pdf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+
+      - name: Install md-to-pdf (pinned version)
+        run: npm install -g md-to-pdf@5.2.4
+
+      - name: Generate PDF
+        run: |
+          cd docs
+          md-to-pdf whitepaper.md \
+            --stylesheet pdf-style.css \
+            --pdf-options '{"format": "Letter", "margin": {"top": "1in", "bottom": "1in", "left": "1in", "right": "1in"}, "printBackground": true}' \
+            --launch-options '{"args": ["--no-sandbox"]}'
+
+      - name: Commit PDF
+        run: |
+          cp docs/whitepaper.pdf web/public/whitepaper.pdf
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/whitepaper.pdf web/public/whitepaper.pdf
+          git diff --staged --quiet || git commit -m "Auto-generate whitepaper PDF"
+          git push

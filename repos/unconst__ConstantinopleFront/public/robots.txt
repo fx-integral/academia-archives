@@ -1,0 +1,8 @@
+User-agent: *
+Allow: /
+Allow: /SKILL.md
+Allow: /llm.txt
+Allow: /agents.txt
+Allow: /.well-known/inference.json
+
+Sitemap: https://www.constantinople.cloud/sitemap.xml

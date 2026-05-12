@@ -1,0 +1,300 @@
+"use client";
+
+import { Card, CardContent } from "@/components/ui/card";
+import { formatParams } from "@/lib/utils";
+import { TEACHER } from "@/lib/subnet";
+
+interface DocsTabProps {
+  /** Composite-worst floor a challenger must clear (king.worst × 1.03). */
+  scoreToBeat: number | null;
+  /** Reference: king's KL on the latest H2H. KL is one of 17 axes, not the gate. */
+  kingKl: number | null;
+}
+
+export function DocsTab({ scoreToBeat, kingKl }: DocsTabProps) {
+  return (
+    <div className="max-w-3xl space-y-6">
+      {/* Composite floor to beat */}
+      <Card className="border-orange-400/30 bg-orange-400/5">
+        <CardContent className="p-4 flex items-center justify-between">
+          <div>
+            <p className="text-sm font-semibold text-orange-400">Composite-worst floor</p>
+            <p className="text-xs text-muted-foreground">
+              The king is whoever has the highest <code className="font-mono">composite.worst</code> — the lowest score across 17 axes. To dethrone, your worst-axis must clear the king&apos;s by ≥3% AND you must Pareto-dominate the king on a meaningful majority of axes.
+            </p>
+          </div>
+          <div className="text-right">
+            <p className="text-2xl font-mono font-bold text-orange-400">
+              &gt;{scoreToBeat != null ? scoreToBeat.toFixed(3) : "—"}
+            </p>
+            <p className="text-[10px] text-muted-foreground">
+              composite.worst floor (king × 1.03)
+            </p>
+          </div>
+        </CardContent>
+      </Card>
+
+      <div className="space-y-6 text-sm leading-relaxed text-muted-foreground">
+        <section className="space-y-2">
+          <h2 className="text-base font-semibold text-foreground">The Goal</h2>
+          <p>
+            Distill{" "}
+            <a href={`https://huggingface.co/${TEACHER.model}`} target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:underline font-mono">
+              {TEACHER.model}
+            </a>{" "}
+            ({formatParams(TEACHER.totalParams)} total, {formatParams(TEACHER.activeParams)} active MoE)
+            into a smaller model. The winning model must match the teacher
+            <em>and</em> pass absolute-correctness, reasoning, factuality,
+            tool-use, long-context, and multi-turn gates. KL is one of 17 axes
+            in the composite — useful, never sufficient.
+          </p>
+        </section>
+
+        <section className="space-y-2">
+          <h2 className="text-base font-semibold text-foreground">Scoring</h2>
+          <p>
+            Each commitment is scored on a <strong className="text-foreground">17-axis composite</strong>.
+            The five concerns it covers:
+          </p>
+          <ul className="list-disc pl-5 space-y-1 text-xs">
+            <li><strong className="text-foreground">Distribution match</strong> — on-policy reverse-KL (35% of the relative slice), forward-KL (15% — the &ldquo;classic&rdquo; KL), capability (25%), length (10%), degeneracy (15%).</li>
+            <li><strong className="text-foreground">Capability against ground truth</strong> — nine procedural benches (math, code, reasoning, IFEval, AIME, MBPP, tool-use, long-context, robustness). All items are generated per round from a block-seed; no static answer key.</li>
+            <li><strong className="text-foreground">Conversational quality</strong> — judge-probe (15%), chat-turns probe (8%).</li>
+            <li><strong className="text-foreground">Generation discipline</strong> — <code className="font-mono">reasoning_density</code> (5%) directly punishes thinking-without-answering. Past kings have been retroactively DQ&apos;d for failing this axis.</li>
+            <li><strong className="text-foreground">Robustness to prompt rewrites</strong> — robustness axis (7%) re-asks math items under K block-rotated paraphrases + noise wrappers.</li>
+          </ul>
+          <p>
+            The king is whoever has the highest <code className="font-mono">composite.worst</code> in <code className="font-mono">composite_scores.json</code>. KL is recomputed per round as <strong className="text-foreground">sparse top-128 KL</strong> (teacher returns top-128 logprobs via vLLM, student softmaxes over all {TEACHER.vocabSize.toLocaleString()} tokens then renormalises over the shared support) — but it&apos;s 0.15 of the relative tier, never the headline.
+          </p>
+          <p>
+            Each eval uses 300 prompts from{" "}
+            <a href="https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle" target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:underline">
+              ClimbMix-400B
+            </a>
+            . Prompts are seeded by on-chain block hash — unpredictable before finalization.
+          </p>
+          <p>
+            <strong className="text-foreground">Winner-take-all:</strong> the king gets weight 1.0. A challenger takes the crown only by beating the king on <code className="font-mono">composite.worst</code> by ≥3% (and passing axis floor + Pareto dominance gates).
+            {kingKl != null && <> Reference: the current king&apos;s KL is {kingKl.toFixed(4)} — that&apos;s the KL axis only, one of 17.</>}
+          </p>
+          <p className="text-xs italic text-muted-foreground/60">
+            Single-eval mode (live 2026-04-25): one registration → one commitment → one eval. The composite is stored once and the king is selected cross-round from the highest worst-axis. Different prompts per round are by design — composite is an absolute (not paired-relative) signal.
+          </p>
+        </section>
+
+        <section className="space-y-2">
+          <h2 className="text-base font-semibold text-foreground">King-of-the-Hill</h2>
+          <p>
+            The current best model (&quot;king&quot;) holds the crown until a new commitment ships a higher <code className="font-mono">composite.worst</code> across the 17 active axes (KL, on-policy RKL, capability, length, degeneracy, judge, chat-turns, reasoning-density, math, code, reasoning, IFEval, AIME, MBPP, tool-use, long-context, robustness).
+          </p>
+          <ul className="list-disc pl-5 space-y-1">
+            <li><strong className="text-foreground">Pre-checks first</strong> — architecture, hash, integrity verified before any GPU time</li>
+            <li><strong className="text-foreground">One eval per commitment</strong> — already-scored UIDs keep their scores; only new on-chain commitments trigger a new eval. No re-evals.</li>
+            <li><strong className="text-foreground">FIFO challenger cap</strong> — at most 10 new challengers per round, oldest commit_block first; the rest defer to the next round (typical round runs ~45 min wall).</li>
+            <li><strong className="text-foreground">Composite-worst margin</strong> — challenger.worst &gt; king.worst + 0.03 to dethrone</li>
+            <li><strong className="text-foreground">Pareto dominance gate</strong> — challenger must win or tie on a meaningful majority of axes; narrow wins on one axis with regressions across many others don&apos;t crown</li>
+            <li><strong className="text-foreground">Axis floor</strong> — collapse below the floor on any required axis (degeneracy, capability, etc.) blocks dethrone</li>
+            <li><strong className="text-foreground">Early stopping</strong> — clearly worse students cut short to save GPU time</li>
+          </ul>
+        </section>
+
+        <section className="space-y-2">
+          <h2 className="text-base font-semibold text-foreground">Model Requirements</h2>
+          <ul className="list-disc pl-5 space-y-1">
+            <li><strong className="text-foreground">≤{formatParams(TEACHER.maxStudentParams)} total params</strong> — from safetensors metadata</li>
+            <li><strong className="text-foreground">Same tokenizer</strong> as teacher (vocab_size={TEACHER.vocabSize.toLocaleString()})</li>
+            <li><strong className="text-foreground">No quantization</strong> — GPTQ/AWQ/FP8 rejected</li>
+            <li><strong className="text-foreground">Unique weights</strong> — SHA256 duplicate detection</li>
+            <li><strong className="text-foreground">Safetensors format</strong> — bf16/fp16</li>
+            <li><strong className="text-foreground">One commit per hotkey</strong> — permanent. If DQ&apos;d, register a new hotkey.</li>
+          </ul>
+        </section>
+
+        <section className="space-y-2">
+          <h2 className="text-base font-semibold text-foreground">How to Mine</h2>
+          <div className="space-y-2">
+            <p><strong className="text-foreground">1.</strong> Train a distilled model from <span className="font-mono">{TEACHER.model}</span></p>
+            <p><strong className="text-foreground">2.</strong> Upload to HuggingFace as a public repo with safetensors weights</p>
+            <p><strong className="text-foreground">3.</strong> Register on subnet 97 and commit with the miner script</p>
+          </div>
+          <Card className="border-border/50 bg-card/50 mt-3">
+            <CardContent className="p-3">
+              <pre className="text-xs font-mono overflow-x-auto whitespace-pre text-foreground">{`git clone https://github.com/unarbos/distil.git && cd distil
+pip install .
+
+# Pre-check your model (recommended)
+python check_model.py --model-repo you/your-model --eval
+
+# Commit (PERMANENT)
+python miner.py --wallet-name mywallet --hotkey-name myhotkey \\
+  --model-repo you/your-model --netuid 97 --network finney`}</pre>
+            </CardContent>
+          </Card>
+        </section>
+
+        <section className="space-y-2">
+          <h2 className="text-base font-semibold text-foreground">Anti-Gaming</h2>
+          <ul className="list-disc pl-5 space-y-1">
+            <li><strong className="text-foreground">Copy detection</strong> — SHA256 hash tracking; first committer owns the weights</li>
+            <li><strong className="text-foreground">Block-hash seeded prompts</strong> — unpredictable before finalization</li>
+            <li><strong className="text-foreground">Procedural live axes</strong> — long-context and synthetic reasoning/instruction/factual tasks are generated from the block seed, so miners can only overfit by learning the skills</li>
+            <li><strong className="text-foreground">Sparse top-128 KL</strong> — teacher returns top-128 logprobs per position via vLLM (<code className="font-mono text-muted-foreground">--max-logprobs 128</code>); student computes full-vocab softmax over all {TEACHER.vocabSize.toLocaleString()} tokens then gathers + renormalizes over the teacher&apos;s top-128 support. Proper KL over the shared 128-token support. Full-vocab path (dense teacher logits) is available in-code for reference but disabled in prod for bandwidth reasons.</li>
+            <li><strong className="text-foreground">Integrity checks</strong> — models must stay public and unchanged</li>
+          </ul>
+        </section>
+
+        <section id="chat-collapse" className="space-y-2 scroll-mt-20">
+          <h2 className="text-base font-semibold text-foreground">Chat & Thinking Collapse</h2>
+          <p className="text-xs text-muted-foreground/80">
+            Pure token-level KL on web text does not punish a student that has forgotten how to stop
+            generating. Off-policy distillation on long teacher chains-of-thought produces students
+            that fill the thinking block with repeated filler phrases (<code className="font-mono text-foreground">*Wait, I&apos;ll write:*</code>)
+            and never emit a final answer — matches the teacher&apos;s short-range token statistics
+            perfectly, fails every real chat interaction. See{" "}
+            <a className="underline" href="https://thinkingmachines.ai/blog/on-policy-distillation/" target="_blank" rel="noreferrer">Thinking Machines on-policy distillation</a>{" "}
+            and{" "}
+            <a className="underline" href="https://arxiv.org/abs/2502.07266" target="_blank" rel="noreferrer">arXiv:2502.07266</a>{" "}
+            on CoT-complexity mismatch between teacher and student.
+          </p>
+          <div className="rounded-lg border border-border/30 p-3 text-xs font-mono space-y-1">
+            <div><span className="text-muted-foreground/60">chat_response_probe</span> → greedy gen, <code>enable_thinking=False</code> on 4 trivial prompts</div>
+            <div><span className="text-muted-foreground/60">DQ if</span> &lt; 50% terminate within <code>768</code> tokens</div>
+            <div><span className="text-muted-foreground/60">DQ if</span> &lt; 50% emit non-empty content after stripping <code>&lt;think&gt;…&lt;/think&gt;</code></div>
+            <div className="pt-1"><span className="text-muted-foreground/60">thinking_collapse_probe</span> → <code>enable_thinking=True</code> on 5 trivial prompts</div>
+            <div><span className="text-muted-foreground/60">per-sample stats</span> gzip ratio, distinct-{'{'}1,2,4{'}'}-gram rate, top-6-gram rate, byte-entropy</div>
+            <div><span className="text-muted-foreground/60">DQ if</span> &gt; 33% degenerate: gzip ratio robust z-score &lt; <code>−4σ</code> vs teacher on same prompts (or gzip ratio &lt; <code>0.25</code> when no teacher reference)</div>
+            <div><span className="text-muted-foreground/60">DQ if</span> &lt; 66% terminate within <code>1024</code> tokens</div>
+          </div>
+          <p className="text-xs text-muted-foreground/70">
+            The threshold is statistical, not hand-picked: the teacher&apos;s own distribution on identical
+            prompts defines the &quot;natural&quot; band via robust median/MAD z-scores (Iglewicz &amp; Hoaglin 1993);
+            a student only fails when its compression or top-n-gram rate is outside a <code>4σ</code>
+            robust band from the teacher&apos;s empirical distribution.
+          </p>
+          <p className="text-xs text-muted-foreground/70">
+            Refs: Holtzman et al. <a className="underline" href="https://arxiv.org/abs/1904.09751" target="_blank" rel="noreferrer">arXiv:1904.09751</a>{" "}
+            (repetition/entropy/Zipfian degeneracy axes); Pillutla et al. MAUVE{" "}
+            <a className="underline" href="https://arxiv.org/abs/2102.01454" target="_blank" rel="noreferrer">arXiv:2102.01454</a>{" "}
+            (distributional-gap formalism);{" "}
+            <a className="underline" href="https://thinkingmachines.ai/blog/on-policy-distillation/" target="_blank" rel="noreferrer">Thinking Machines on-policy distillation</a>{" "}
+            and <a className="underline" href="https://arxiv.org/abs/2502.07266" target="_blank" rel="noreferrer">arXiv:2502.07266</a>{" "}
+            (why off-policy distillation causes CoT collapse).
+          </p>
+          <p className="text-xs text-muted-foreground/70">
+            Env knobs: <code>THINK_PROBE_MAX_TOKENS</code>, <code>THINK_PROBE_DEGEN_SIGMA</code>,{" "}
+            <code>THINK_PROBE_GZIP_FLOOR</code>, <code>THINK_PROBE_TERMINATE_THRESHOLD</code>. Set{" "}
+            <code>THINK_COLLAPSE_PROBE=0</code> to skip.
+          </p>
+        </section>
+
+        <section id="anti-finetune" className="space-y-2 scroll-mt-20">
+          <h2 className="text-base font-semibold text-foreground">Fine-Tunability Requirement</h2>
+          <p className="text-xs text-muted-foreground/80">
+            Submitted models must be continuable-pretraining targets, not dead ends. Every student is
+            probed before scoring with a simple cross-entropy pass; models whose gradients explode or
+            whose layer norms have been inflated out of range are disqualified (DQ reason prefixed{" "}
+            <code className="font-mono text-foreground">anti-finetune:</code>).
+          </p>
+          <div className="rounded-lg border border-border/30 p-3 text-xs font-mono space-y-1">
+            <div><span className="text-muted-foreground/60">Probe input</span> → <span className="text-foreground">&quot;The capital of France is Paris. The capital of Germany is Berlin.&quot;</span></div>
+            <div><span className="text-muted-foreground/60">Probe mode</span> → <span className="text-foreground">forward + backward on labels=input_ids (standard causal CE loss)</span></div>
+            <div><span className="text-muted-foreground/60">DQ if</span> loss is <code>NaN</code>/<code>Inf</code></div>
+            <div><span className="text-muted-foreground/60">DQ if</span> any grad is <code>NaN</code>/<code>Inf</code></div>
+            <div><span className="text-muted-foreground/60">DQ if</span> global grad-norm &gt; <code className="text-danger">500</code></div>
+            <div><span className="text-muted-foreground/60">DQ if</span> any per-param-type grad-norm &gt; <code className="text-danger">500</code> (norm / embed / lm_head / attn / ffn / bias)</div>
+            <div><span className="text-muted-foreground/60">DQ if</span> any LayerNorm/RMSNorm weight <code>|w|</code><sub>max</sub> &gt; <code className="text-danger">30</code></div>
+          </div>
+          <p className="text-xs text-muted-foreground/70">
+            Thresholds are env-tunable (<code>FINETUNE_GRAD_NORM_MAX</code>,{" "}
+            <code>FINETUNE_NORM_WEIGHT_MAX</code>). Initial values are heuristic — per mantaLLM&apos;s
+            suggestion we will continue to tighten them as we observe probe outputs across the
+            miner population. Well-behaved distilled models sit 1–3 orders of magnitude below the
+            current caps. If you hit a false DQ, open a thread with your probe numbers from the
+            round card (<code>loss</code>, <code>global_grad_norm</code>, <code>worst_param_type</code>,{" "}
+            <code>worst_norm_weight</code>).
+          </p>
+        </section>
+
+        <section id="local-eval" className="space-y-2 scroll-mt-20">
+          <h2 className="text-base font-semibold text-foreground">Local Eval (Parity Recipe)</h2>
+          <p className="text-xs text-muted-foreground/80">
+            Want to sanity-check your KL axis against the current king before you submit? Run the same prompt
+            sampling + KL math the validator does, locally, against any HF model. Note: this only checks <em>one</em> of the 17 axes — a strong local KL still has to clear math, code, IFEval, reasoning-density, and the rest before it earns the crown.
+          </p>
+          <div className="rounded-lg border border-border/30 p-3 text-xs font-mono space-y-1">
+            <div><span className="text-muted-foreground/60"># start a teacher vLLM on port 8000 (Qwen3.5-35B-A3B)</span></div>
+            <div><span className="text-muted-foreground/60"># then from repo root:</span></div>
+            <div>STUDENT_HF=<span className="text-foreground">your-org/your-model</span> \</div>
+            <div className="pl-4">python scripts/local_eval.py</div>
+          </div>
+          <p className="text-xs text-muted-foreground/70">
+            Env vars: <code>STUDENT_HF</code> (required), <code>BLOCK_NUMBER</code>/<code>BLOCK_HASH</code>{" "}
+            (optional — defaults to the latest public round), <code>KING_KL</code> (optional),{" "}
+            <code>TEACHER_BACKEND</code> (<code>vllm</code> default, or <code>hf</code> for pure
+            transformers), <code>N_PROMPTS</code> (default 300), <code>DEVICE</code>,{" "}
+            <code>DTYPE</code>. Results are written to <code>state/local_eval/</code>.
+          </p>
+        </section>
+
+        <section className="space-y-2">
+          <h2 className="text-base font-semibold text-foreground">Teacher Model</h2>
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 text-xs rounded-lg border border-border/30 p-3">
+            <div>
+              <span className="text-muted-foreground/60">Model</span>
+              <p className="font-mono text-foreground">{TEACHER.model}</p>
+            </div>
+            <div>
+              <span className="text-muted-foreground/60">Total</span>
+              <p className="font-mono text-foreground">{formatParams(TEACHER.totalParams)}</p>
+            </div>
+            <div>
+              <span className="text-muted-foreground/60">Active</span>
+              <p className="font-mono text-foreground">{formatParams(TEACHER.activeParams)}</p>
+            </div>
+            <div>
+              <span className="text-muted-foreground/60">Arch</span>
+              <p className="font-mono text-foreground">{TEACHER.architecture}</p>
+            </div>
+            <div>
+              <span className="text-muted-foreground/60">Vocab</span>
+              <p className="font-mono text-foreground">{TEACHER.vocabSize.toLocaleString()}</p>
+            </div>
+            <div>
+              <span className="text-muted-foreground/60">Max Student</span>
+              <p className="font-mono text-foreground">{formatParams(TEACHER.maxStudentParams)}</p>
+            </div>
+          </div>
+        </section>
+
+        <section className="space-y-2">
+          <h2 className="text-base font-semibold text-foreground">Roadmap</h2>
+          <p className="text-xs text-muted-foreground/70">
+            Next teacher candidates under discussion (subject to governance + community feedback).
+            No change is scheduled until announced.
+          </p>
+          <ul className="list-disc pl-5 space-y-1 text-xs">
+            <li>
+              <a href="https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct" target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:underline font-mono">
+                Qwen/Qwen3-Next-80B-A3B-Instruct
+              </a>{" "}
+              — current teacher.
+            </li>
+            <li>
+              Future MoE candidates with comparable active-param budgets.
+            </li>
+            <li>
+              Next-gen dense 7B-12B teachers if a strong open release appears.
+            </li>
+          </ul>
+          <p className="text-[11px] italic text-muted-foreground/50">
+            Want to propose a teacher? Open an issue on{" "}
+            <a href="https://github.com/unarbos/distil/issues" target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:underline">
+              GitHub
+            </a>
+            .
+          </p>
+        </section>
+      </div>
+    </div>
+  );
+}

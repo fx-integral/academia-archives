@@ -1,0 +1,429 @@
+"""Private FastAPI app for challenge administration and registry access."""
+
+from __future__ import annotations
+
+import html
+
+from fastapi import (
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    status,
+)
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
+from platform_network.gpu.client import GpuAgentClient
+from platform_network.gpu.registry import (
+    GpuServerAlreadyExistsError,
+    GpuServerNotFoundError,
+)
+from platform_network.master.admin.auth import (
+    TokenProvider,
+    constant_time_match,
+    load_admin_token_from_environment,
+    resolve_token,
+)
+from platform_network.master.admin.gpu_registry import (
+    GpuServerRegistry,
+    InMemoryGpuServerRegistry,
+)
+from platform_network.master.admin.runtime import (
+    NoopRuntimeController,
+    RuntimeController,
+)
+from platform_network.master.challenge_dashboard import (
+    ChallengeMetricsProvider,
+    render_challenges_dashboard_svg,
+)
+from platform_network.master.registry import (
+    ChallengeAlreadyExistsError,
+    ChallengeNotFoundError,
+    ChallengeRegistry,
+    record_to_admin_view,
+)
+from platform_network.master.weight_fallback import SignedWeightsService
+from platform_network.schemas.challenge import (
+    ChallengeAdminView,
+    ChallengeCreate,
+    ChallengeCreateResponse,
+    ChallengeStatus,
+    ChallengeUpdate,
+    RegistryResponse,
+    RuntimeOperationResponse,
+)
+from platform_network.schemas.gpu_server import (
+    GpuServerCreate,
+    GpuServerHealth,
+    GpuServerRecord,
+    GpuServerUpdate,
+    GpuServerView,
+)
+from platform_network.schemas.weight_fallback import SignedWeightsResponse
+
+_bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def _not_found(slug: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND, detail=f"Challenge '{slug}' not found"
+    )
+
+
+def create_admin_app(
+    *,
+    registry: ChallengeRegistry | None = None,
+    runtime_controller: RuntimeController | None = None,
+    gpu_registry: GpuServerRegistry | None = None,
+    weights_service: SignedWeightsService | None = None,
+    metrics_provider: ChallengeMetricsProvider | None = None,
+    admin_token_provider: TokenProvider = load_admin_token_from_environment,
+    weights_token_provider: TokenProvider | None = None,
+) -> FastAPI:
+    """Create the private admin/registry FastAPI app."""
+
+    app = FastAPI(title="Platform Network Admin API", version="1.0")
+    challenge_registry = registry or ChallengeRegistry()
+    controller = runtime_controller or NoopRuntimeController()
+    gpu_servers = gpu_registry or InMemoryGpuServerRegistry()
+    weights_token = weights_token_provider or admin_token_provider
+
+    async def require_admin(
+        x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+        credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+    ) -> None:
+        expected = await resolve_token(admin_token_provider)
+        provided = x_admin_token or (credentials.credentials if credentials else "")
+        if not constant_time_match(provided, expected):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized"
+            )
+
+    @app.get("/v1/registry", response_model=RegistryResponse)
+    async def get_registry() -> RegistryResponse:
+        return challenge_registry.registry_response()
+
+    @app.get("/v1/challenges/dashboard.svg")
+    async def get_challenges_dashboard_svg() -> Response:
+        svg = render_challenges_dashboard_svg(
+            challenge_registry.list(), metrics_provider=metrics_provider
+        )
+        return Response(
+            content=svg,
+            media_type="image/svg+xml",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get("/admin", dependencies=[Depends(require_admin)])
+    async def admin_home() -> Response:
+        content = (
+            "<h1>Platform Admin</h1>"
+            "<ul>"
+            "<li><a href='/admin/challenges'>Challenges</a></li>"
+            "<li><a href='/admin/gpu-servers'>GPU servers</a></li>"
+            "<li><a href='/admin/fallback'>Fallback weights</a></li>"
+            "</ul>"
+        )
+        return Response(content=content, media_type="text/html")
+
+    @app.get("/admin/challenges", dependencies=[Depends(require_admin)])
+    async def admin_challenges() -> Response:
+        rows = "".join(
+            "<tr>"
+            f"<td>{html.escape(record.slug)}</td>"
+            f"<td>{html.escape(str(record.status))}</td>"
+            f"<td>{html.escape(record.image)}</td>"
+            f"<td>{html.escape(str(record.resources))}</td>"
+            "</tr>"
+            for record in challenge_registry.list()
+        )
+        return Response(
+            content=f"<h1>Challenges</h1><table>{rows}</table>",
+            media_type="text/html",
+        )
+
+    @app.get("/admin/gpu-servers", dependencies=[Depends(require_admin)])
+    async def admin_gpu_servers() -> Response:
+        rows = "".join(
+            "<tr>"
+            f"<td>{html.escape(record.id)}</td>"
+            f"<td>{html.escape(record.base_url)}</td>"
+            f"<td>{record.enabled}</td>"
+            f"<td>{record.min_gpu_count}</td>"
+            "</tr>"
+            for record in gpu_servers.list()
+        )
+        form = (
+            "<form method='post' action='/v1/admin/gpu-servers'>"
+            "<input name='id' placeholder='id'/>"
+            "<input name='base_url' placeholder='base_url'/>"
+            "</form>"
+        )
+        return Response(
+            content=f"<h1>GPU servers</h1>{form}<table>{rows}</table>",
+            media_type="text/html",
+        )
+
+    @app.get("/admin/fallback", dependencies=[Depends(require_admin)])
+    async def admin_fallback() -> Response:
+        status_text = "configured" if weights_service is not None else "not configured"
+        return Response(
+            content=f"<h1>Fallback weights</h1><p>{status_text}</p>",
+            media_type="text/html",
+        )
+
+    @app.post(
+        "/v1/admin/challenges",
+        response_model=ChallengeCreateResponse,
+        status_code=status.HTTP_201_CREATED,
+        dependencies=[Depends(require_admin)],
+    )
+    async def create_challenge(payload: ChallengeCreate) -> ChallengeCreateResponse:
+        try:
+            record, token = challenge_registry.create(payload)
+        except ChallengeAlreadyExistsError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Challenge '{payload.slug}' already exists",
+            ) from exc
+        return ChallengeCreateResponse(
+            challenge=record_to_admin_view(record), challenge_token=token
+        )
+
+    @app.get(
+        "/v1/admin/challenges/{slug}",
+        response_model=ChallengeAdminView,
+        dependencies=[Depends(require_admin)],
+    )
+    async def get_challenge(slug: str) -> ChallengeAdminView:
+        try:
+            return record_to_admin_view(challenge_registry.get(slug))
+        except ChallengeNotFoundError as exc:
+            raise _not_found(slug) from exc
+
+    @app.patch(
+        "/v1/admin/challenges/{slug}",
+        response_model=ChallengeAdminView,
+        dependencies=[Depends(require_admin)],
+    )
+    async def patch_challenge(
+        slug: str, payload: ChallengeUpdate
+    ) -> ChallengeAdminView:
+        try:
+            return record_to_admin_view(challenge_registry.update(slug, payload))
+        except ChallengeNotFoundError as exc:
+            raise _not_found(slug) from exc
+
+    @app.post(
+        "/v1/admin/challenges/{slug}/activate",
+        response_model=ChallengeAdminView,
+        dependencies=[Depends(require_admin)],
+    )
+    async def activate_challenge(slug: str) -> ChallengeAdminView:
+        try:
+            return record_to_admin_view(
+                challenge_registry.set_status(slug, ChallengeStatus.ACTIVE)
+            )
+        except ChallengeNotFoundError as exc:
+            raise _not_found(slug) from exc
+
+    @app.post(
+        "/v1/admin/challenges/{slug}/deactivate",
+        response_model=ChallengeAdminView,
+        dependencies=[Depends(require_admin)],
+    )
+    async def deactivate_challenge(slug: str) -> ChallengeAdminView:
+        try:
+            return record_to_admin_view(
+                challenge_registry.set_status(slug, ChallengeStatus.INACTIVE)
+            )
+        except ChallengeNotFoundError as exc:
+            raise _not_found(slug) from exc
+
+    def _gpu_not_found(server_id: str) -> HTTPException:
+        return HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"GPU server '{server_id}' not found",
+        )
+
+    def _gpu_view(record: GpuServerRecord) -> GpuServerView:
+        return GpuServerView(**record.model_dump())
+
+    @app.get(
+        "/v1/admin/gpu-servers",
+        response_model=list[GpuServerView],
+        dependencies=[Depends(require_admin)],
+    )
+    async def list_gpu_servers() -> list[GpuServerView]:
+        return [_gpu_view(record) for record in gpu_servers.list()]
+
+    @app.post(
+        "/v1/admin/gpu-servers",
+        response_model=GpuServerView,
+        status_code=status.HTTP_201_CREATED,
+        dependencies=[Depends(require_admin)],
+    )
+    async def create_gpu_server(payload: GpuServerCreate) -> GpuServerView:
+        try:
+            return _gpu_view(gpu_servers.create(payload))
+        except GpuServerAlreadyExistsError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"GPU server '{payload.id}' already exists",
+            ) from exc
+
+    @app.get(
+        "/v1/admin/gpu-servers/{server_id}",
+        response_model=GpuServerView,
+        dependencies=[Depends(require_admin)],
+    )
+    async def get_gpu_server(server_id: str) -> GpuServerView:
+        try:
+            return _gpu_view(gpu_servers.get(server_id))
+        except GpuServerNotFoundError as exc:
+            raise _gpu_not_found(server_id) from exc
+
+    @app.patch(
+        "/v1/admin/gpu-servers/{server_id}",
+        response_model=GpuServerView,
+        dependencies=[Depends(require_admin)],
+    )
+    async def update_gpu_server(
+        server_id: str, payload: GpuServerUpdate
+    ) -> GpuServerView:
+        try:
+            return _gpu_view(gpu_servers.update(server_id, payload))
+        except GpuServerNotFoundError as exc:
+            raise _gpu_not_found(server_id) from exc
+
+    @app.delete(
+        "/v1/admin/gpu-servers/{server_id}",
+        status_code=status.HTTP_204_NO_CONTENT,
+        dependencies=[Depends(require_admin)],
+    )
+    async def delete_gpu_server(server_id: str) -> Response:
+        try:
+            gpu_servers.delete(server_id)
+        except GpuServerNotFoundError as exc:
+            raise _gpu_not_found(server_id) from exc
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @app.post(
+        "/v1/admin/gpu-servers/{server_id}/enable",
+        response_model=GpuServerView,
+        dependencies=[Depends(require_admin)],
+    )
+    async def enable_gpu_server(server_id: str) -> GpuServerView:
+        try:
+            return _gpu_view(gpu_servers.set_enabled(server_id, True))
+        except GpuServerNotFoundError as exc:
+            raise _gpu_not_found(server_id) from exc
+
+    @app.post(
+        "/v1/admin/gpu-servers/{server_id}/disable",
+        response_model=GpuServerView,
+        dependencies=[Depends(require_admin)],
+    )
+    async def disable_gpu_server(server_id: str) -> GpuServerView:
+        try:
+            return _gpu_view(gpu_servers.set_enabled(server_id, False))
+        except GpuServerNotFoundError as exc:
+            raise _gpu_not_found(server_id) from exc
+
+    @app.post(
+        "/v1/admin/gpu-servers/{server_id}/health",
+        response_model=GpuServerHealth,
+        dependencies=[Depends(require_admin)],
+    )
+    async def gpu_server_health(server_id: str) -> GpuServerHealth:
+        try:
+            record = gpu_servers.get(server_id)
+        except GpuServerNotFoundError as exc:
+            raise _gpu_not_found(server_id) from exc
+        token = gpu_servers.get_token(server_id)
+        if not token:
+            return GpuServerHealth(id=server_id, status="error", detail="missing token")
+        try:
+            client = GpuAgentClient(
+                server_id=record.id,
+                base_url=record.base_url,
+                token=token,
+                timeout_seconds=record.timeout_seconds,
+                verify_tls=record.verify_tls,
+            )
+            client.health()
+        except Exception as exc:
+            return GpuServerHealth(id=server_id, status="error", detail=str(exc))
+        return GpuServerHealth(id=server_id, status="ok")
+
+    @app.get(
+        "/v1/weights/latest",
+        response_model=SignedWeightsResponse,
+    )
+    async def latest_weights(
+        challenge_slug: str | None = Query(default=None),
+        authorization: str | None = Header(default=None),
+    ) -> SignedWeightsResponse:
+        expected = await resolve_token(weights_token)
+        provided = ""
+        if authorization and authorization.startswith("Bearer "):
+            provided = authorization.removeprefix("Bearer ").strip()
+        if not constant_time_match(provided, expected):
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Unauthorized")
+        if weights_service is None:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, "latest weights are not configured"
+            )
+        return weights_service.latest(challenge_slug)
+
+    async def _runtime_operation(slug: str, operation: str) -> RuntimeOperationResponse:
+        try:
+            challenge_registry.get(slug)
+        except ChallengeNotFoundError as exc:
+            raise _not_found(slug) from exc
+
+        if operation == "pull":
+            return await controller.pull(slug)
+        if operation == "restart":
+            return await controller.restart(slug)
+        return await controller.status(slug)
+
+    @app.post(
+        "/v1/admin/challenges/{slug}/pull",
+        response_model=RuntimeOperationResponse,
+        dependencies=[Depends(require_admin)],
+    )
+    async def pull_challenge(slug: str) -> RuntimeOperationResponse:
+        return await _runtime_operation(slug, "pull")
+
+    @app.post(
+        "/v1/admin/challenges/{slug}/restart",
+        response_model=RuntimeOperationResponse,
+        dependencies=[Depends(require_admin)],
+    )
+    async def restart_challenge(slug: str) -> RuntimeOperationResponse:
+        return await _runtime_operation(slug, "restart")
+
+    @app.get(
+        "/v1/admin/challenges/{slug}/status",
+        response_model=RuntimeOperationResponse,
+        dependencies=[Depends(require_admin)],
+    )
+    async def challenge_status(slug: str) -> RuntimeOperationResponse:
+        return await _runtime_operation(slug, "status")
+
+    @app.middleware("http")
+    async def no_secret_request_state(request: Request, call_next):  # type: ignore[no-untyped-def]
+        # This middleware intentionally does not log request headers or tokens.
+        return await call_next(request)
+
+    app.state.challenge_registry = challenge_registry
+    app.state.runtime_controller = controller
+    app.state.gpu_registry = gpu_servers
+    return app
+
+
+app = create_admin_app()

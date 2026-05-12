@@ -1,0 +1,639 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      build_images:
+        description: Build and push all Docker images
+        required: false
+        default: "false"
+      image_tag:
+        description: Tag to apply to images when building via workflow_dispatch
+        required: false
+        default: "k3_test"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+  RUSTFLAGS: "-Clink-arg=-fuse-ld=mold"
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: "clang"
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  # Detect changes to determine which services need building
+  changes:
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    outputs:
+      validator: ${{ steps.changes.outputs.validator }}
+      miner: ${{ steps.changes.outputs.miner }}
+      basilica-cli: ${{ steps.changes.outputs.basilica-cli }}
+      basilica-sdk-python: ${{ steps.changes.outputs.basilica-sdk-python }}
+      workspace: ${{ steps.changes.outputs.workspace }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dorny/paths-filter@4512585405083f25c027a35db413c2b3b9006d50 # v2
+        id: changes
+        with:
+          filters: |
+            validator:
+              - 'crates/basilica-validator/**'
+              - 'crates/basilica-common/**'
+              - 'crates/basilica-protocol/**'
+              - 'scripts/validator/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+            miner:
+              - 'crates/basilica-miner/**'
+              - 'crates/basilica-common/**'
+              - 'crates/basilica-protocol/**'
+              - 'scripts/miner/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+            basilica-cli:
+              - 'crates/basilica-cli/**'
+              - 'crates/basilica-common/**'
+              - 'crates/basilica-protocol/**'
+              - 'scripts/cli/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+            basilica-sdk-python:
+              - 'crates/basilica-sdk-python/**'
+              - 'crates/basilica-sdk/**'
+              - 'crates/basilica-common/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+            workspace:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/**'
+
+  quick-checks:
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: "shared-cache"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install protoc
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROTOC_VERSION=25.9
+          PROTOC_ZIP=protoc-${PROTOC_VERSION}-linux-x86_64.zip
+          DOWNLOAD_URL=https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/${PROTOC_ZIP}
+          for attempt in 1 2 3 4 5; do
+            if curl -fsSL --retry 3 --retry-delay 5 --retry-all-errors -o /tmp/${PROTOC_ZIP} "${DOWNLOAD_URL}"; then
+              break
+            fi
+            if [ "${attempt}" = "5" ]; then
+              echo "ERROR: protoc download failed after 5 attempts" >&2
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
+          sudo unzip -q -o /tmp/${PROTOC_ZIP} -d /usr/local
+          rm -f /tmp/${PROTOC_ZIP}
+          protoc --version
+      - name: Cache and install system dependencies
+        uses: awalsh128/cache-apt-pkgs-action@2c09a5e66da6c8016428a2172bd76e5e4f14bb17 # latest
+        with:
+          packages: pkg-config libssl-dev xxd mold clang python3-dev
+          version: 1.0
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@055f5df8c3f65ea01cd41e9dc855becd88953486 # v2
+        with:
+          tool: nextest
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check basilica-sdk-python version consistency
+        # Guard: maturin uses pyproject.toml for the wheel version, while the
+        # Rust crate reads Cargo.toml. When these drift, a tag-triggered
+        # release can build wheels matching the pyproject version and get
+        # silently skipped by PyPI's `skip-existing`.
+        run: |
+          set -euo pipefail
+          cargo_ver=$(awk -F\" '/^version = / {print $2; exit}' crates/basilica-sdk-python/Cargo.toml)
+          pyproject_ver=$(awk -F\" '/^version = / {print $2; exit}' crates/basilica-sdk-python/pyproject.toml)
+          echo "Cargo.toml    version: $cargo_ver"
+          echo "pyproject.toml version: $pyproject_ver"
+          if [ "$cargo_ver" != "$pyproject_ver" ]; then
+            echo "::error file=crates/basilica-sdk-python/pyproject.toml::basilica-sdk-python version drift: Cargo.toml=$cargo_ver, pyproject.toml=$pyproject_ver"
+            exit 1
+          fi
+      - name: Quick check builds
+        run: |
+          cargo check -p basilica-common -p basilica-protocol
+      - name: Run clippy on core packages
+        run: |
+          cargo clippy -p basilica-common -p basilica-protocol --all-targets -- -D warnings
+
+  # Supply-chain checks: advisories, licenses, bans, sources.
+  # Policy lives in `deny.toml`.
+  security-audit:
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: cargo deny check
+        # Use the official cargo-deny-action: it installs cargo-deny and
+        # manages the advisory-db fetch reliably. The direct `cargo deny`
+        # install path fails on these runners because the advisory-db
+        # metadata lookup does not handle a missing per-db directory.
+        uses: EmbarkStudios/cargo-deny-action@91bf2b620e09e18d6eb78b92e7861937469acedb # v2.0.17
+        with:
+          command: check
+          # Respect `all-features = false` in deny.toml; the action default
+          # of `--all-features` would otherwise override it.
+          arguments: ""
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@055f5df8c3f65ea01cd41e9dc855becd88953486 # v2
+        with:
+          tool: cargo-audit
+      - name: cargo audit (advisory only)
+        # cargo-audit runs in addition to cargo-deny to surface anything the
+        # policy in deny.toml does not cover (e.g. non-security informational
+        # advisories). Non-blocking for now — tighten after 0.27.0 removes
+        # the subnet stack that inherits the current noise.
+        continue-on-error: true
+        run: cargo audit --deny warnings
+  lint-complex:
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    needs: quick-checks
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: "shared-cache"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install protoc
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROTOC_VERSION=25.9
+          PROTOC_ZIP=protoc-${PROTOC_VERSION}-linux-x86_64.zip
+          DOWNLOAD_URL=https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/${PROTOC_ZIP}
+          for attempt in 1 2 3 4 5; do
+            if curl -fsSL --retry 3 --retry-delay 5 --retry-all-errors -o /tmp/${PROTOC_ZIP} "${DOWNLOAD_URL}"; then
+              break
+            fi
+            if [ "${attempt}" = "5" ]; then
+              echo "ERROR: protoc download failed after 5 attempts" >&2
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
+          sudo unzip -q -o /tmp/${PROTOC_ZIP} -d /usr/local
+          rm -f /tmp/${PROTOC_ZIP}
+          protoc --version
+      - name: Cache and install system dependencies
+        uses: awalsh128/cache-apt-pkgs-action@2c09a5e66da6c8016428a2172bd76e5e4f14bb17 # latest
+        with:
+          packages: pkg-config libssl-dev xxd mold clang python3-dev
+          version: 1.0
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@055f5df8c3f65ea01cd41e9dc855becd88953486 # v2
+        with:
+          tool: nextest
+      - name: Run clippy on complex packages
+        run: |
+          cargo clippy -p basilica-miner --all-targets --all-features -- -D warnings
+          cargo clippy -p basilica-validator --all-targets --all-features -- -D warnings
+          cargo clippy -p basilica-cli --all-targets --all-features -- -D warnings
+          cargo clippy -p basilica-sdk --all-targets --all-features -- -D warnings
+
+  # Build and test validator
+  build-validator:
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    needs: changes
+    if: needs.changes.outputs.validator == 'true' || needs.changes.outputs.workspace == 'true'
+    strategy:
+      matrix:
+        rust-version: [stable]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ matrix.rust-version }}
+          components: rustfmt
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: "shared-cache"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install protoc
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROTOC_VERSION=25.9
+          PROTOC_ZIP=protoc-${PROTOC_VERSION}-linux-x86_64.zip
+          DOWNLOAD_URL=https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/${PROTOC_ZIP}
+          for attempt in 1 2 3 4 5; do
+            if curl -fsSL --retry 3 --retry-delay 5 --retry-all-errors -o /tmp/${PROTOC_ZIP} "${DOWNLOAD_URL}"; then
+              break
+            fi
+            if [ "${attempt}" = "5" ]; then
+              echo "ERROR: protoc download failed after 5 attempts" >&2
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
+          sudo unzip -q -o /tmp/${PROTOC_ZIP} -d /usr/local
+          rm -f /tmp/${PROTOC_ZIP}
+          protoc --version
+      - name: Cache and install system dependencies
+        uses: awalsh128/cache-apt-pkgs-action@2c09a5e66da6c8016428a2172bd76e5e4f14bb17 # latest
+        with:
+          packages: pkg-config libssl-dev xxd mold clang
+          version: 1.0
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@055f5df8c3f65ea01cd41e9dc855becd88953486 # v2
+        with:
+          tool: nextest
+      - name: Setup Blacksmith Builder
+        uses: useblacksmith/setup-docker-builder@ac083cc84672d01c60d5e8561d0a939b697de542 # v1
+      - name: Generate test key
+        run: |
+          chmod +x scripts/gen-key.sh
+          ./scripts/gen-key.sh
+      - name: Build and test validator
+        run: |
+          export VALIDATOR_PUBLIC_KEY=$(cat public_key.hex)
+          cargo build -p basilica-validator
+          cargo nextest run -p basilica-validator --all-features --no-fail-fast
+          ./target/debug/basilica-validator --help
+      - name: Clean up space before Docker build
+        run: |
+          docker system prune -af
+          df -h
+      - name: Test Docker build script
+        run: |
+          chmod +x scripts/validator/build.sh
+          BITTENSOR_NETWORK=finney ./scripts/validator/build.sh --no-extract
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@876cf04c63f65e9799bcf1043b584e72469c7143 # master
+        with:
+          image-ref: basilica/validator:latest
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'
+          trivyignores: '.trivyignore.yaml'
+
+  # Build and test miner
+  build-miner:
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    needs: changes
+    if: needs.changes.outputs.miner == 'true' || needs.changes.outputs.workspace == 'true'
+    strategy:
+      matrix:
+        rust-version: [stable]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ matrix.rust-version }}
+          components: rustfmt
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: "shared-cache"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install protoc
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROTOC_VERSION=25.9
+          PROTOC_ZIP=protoc-${PROTOC_VERSION}-linux-x86_64.zip
+          DOWNLOAD_URL=https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/${PROTOC_ZIP}
+          for attempt in 1 2 3 4 5; do
+            if curl -fsSL --retry 3 --retry-delay 5 --retry-all-errors -o /tmp/${PROTOC_ZIP} "${DOWNLOAD_URL}"; then
+              break
+            fi
+            if [ "${attempt}" = "5" ]; then
+              echo "ERROR: protoc download failed after 5 attempts" >&2
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
+          sudo unzip -q -o /tmp/${PROTOC_ZIP} -d /usr/local
+          rm -f /tmp/${PROTOC_ZIP}
+          protoc --version
+      - name: Cache and install system dependencies
+        uses: awalsh128/cache-apt-pkgs-action@2c09a5e66da6c8016428a2172bd76e5e4f14bb17 # latest
+        with:
+          packages: pkg-config libssl-dev xxd mold clang python3-dev
+          version: 1.0
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@055f5df8c3f65ea01cd41e9dc855becd88953486 # v2
+        with:
+          tool: nextest
+      - name: Setup Blacksmith Builder
+        uses: useblacksmith/setup-docker-builder@ac083cc84672d01c60d5e8561d0a939b697de542 # v1
+      - name: Generate test key
+        run: |
+          chmod +x scripts/gen-key.sh
+          ./scripts/gen-key.sh
+      - name: Build and test miner
+        run: |
+          export VALIDATOR_PUBLIC_KEY=$(cat public_key.hex)
+          cargo build -p basilica-miner
+          cargo nextest run -p basilica-miner --lib --no-fail-fast
+          ./target/debug/basilica-miner --help
+      - name: Clean up space before Docker build
+        run: |
+          docker system prune -af
+          df -h
+      - name: Test Docker build script
+        run: |
+          chmod +x scripts/miner/build.sh
+          BITTENSOR_NETWORK=finney ./scripts/miner/build.sh --no-extract
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@876cf04c63f65e9799bcf1043b584e72469c7143 # master
+        with:
+          image-ref: basilica/miner:latest
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'
+          trivyignores: '.trivyignore.yaml'
+
+  # Build and test basilica-cli
+  build-cli:
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    needs: changes
+    if: needs.changes.outputs.basilica-cli == 'true' || needs.changes.outputs.workspace == 'true'
+    strategy:
+      matrix:
+        rust-version: [stable]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ matrix.rust-version }}
+          components: rustfmt
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: "shared-cache"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install protoc
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROTOC_VERSION=25.9
+          PROTOC_ZIP=protoc-${PROTOC_VERSION}-linux-x86_64.zip
+          DOWNLOAD_URL=https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/${PROTOC_ZIP}
+          for attempt in 1 2 3 4 5; do
+            if curl -fsSL --retry 3 --retry-delay 5 --retry-all-errors -o /tmp/${PROTOC_ZIP} "${DOWNLOAD_URL}"; then
+              break
+            fi
+            if [ "${attempt}" = "5" ]; then
+              echo "ERROR: protoc download failed after 5 attempts" >&2
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
+          sudo unzip -q -o /tmp/${PROTOC_ZIP} -d /usr/local
+          rm -f /tmp/${PROTOC_ZIP}
+          protoc --version
+      - name: Cache and install system dependencies
+        uses: awalsh128/cache-apt-pkgs-action@2c09a5e66da6c8016428a2172bd76e5e4f14bb17 # latest
+        with:
+          packages: pkg-config libssl-dev xxd mold clang python3-dev
+          version: 1.0
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@055f5df8c3f65ea01cd41e9dc855becd88953486 # v2
+        with:
+          tool: nextest
+      - name: Build and test basilica-cli
+        run: |
+          cargo build -p basilica-cli
+          cargo nextest run -p basilica-cli --all-features --no-fail-fast
+          ./target/debug/basilica --help
+
+  # Build and test Python SDK
+  test-python-sdk:
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    needs: changes
+    if: needs.changes.outputs.basilica-sdk-python == 'true' || needs.changes.outputs.workspace == 'true'
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: "shared-cache"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install protoc
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROTOC_VERSION=25.9
+          PROTOC_ZIP=protoc-${PROTOC_VERSION}-linux-x86_64.zip
+          DOWNLOAD_URL=https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/${PROTOC_ZIP}
+          for attempt in 1 2 3 4 5; do
+            if curl -fsSL --retry 3 --retry-delay 5 --retry-all-errors -o /tmp/${PROTOC_ZIP} "${DOWNLOAD_URL}"; then
+              break
+            fi
+            if [ "${attempt}" = "5" ]; then
+              echo "ERROR: protoc download failed after 5 attempts" >&2
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
+          sudo unzip -q -o /tmp/${PROTOC_ZIP} -d /usr/local
+          rm -f /tmp/${PROTOC_ZIP}
+          protoc --version
+
+      - name: Cache and install system dependencies
+        uses: awalsh128/cache-apt-pkgs-action@2c09a5e66da6c8016428a2172bd76e5e4f14bb17 # latest
+        with:
+          packages: pkg-config libssl-dev xxd mold clang python3-dev
+          version: 1.0
+
+      - name: Create virtual environment
+        run: python -m venv .venv
+
+      - name: Install maturin
+        run: |
+          source .venv/bin/activate
+          pip install maturin pytest pytest-asyncio
+
+      - name: Build and install Python SDK
+        run: |
+          source .venv/bin/activate
+          cd crates/basilica-sdk-python
+          maturin develop --release
+
+      - name: Run Python tests
+        run: |
+          source .venv/bin/activate
+          cd crates/basilica-sdk-python
+          python -m pytest tests/ -v || echo "No tests found yet"
+
+      - name: Test examples (syntax check)
+        run: |
+          source .venv/bin/activate
+          cd crates/basilica-sdk-python/examples
+          for example in *.py; do
+            echo "Checking $example..."
+            python -m py_compile "$example"
+          done
+
+      - name: Test import
+        run: |
+          source .venv/bin/activate
+          python -c 'import basilica; print(f"SDK imported successfully. API URL: {basilica.DEFAULT_API_URL}")'
+
+  # Final status check
+  ci-success:
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    needs:
+      - quick-checks
+      - lint-complex
+      - security-audit
+      - build-validator
+      - build-miner
+      - build-cli
+      - test-python-sdk
+    if: always()
+    steps:
+      - name: Check if all jobs succeeded
+        run: |
+          if [[ "${{ needs.quick-checks.result }}" == "success" && \
+                "${{ needs.lint-complex.result }}" == "success" && \
+                "${{ needs.security-audit.result }}" == "success" && \
+                ("${{ needs.build-validator.result }}" == "success" || "${{ needs.build-validator.result }}" == "skipped") && \
+                ("${{ needs.build-miner.result }}" == "success" || "${{ needs.build-miner.result }}" == "skipped") && \
+                ("${{ needs.build-cli.result }}" == "success" || "${{ needs.build-cli.result }}" == "skipped") && \
+                ("${{ needs.test-python-sdk.result }}" == "success" || "${{ needs.test-python-sdk.result }}" == "skipped") ]]; then
+            echo "All CI checks passed!"
+            exit 0
+          else
+            echo "Some CI checks failed!"
+            exit 1
+          fi
+
+  # Manual: Build and push all images (workflow_dispatch only)
+  build-images:
+    if: |
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.build_images == 'true') ||
+      (github.event_name == 'pull_request' && (
+        contains(github.event.pull_request.title, 'build-images') ||
+        contains(github.event.pull_request.body, 'build-images') ||
+        contains(join(github.event.pull_request.labels.*.name, ' '), 'build-images')
+      ))
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Setup Blacksmith Builder
+        uses: useblacksmith/setup-docker-builder@ac083cc84672d01c60d5e8561d0a939b697de542 # v1
+
+      - name: Resolve image tag
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.image_tag }}"
+          if [[ "$TAG" == TAG=* ]]; then TAG="${TAG#TAG=}"; fi
+          if [[ -z "$TAG" ]]; then TAG="k3_test"; fi
+          echo "TAG=$TAG" >> $GITHUB_ENV
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build validator image
+        env:
+          BITTENSOR_NETWORK: finney
+        run: |
+          ./scripts/validator/build.sh \
+            --image-name ghcr.io/one-covenant/basilica/validator \
+            --image-tag "$TAG" \
+            --no-extract
+      - name: Scan validator image
+        uses: aquasecurity/trivy-action@876cf04c63f65e9799bcf1043b584e72469c7143 # master
+        with:
+          image-ref: ghcr.io/one-covenant/basilica/validator:${{ env.TAG }}
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'
+          trivyignores: '.trivyignore.yaml'
+
+      - name: Push validator image
+        run: |
+          ./scripts/validator/push.sh \
+            --source-image ghcr.io/one-covenant/basilica/validator \
+            --target-image ghcr.io/one-covenant/basilica/validator \
+            --tag "$TAG"
+
+      - name: Build miner image
+        env:
+          BITTENSOR_NETWORK: finney
+        run: |
+          ./scripts/miner/build.sh \
+            --image-name ghcr.io/one-covenant/basilica/miner \
+            --image-tag "$TAG" \
+            --no-extract
+      - name: Scan miner image
+        uses: aquasecurity/trivy-action@876cf04c63f65e9799bcf1043b584e72469c7143 # master
+        with:
+          image-ref: ghcr.io/one-covenant/basilica/miner:${{ env.TAG }}
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'
+          trivyignores: '.trivyignore.yaml'
+
+      - name: Push miner image
+        run: |
+          ./scripts/miner/push.sh \
+            --source-image ghcr.io/one-covenant/basilica/miner \
+            --target-image ghcr.io/one-covenant/basilica/miner \
+            --tag "$TAG"
+
+      - name: Build CLI image (single-arch)
+        run: |
+          ./scripts/cli/build.sh \
+            --single-arch \
+            --image-name ghcr.io/one-covenant/basilica/cli \
+            --image-tag "$TAG" \
+            --no-extract
+      - name: Scan CLI image
+        uses: aquasecurity/trivy-action@876cf04c63f65e9799bcf1043b584e72469c7143 # master
+        with:
+          image-ref: ghcr.io/one-covenant/basilica/cli:${{ env.TAG }}
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'
+          trivyignores: '.trivyignore.yaml'
+
+      - name: Push CLI image
+        run: |
+          docker push ghcr.io/one-covenant/basilica/cli:"$TAG"

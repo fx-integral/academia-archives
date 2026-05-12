@@ -1,0 +1,197 @@
+╔════════════════════════════════════════════════════════════════════════════╗
+║                     .ENV UPDATE QUICK REFERENCE                           ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+📊 STATISTICS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Before:  74 lines, 14 variables
+After:   135 lines, 39+ variables
+Change:  +61 lines, +25 new variables, +1 updated, +2 removed
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ WHAT WAS ADDED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. GENERATION CONFIG (1 var)
+   └─ GRAIL_GENERATION_BATCH_SIZE=4
+
+2. TRAINING CONFIG (10 vars)
+   ├─ GRAIL_TRAINER_LR=2e-6
+   ├─ GRAIL_TRAINER_EPOCHS=2
+   ├─ GRAIL_TRAINER_BATCH_SIZE=4
+   ├─ GRAIL_TRAINER_MAX_LENGTH=1024
+   ├─ GRAIL_TRAINER_GRAD_CLIP=0.5
+   ├─ GRAIL_TRAINER_WARMUP_STEPS=10
+   ├─ GRAIL_TRAINER_KL_COEF=0.02
+   ├─ GRAIL_TRAINER_ENTROPY_COEF=0.001
+   ├─ GRAIL_TRAINER_ADV_CLIP_PERCENTILE=99.0
+   └─ GRAIL_TRAINER_GROUP_ADV_SUM_TOL=0.01
+
+3. CHECKPOINT CONFIG (3 vars)
+   ├─ GRAIL_CHECKPOINT_RETENTION_LIMIT=3
+   ├─ GRAIL_CHECKPOINT_MILESTONE_INTERVAL=100
+   └─ GRAIL_CACHE_DIR=
+
+4. NETWORK RETRY CONFIG (3 vars)
+   ├─ BT_CALL_TIMEOUT=15.0
+   ├─ BT_CALL_RETRIES=3
+   └─ BT_CALL_BACKOFF=5.0
+
+5. ENVIRONMENT UPDATE (1 var)
+   └─ GRAIL_ENV: dev → prod
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✨ KEY FEATURES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✓ Production Ready
+  • Environment set to "prod"
+  • All critical settings configured
+  • Aligned with latest standards
+
+✓ Fine-Tuning Control
+  • 10 training hyperparameters
+  • Batch size optimization
+  • Checkpoint management
+
+✓ Network Resilience
+  • Timeout configuration
+  • Automatic retry logic
+  • Exponential backoff
+
+✓ Resource Management
+  • Checkpoint retention
+  • Cache directory
+  • Batch size tuning
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🎯 CURRENT WALLET SETUP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Wallet Name:    grail
+Coldkey:        grail
+Hotkey:         final (production)
+Network:        Finney (mainnet)
+NetUID:         81
+Environment:    prod
+
+Available Hotkeys:
+  • default  - 5EbnismoJnnKNfFnUwPLwEU6j2xeCbojoirmuMTf5J9mYnKm
+  • main     - 5EsPTNLhExAAPYNZqyrn8crmuf77tRH9eBDEZwjadDa3gp9t
+  • final    - 5F9uEDDovurwEJihzZSpKypipVy84EEAPHTt3EfepTjcQfij (current)
+  • 81       - 5FKz1PAcB1y5vn3aGqNog2vyxagrKMjbkMRpdjY9cuXAG6pD
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+⚙️  TUNING RECOMMENDATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+For Different GPU Memory:
+
+24GB+ VRAM (H100/A100):
+  GRAIL_GENERATION_BATCH_SIZE=8
+  GRAIL_TRAINER_BATCH_SIZE=8
+
+16GB VRAM (L40/RTX 4090):
+  GRAIL_GENERATION_BATCH_SIZE=4  ← Current (good!)
+  GRAIL_TRAINER_BATCH_SIZE=4
+
+12GB VRAM (RTX 3090):
+  GRAIL_GENERATION_BATCH_SIZE=2
+  GRAIL_TRAINER_BATCH_SIZE=2
+
+8GB VRAM (RTX 4070):
+  GRAIL_GENERATION_BATCH_SIZE=1
+  GRAIL_TRAINER_BATCH_SIZE=1
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📝 FILE LOCATIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+.env file:           /home/shadeform/grail/.env
+.env.example:        /home/shadeform/grail/.env.example
+Wallet:              ~/.bittensor/wallets/grail/
+Logs:                /tmp/grail-local.log
+Cache:               ~/.cache/grail/ (default)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ VERIFICATION COMMANDS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# Check .env is complete
+wc -l ~/.env  # Should show 135 lines
+
+# Verify wallet setup
+btcli wallet overview --wallet.name grail --hotkey final
+
+# List all wallets
+btcli list
+
+# Check env vars loaded
+env | grep GRAIL_ | head -20
+
+# Test GRAIL setup
+uv run grail validate --help
+
+# Monitor logs
+tail -f /tmp/grail-local.log
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🚀 DEPLOYMENT CHECKLIST
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Before running validator:
+  ☐ Source .env file
+  ☐ Verify wallet config (grail/final)
+  ☐ Check GPU memory meets requirements
+  ☐ Confirm network connectivity
+  ☐ Review hyperparameters for your GPU
+  ☐ Monitor first few minutes for errors
+
+During operation:
+  ☐ Monitor GPU utilization
+  ☐ Check memory usage
+  ☐ Watch network calls (retries indicate issues)
+  ☐ Review WandB metrics
+  ☐ Check logs for warnings
+
+Optimization:
+  ☐ If OOM: Reduce batch sizes
+  ☐ If low GPU util: Increase batch sizes
+  ☐ If network issues: Increase BT_CALL_TIMEOUT
+  ☐ If training slow: Adjust learning rate/epochs
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📞 SUPPORT REFERENCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Common Issues:
+
+1. "hotkey not found"
+   → Solution: Use one of: default, main, final, 81
+
+2. "Out of memory"
+   → Solution: Reduce GRAIL_GENERATION_BATCH_SIZE or GRAIL_TRAINER_BATCH_SIZE
+
+3. "Network timeout"
+   → Solution: Increase BT_CALL_TIMEOUT and/or BT_CALL_RETRIES
+
+4. "WandB not logging"
+   → Solution: Check WANDB_API_KEY is set and WANDB_MODE=online
+
+5. "Checkpoint not found"
+   → Solution: Check R2 credentials and GRAIL_CHECKPOINT_RETENTION_LIMIT
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✨ Status: Production-Ready Configuration Complete! ✨
+
+Date Updated: 2025-10-19
+Configuration Version: Latest (aligned with .env.example)

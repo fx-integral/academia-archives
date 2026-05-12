@@ -1,0 +1,53 @@
+services:
+  targon:
+    image: ghcr.io/manifold-inc/targon:latest
+    restart: always
+    stop_grace_period: 15m
+    depends_on:
+      weights-api:
+        condition: service_started
+      mongo:
+        condition: service_healthy
+    build:
+      dockerfile: Dockerfile
+      context: ./targon
+      x-bake:
+        platforms:
+          - linux/amd64
+          - linux/arm64
+    env_file: .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  weights-api:
+    image: ghcr.io/manifold-inc/targon-weights-api:latest
+    restart: always
+    build:
+      dockerfile: Dockerfile
+      context: ./weights-api
+      x-bake:
+        platforms:
+          - linux/amd64
+          - linux/arm64
+    env_file: .env
+
+  mongo:
+    image: mongo:latest
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_USERNAME}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_PASSWORD}
+      - MONGO_INITDB_DATABASE=targon
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    restart: unless-stopped
+
+volumes:
+  mongo_data:

@@ -1,0 +1,47 @@
+# StoryNet Generator Configuration
+#
+# Copy this file to generator_config.yaml and modify as needed.
+
+generator:
+  # Mode: "local" or "cloud"
+  mode: "local"
+
+  # ========================================
+  # LOCAL MODE
+  # ========================================
+  # Use your own GPU to run LLMs locally.
+  # Recommended for better rewards and decentralization.
+  #
+  local:
+    # Type: "ollama" or "vllm"
+    type: "ollama"
+
+    # Local server URL
+    url: "http://localhost:11434"
+
+    # Model name (must be pulled/loaded on your server)
+    # Examples:
+    #   Ollama: qwen2.5:7b, qwen2.5:72b, llama3.1:70b
+    #   vLLM: Qwen/Qwen2.5-72B-Instruct, meta-llama/Llama-3.1-70B-Instruct
+    model: "qwen2.5:7b"
+
+  # ========================================
+  # CLOUD MODE
+  # ========================================
+  # Use cloud APIs (costs money, but no GPU needed).
+  #
+  cloud:
+    # Provider: "openai", "gemini", "zhipu"
+    provider: "openai"
+
+    # Environment variable containing API key
+    api_key_env: "OPENAI_API_KEY"
+
+    # Model name
+    # OpenAI: gpt-4o, gpt-4o-mini
+    # Gemini: gemini-2.0-flash-exp, gemini-1.5-pro
+    # Zhipu: glm-4, glm-4-flash
+    model: "gpt-4o-mini"
+
+    # Custom endpoint (optional, for proxies)
+    endpoint: null

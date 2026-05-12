@@ -1,0 +1,148 @@
+[tool.poetry]
+name = "validation"
+version = "2.1.0"
+description = "This endpoint functions as an independent local web server, which operates concurrently with the neuron process."
+authors = ["404 team"]
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.11"
+numpy = "==1.26.4"
+transformers = "==4.44.2"
+pytest = "==8.3.2"
+loguru = "==0.7.3"
+meshio = "==5.3.5"
+ninja = "==1.11.1.1"
+fastapi = "==0.111.0"
+uvicorn = "==0.30.1"
+pillow = "==10.0.0"
+pandas = "==2.2.2"
+open_clip_torch = "==2.29.0"
+pytod = "==0.0.3"
+imageio = "==2.35.1"
+open3d = "==0.18.0"
+pybase64 = "==1.4.0"
+openai-clip = "==1.0.1"
+safetensors = "==0.4.1"
+
+[tool.poetry.group.dev.dependencies]
+poetry = { version = "2.1.4" }
+poethepoet = { version = "0.36.0", extras = ["poetry_plugin"] }
+bandit = { version = "1.8.6" }
+black = { version = "25.1.0" }
+mypy = { version = "1.17.1" }
+ruff = { version = "0.12.7" }
+types-requests = { version = "2.32.*" }
+
+types-PyYAML = "==6.0.12.20250516"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+target-version = ['py311']
+line-length = 120
+include = '\.pyi?$'
+exclude = '''
+/(
+    \.git
+  | \.pytest_cache
+  | \.idea
+  | \.venv
+  | \.vscode
+)/
+'''
+
+[tool.ruff]
+target-version = "py311"
+cache-dir = ".reports/ruff_cache"
+line-length = 120
+src = ["sources"]
+namespace-packages = ["sources"]
+fix = true
+output-format = "full"
+include = ["*.py"]
+exclude = [
+    '.venv/.*',
+    'tests',
+    './validation_lib/eval_sh.py'
+]
+
+[tool.ruff.lint]
+select = [
+    "E", # pycodestyle
+    "F", # pyflakes
+    "UP", # pyupgrade
+    "I", # isort
+    "S", # flake8-bandit
+    "B", # flake8-bugbear
+    "Q", # flake8-quotes
+    "ASYNC", # flake8-async
+    "PTH", # flake8-use-pathlib
+]
+# Allow autofix for all enabled rules (when `--fix`) is provided.
+fixable = ["ALL"]
+unfixable = []
+
+# Exclude directories
+exclude = [
+    ".*",
+    "tests",
+    "./validation_lib/eval_sh.py"
+]
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = []
+
+[tool.ruff.lint.flake8-quotes]
+docstring-quotes = "double"
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+lines-after-imports = 2
+
+[tool.bandit]
+skips = ["B104"]
+exclude_dirs = [
+    "./.*/**",
+    "./tests/**",
+    "./validation_lib/eval_sh.py"
+]
+
+
+[tool.mypy]
+cache_dir = ".reports/mypy_cache/"
+ignore_missing_imports = true
+disallow_incomplete_defs = true
+disallow_untyped_defs = true
+warn_unused_ignores = false
+warn_return_any = true
+warn_no_return = false
+warn_unreachable = true
+strict_equality = true
+warn_redundant_casts = true
+exclude = [
+    '.venv/.*',
+    'tests',
+    'validation_lib/eval_sh.py'
+]
+
+[[tool.mypy.overrides]]
+module = [
+    "types-pyyaml",
+    "validation_lib.eval_sh"
+]
+ignore_errors = true
+
+[tool.poe]
+poetry_command = ""
+
+[tool.poe.tasks.run-check]
+help = "Run tests and try fix format"
+ignore_fail = "return_non_zero"
+sequence = [
+    { cmd = "ruff check ." },
+    { cmd = "black ." },
+    { cmd = "bandit . -rq -c pyproject.toml" },
+    { cmd = "mypy --junit-xml .reports/mypy-junit-report.xml ." },
+]

@@ -1,0 +1,74 @@
+[package]
+name = "basilica-common"
+version = "0.1.0"
+edition = "2021"
+description = "Core shared types, errors, traits, and cryptographic utilities for Basilica "
+license = "MIT"
+rust-version = "1.70"
+build = "build.rs"
+
+[dependencies]
+# Use workspace dependencies
+thiserror = { workspace = true }
+serde = { workspace = true }
+uuid = { workspace = true }
+blake3 = { workspace = true }
+aes-gcm = { workspace = true }
+rand = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-journald = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+clap-verbosity-flag = { workspace = true }
+tokio = { workspace = true }
+figment = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+libc = { workspace = true }
+
+# Additional dependencies specific to common_basilca
+# SS58 format validation (adjust version as needed)
+# ss58-registry = "1.0"  # TODO: Add when implementing Hotkey validation
+
+# Bittensor integration
+bittensor = { workspace = true }
+chrono = { workspace = true }
+
+# Decimal precision for prices
+rust_decimal = { workspace = true, features = ["serde-with-str"] }
+
+# Cryptographic dependencies
+ed25519-dalek = { workspace = true }
+p256 = { workspace = true }
+pbkdf2 = { workspace = true }
+argon2 = { workspace = true }
+zeroize = { workspace = true }
+base64 = { workspace = true }
+data-encoding = { workspace = true }
+sha2 = { workspace = true }
+regex = { workspace = true }
+once_cell = { workspace = true }
+oci-client = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+
+[build-dependencies]
+dotenvy = { workspace = true }
+
+[features]
+default = []
+# Feature for enabling additional crypto utilities if needed
+crypto-extra = []
+# Database features
+sqlite = ["sqlx/sqlite"]
+postgres = ["sqlx/postgres"]
+
+[dependencies.sqlx]
+workspace = true
+features = ["runtime-tokio", "tls-rustls", "migrate", "uuid", "chrono"]
+optional = true

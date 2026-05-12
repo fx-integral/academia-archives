@@ -1,0 +1,63 @@
+# TrajectoryRL Validator — Production Compose
+#
+# Season 1: validator orchestrates trajrl-bench sandbox containers via
+# Docker API.  Watchtower auto-updates the image from GHCR.
+#
+# Setup:
+#   1. Create .env.validator in repo root (see .env.validator.example)
+#   2. docker compose --env-file .env.validator -f docker/docker-compose.validator.yml up -d
+#   3. docker compose -f docker/docker-compose.validator.yml logs -f validator
+#
+# Required .env.validator:
+#   WALLET_NAME=sn11-owner
+#   WALLET_HOTKEY=default
+#   NETUID=11
+#   NETWORK=finney
+#   LLM_API_KEY=...
+#   LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
+#   LLM_MODEL=glm-5.1
+
+services:
+  validator:
+    image: ghcr.io/trajectoryrl/trajectoryrl:latest
+    container_name: trajectoryrl_validator
+    restart: unless-stopped
+    env_file:
+      - ../.env.validator
+    environment:
+      # Pin sandbox/harness images to the stable channel. Hard-coded here
+      # rather than in .env.validator so that running prod and staging side
+      # by side cannot accidentally cross-wire the channels.
+      - IMAGE_CHANNEL=latest
+    volumes:
+      - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
+      - trajectoryrl_data:/var/lib/trajectoryrl
+      - /var/run/docker.sock:/var/run/docker.sock
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: trajectoryrl_watchtower
+    restart: unless-stopped
+    environment:
+      - DOCKER_API_VERSION=1.44
+      - WATCHTOWER_LABEL_ENABLE=true
+      - WATCHTOWER_POLL_INTERVAL=300
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_INCLUDE_STOPPED=true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+volumes:
+  trajectoryrl_data:

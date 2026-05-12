@@ -1,0 +1,168 @@
+"use client";
+
+import { useEffect, useState } from "react";
+import { WagmiProvider, createConfig, http, useConnect } from "wagmi";
+import { base, baseSepolia } from "wagmi/chains";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { RainbowKitProvider, getDefaultConfig } from "@rainbow-me/rainbowkit";
+import {
+  coinbaseWallet,
+  metaMaskWallet,
+  walletConnectWallet,
+} from "@rainbow-me/rainbowkit/wallets";
+import { mock } from "wagmi/connectors";
+import {
+  testWalletConnector,
+  getTestKey,
+} from "@/lib/test-wallet-connector";
+import "@rainbow-me/rainbowkit/styles.css";
+
+const WALLETCONNECT_PROJECT_ID =
+  process.env.NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID ?? "";
+
+const IS_E2E = process.env.NEXT_PUBLIC_E2E_TEST === "true";
+const CHAIN_ID = Number(process.env.NEXT_PUBLIC_CHAIN_ID ?? "84532");
+const RPC_URL = process.env.NEXT_PUBLIC_BASE_RPC_URL ?? "https://sepolia.base.org";
+const activeChain = CHAIN_ID === 8453 ? base : baseSepolia;
+
+// Anvil account #0 — used only in E2E test builds
+const TEST_ACCOUNT = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266" as const;
+
+coinbaseWallet.preference = CHAIN_ID === 8453 ? "smartWalletOnly" : "all";
+
+const prodConfig = getDefaultConfig({
+  appName: "Djinn",
+  projectId: WALLETCONNECT_PROJECT_ID || "unused",
+  chains: [activeChain],
+  transports: {
+    [activeChain.id]: http(RPC_URL),
+  },
+  multiInjectedProviderDiscovery: true,
+  wallets: [
+    {
+      groupName: "Create a Wallet (Free)",
+      wallets: [coinbaseWallet],
+    },
+    {
+      groupName: "I already have a wallet",
+      wallets: WALLETCONNECT_PROJECT_ID
+        ? [metaMaskWallet, walletConnectWallet]
+        : [metaMaskWallet],
+    },
+  ],
+});
+
+// E2E tests always use Base Sepolia
+const e2eConfig = IS_E2E
+  ? createConfig({
+      chains: [baseSepolia],
+      connectors: [
+        mock({
+          accounts: [TEST_ACCOUNT],
+          features: { defaultConnected: true, reconnect: true },
+        }),
+      ],
+      transports: {
+        [baseSepolia.id]: http(RPC_URL),
+      },
+    })
+  : null;
+
+// Testnet QA config: uses a real private key from sessionStorage for signing.
+// Only created on Base Sepolia when djinn_test_key is set.
+function buildTestnetQAConfig() {
+  if (typeof window === "undefined") return null;
+  if (CHAIN_ID !== 84532) return null;
+  if (!getTestKey()) return null;
+  return createConfig({
+    chains: [baseSepolia],
+    connectors: [testWalletConnector()],
+    transports: {
+      [baseSepolia.id]: http(RPC_URL),
+    },
+  });
+}
+
+export const wagmiConfig = e2eConfig ?? prodConfig;
+
+const queryClient = new QueryClient();
+
+/** Auto-connect the mock wallet on mount in E2E mode. */
+function E2EAutoConnect({ children }: { children: React.ReactNode }) {
+  const { connect, connectors } = useConnect();
+  useEffect(() => {
+    const mockConnector = connectors.find((c) => c.id === "mock");
+    if (mockConnector) {
+      connect({ connector: mockConnector });
+    }
+  }, [connect, connectors]);
+  return <>{children}</>;
+}
+
+/** Auto-connect the test wallet on mount in QA mode. */
+function QAAutoConnect({ children }: { children: React.ReactNode }) {
+  const { connect, connectors } = useConnect();
+  useEffect(() => {
+    const testConnector = connectors.find((c) => c.id === "testWallet");
+    if (testConnector) {
+      connect({ connector: testConnector });
+    }
+  }, [connect, connectors]);
+  return <>{children}</>;
+}
+
+export default function Providers({ children }: { children: React.ReactNode }) {
+  const [qaConfig, setQaConfig] = useState<ReturnType<
+    typeof createConfig
+  > | null>(null);
+  const [checked, setChecked] = useState(false);
+
+  useEffect(() => {
+    setQaConfig(buildTestnetQAConfig());
+    setChecked(true);
+  }, []);
+
+  if (IS_E2E) {
+    return (
+      <WagmiProvider config={wagmiConfig}>
+        <QueryClientProvider client={queryClient}>
+          <E2EAutoConnect>
+            {children}
+          </E2EAutoConnect>
+        </QueryClientProvider>
+      </WagmiProvider>
+    );
+  }
+
+  // Testnet QA mode: real signing with private key from sessionStorage.
+  // Still wrap in RainbowKitProvider since the app uses RainbowKit transaction hooks.
+  if (checked && qaConfig) {
+    return (
+      <WagmiProvider config={qaConfig}>
+        <QueryClientProvider client={queryClient}>
+          <RainbowKitProvider
+            modalSize="compact"
+            initialChain={activeChain}
+          >
+            <QAAutoConnect>
+              {children}
+            </QAAutoConnect>
+          </RainbowKitProvider>
+        </QueryClientProvider>
+      </WagmiProvider>
+    );
+  }
+
+  return (
+    <WagmiProvider config={checked ? wagmiConfig : wagmiConfig}>
+      <QueryClientProvider client={queryClient}>
+        <RainbowKitProvider
+          modalSize="compact"
+          initialChain={activeChain}
+        >
+          {children}
+        </RainbowKitProvider>
+      </QueryClientProvider>
+    </WagmiProvider>
+  );
+}

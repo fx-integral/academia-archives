@@ -1,0 +1,13 @@
+substrate-interface!=1.8.0
+async_substrate_interface
+aiohttp
+asyncpg
+python-dotenv
+pyyaml
+retry
+psutil
+loguru
+tenacity
+numpy
+bittensor
+httpx[http2]

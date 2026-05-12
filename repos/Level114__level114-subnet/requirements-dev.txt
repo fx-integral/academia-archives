@@ -1,0 +1,14 @@
+# Level114 Subnet - Development Dependencies
+# Include core dependencies
+-r requirements.txt
+
+# Testing framework
+pytest>=7.0.0
+pytest-asyncio>=1.2.0
+
+# Code formatting and linting
+black>=23.0.0
+flake8>=6.0.0
+
+# Type checking
+mypy>=1.0.0

@@ -1,0 +1,6797 @@
+{
+  "source": {
+    "hash": "0x790d5b01e61b08540fe77aa3b4780324b20150afab231584744162d8ae384652",
+    "language": "ink! 5.1.1",
+    "compiler": "rustc 1.91.1",
+    "build_info": {
+      "build_mode": "Release",
+      "cargo_contract_version": "5.0.3",
+      "rust_toolchain": "stable-x86_64-unknown-linux-gnu",
+      "wasm_opt_settings": {
+        "keep_debug_symbols": false,
+        "optimization_passes": "Z"
+      }
+    }
+  },
+  "contract": {
+    "name": "allways_swap_manager",
+    "version": "1.0.0",
+    "authors": [
+      "Allways"
+    ]
+  },
+  "image": null,
+  "spec": {
+    "constructors": [
+      {
+        "args": [
+          {
+            "label": "recycle_address",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          },
+          {
+            "label": "staking_hotkey",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          },
+          {
+            "label": "netuid",
+            "type": {
+              "displayName": [
+                "u16"
+              ],
+              "type": 3
+            }
+          },
+          {
+            "label": "fulfillment_timeout_blocks",
+            "type": {
+              "displayName": [
+                "u32"
+              ],
+              "type": 5
+            }
+          },
+          {
+            "label": "reservation_ttl",
+            "type": {
+              "displayName": [
+                "u32"
+              ],
+              "type": 5
+            }
+          },
+          {
+            "label": "min_collateral",
+            "type": {
+              "displayName": [
+                "Balance"
+              ],
+              "type": 6
+            }
+          },
+          {
+            "label": "max_collateral",
+            "type": {
+              "displayName": [
+                "Balance"
+              ],
+              "type": 6
+            }
+          },
+          {
+            "label": "min_swap_amount",
+            "type": {
+              "displayName": [
+                "Balance"
+              ],
+              "type": 6
+            }
+          },
+          {
+            "label": "max_swap_amount",
+            "type": {
+              "displayName": [
+                "Balance"
+              ],
+              "type": 6
+            }
+          },
+          {
+            "label": "consensus_threshold_percent",
+            "type": {
+              "displayName": [
+                "u8"
+              ],
+              "type": 2
+            }
+          }
+        ],
+        "default": false,
+        "docs": [
+          "Initialize the contract"
+        ],
+        "label": "new",
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink_primitives",
+            "ConstructorResult"
+          ],
+          "type": 76
+        },
+        "selector": "0x9bae9d5e"
+      }
+    ],
+    "docs": [],
+    "environment": {
+      "accountId": {
+        "displayName": [
+          "AccountId"
+        ],
+        "type": 0
+      },
+      "balance": {
+        "displayName": [
+          "Balance"
+        ],
+        "type": 6
+      },
+      "blockNumber": {
+        "displayName": [
+          "BlockNumber"
+        ],
+        "type": 5
+      },
+      "chainExtension": {
+        "displayName": [
+          "ChainExtension"
+        ],
+        "type": 102
+      },
+      "hash": {
+        "displayName": [
+          "Hash"
+        ],
+        "type": 38
+      },
+      "maxEventTopics": 4,
+      "staticBufferSize": 16384,
+      "timestamp": {
+        "displayName": [
+          "Timestamp"
+        ],
+        "type": 8
+      }
+    },
+    "events": [
+      {
+        "args": [
+          {
+            "docs": [],
+            "indexed": false,
+            "label": "tao_amount",
+            "type": {
+              "displayName": [
+                "u128"
+              ],
+              "type": 6
+            }
+          },
+          {
+            "docs": [],
+            "indexed": false,
+            "label": "via_chain_ext",
+            "type": {
+              "displayName": [
+                "bool"
+              ],
+              "type": 4
+            }
+          }
+        ],
+        "docs": [
+          "`via_chain_ext = true` → fees went through `add_stake_recycle`.",
+          "`via_chain_ext = false` → fees went to the custodial fallback."
+        ],
+        "label": "FeesRecycled",
+        "module_path": "allways_swap_manager::events",
+        "signature_topic": "0xcbd47fa79a8331920a18188ac3a270061ad40c0e4bddc96b2e8b6bbaba1cba94"
+      },
+      {
+        "args": [
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "swap_id",
+            "type": {
+              "displayName": [
+                "u64"
+              ],
+              "type": 8
+            }
+          },
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "user",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          },
+          {
+            "docs": [],
+            "indexed": false,
+            "label": "amount",
+            "type": {
+              "displayName": [
+                "u128"
+              ],
+              "type": 6
+            }
+          }
+        ],
+        "docs": [
+          "Event emitted when a user claims their pending slash payout"
+        ],
+        "label": "SlashClaimed",
+        "module_path": "allways_swap_manager::events",
+        "signature_topic": "0x7a4d2f860f9edffa238525fd7bb0d64492f495558b7743b2448ff7382c6d93bc"
+      },
+      {
+        "args": [
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "swap_id",
+            "type": {
+              "displayName": [
+                "u64"
+              ],
+              "type": 8
+            }
+          },
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "user",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          },
+          {
+            "docs": [],
+            "indexed": false,
+            "label": "amount",
+            "type": {
+              "displayName": [
+                "u128"
+              ],
+              "type": 6
+            }
+          }
+        ],
+        "docs": [
+          "Event emitted when a slash transfer fails and is stored for later claim"
+        ],
+        "label": "SlashPending",
+        "module_path": "allways_swap_manager::events",
+        "signature_topic": "0x9fab85c79f4ef2e5cbc2ba31b62b64a3b021cf2cb7e84530a452cc19e58b3956"
+      },
+      {
+        "args": [
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "swap_id",
+            "type": {
+              "displayName": [
+                "u64"
+              ],
+              "type": 8
+            }
+          },
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "miner",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          },
+          {
+            "docs": [],
+            "indexed": false,
+            "label": "tao_amount",
+            "type": {
+              "displayName": [
+                "u128"
+              ],
+              "type": 6
+            }
+          },
+          {
+            "docs": [],
+            "indexed": false,
+            "label": "slash_amount",
+            "type": {
+              "displayName": [
+                "u128"
+              ],
+              "type": 6
+            }
+          }
+        ],
+        "docs": [
+          "Event emitted when validators confirm swap timeout"
+        ],
+        "label": "SwapTimedOut",
+        "module_path": "allways_swap_manager::events",
+        "signature_topic": "0xa30af8c28cb7ad46db5b851a7c3fd873309767549e868b90d8e01590696a8ded"
+      },
+      {
+        "args": [
+          {
+            "docs": [],
+            "indexed": false,
+            "label": "key",
+            "type": {
+              "displayName": [
+                "ink",
+                "prelude",
+                "string",
+                "String"
+              ],
+              "type": 9
+            }
+          },
+          {
+            "docs": [],
+            "indexed": false,
+            "label": "value",
+            "type": {
+              "displayName": [
+                "u128"
+              ],
+              "type": 6
+            }
+          }
+        ],
+        "docs": [
+          "Event emitted when contract configuration changes"
+        ],
+        "label": "ConfigUpdated",
+        "module_path": "allways_swap_manager::events",
+        "signature_topic": "0xa9cbce7f91bef8d84c69355976718ee718418f0946f06f3ea9a33dc32ddd23bf"
+      },
+      {
+        "args": [
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "miner",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          },
+          {
+            "docs": [],
+            "indexed": false,
+            "label": "reserved_until",
+            "type": {
+              "displayName": [
+                "u32"
+              ],
+              "type": 5
+            }
+          }
+        ],
+        "docs": [
+          "Event emitted when a miner is reserved for a swap"
+        ],
+        "label": "MinerReserved",
+        "module_path": "allways_swap_manager::events",
+        "signature_topic": "0x6e7016ee8e9894e1447bcdeb9c857643a8bc8f6e0c0cfa9e5d124597714d4d57"
+      },
+      {
+        "args": [
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "swap_id",
+            "type": {
+              "displayName": [
+                "u64"
+              ],
+              "type": 8
+            }
+          },
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "miner",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          },
+          {
+            "docs": [],
+            "indexed": false,
+            "label": "tao_amount",
+            "type": {
+              "displayName": [
+                "u128"
+              ],
+              "type": 6
+            }
+          },
+          {
+            "docs": [],
+            "indexed": false,
+            "label": "fee_amount",
+            "type": {
+              "displayName": [
+                "u128"
+              ],
+              "type": 6
+            }
+          }
+        ],
+        "docs": [
+          "Event emitted when validators confirm swap completion"
+        ],
+        "label": "SwapCompleted",
+        "module_path": "allways_swap_manager::events",
+        "signature_topic": "0x0791bf263039a44e708b455e070033ec8b69d77c23043ca174e6364f4c12cb23"
+      },
+      {
+        "args": [
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "swap_id",
+            "type": {
+              "displayName": [
+                "u64"
+              ],
+              "type": 8
+            }
+          },
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "miner",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          },
+          {
+            "docs": [],
+            "indexed": false,
+            "label": "to_tx_hash",
+            "type": {
+              "displayName": [
+                "ink",
+                "prelude",
+                "string",
+                "String"
+              ],
+              "type": 9
+            }
+          }
+        ],
+        "docs": [
+          "Event emitted when a miner marks a swap as fulfilled"
+        ],
+        "label": "SwapFulfilled",
+        "module_path": "allways_swap_manager::events",
+        "signature_topic": "0xf1b505e60060d0c602e90b26909812115dcf34bf7f03f0000657b1fb0fc4a848"
+      },
+      {
+        "args": [
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "swap_id",
+            "type": {
+              "displayName": [
+                "u64"
+              ],
+              "type": 8
+            }
+          },
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "user",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          },
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "miner",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          },
+          {
+            "docs": [],
+            "indexed": false,
+            "label": "from_amount",
+            "type": {
+              "displayName": [
+                "u128"
+              ],
+              "type": 6
+            }
+          },
+          {
+            "docs": [],
+            "indexed": false,
+            "label": "initiated_block",
+            "type": {
+              "displayName": [
+                "u32"
+              ],
+              "type": 5
+            }
+          }
+        ],
+        "docs": [
+          "Event emitted when a validator initiates a swap (source tx pre-verified)"
+        ],
+        "label": "SwapInitiated",
+        "module_path": "allways_swap_manager::events",
+        "signature_topic": "0x06935140a2925377c2324251c3c9c416116ec34f214a8196fac9affd1775839a"
+      },
+      {
+        "args": [
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "miner",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          },
+          {
+            "docs": [],
+            "indexed": false,
+            "label": "active",
+            "type": {
+              "displayName": [
+                "bool"
+              ],
+              "type": 4
+            }
+          }
+        ],
+        "docs": [
+          "Event emitted when a miner is activated or deactivated"
+        ],
+        "label": "MinerActivated",
+        "module_path": "allways_swap_manager::events",
+        "signature_topic": "0xcc0ae267cf4c0305173a926f499ee9149813ec3d04baa027f3c0ed7e8c1114ca"
+      },
+      {
+        "args": [
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "miner",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          },
+          {
+            "docs": [],
+            "indexed": false,
+            "label": "amount",
+            "type": {
+              "displayName": [
+                "u128"
+              ],
+              "type": 6
+            }
+          },
+          {
+            "docs": [],
+            "indexed": false,
+            "label": "total",
+            "type": {
+              "displayName": [
+                "u128"
+              ],
+              "type": 6
+            }
+          }
+        ],
+        "docs": [
+          "Event emitted when a miner posts collateral"
+        ],
+        "label": "CollateralPosted",
+        "module_path": "allways_swap_manager::events",
+        "signature_topic": "0xac8a40d8f433a5c3b074e1744178ffb9ebfc02a848c5ee67deb0f0c3168380f9"
+      },
+      {
+        "args": [
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "validator",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          },
+          {
+            "docs": [],
+            "indexed": false,
+            "label": "registered",
+            "type": {
+              "displayName": [
+                "bool"
+              ],
+              "type": 4
+            }
+          }
+        ],
+        "docs": [
+          "Event emitted when a validator is added or removed"
+        ],
+        "label": "ValidatorUpdated",
+        "module_path": "allways_swap_manager::events",
+        "signature_topic": "0xa196d9e279715a236c224752aaa4e5b3876155c0a9a33e6efd4d0374981d5484"
+      },
+      {
+        "args": [
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "miner",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          },
+          {
+            "docs": [],
+            "indexed": false,
+            "label": "amount",
+            "type": {
+              "displayName": [
+                "u128"
+              ],
+              "type": 6
+            }
+          },
+          {
+            "docs": [],
+            "indexed": false,
+            "label": "recipient",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          }
+        ],
+        "docs": [
+          "Event emitted when collateral is slashed"
+        ],
+        "label": "CollateralSlashed",
+        "module_path": "allways_swap_manager::events",
+        "signature_topic": "0x12d7a8149bd00a411994d27a9e95f904843390f31e8cdd17e76ce3f2ef0109fe"
+      },
+      {
+        "args": [
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "miner",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          },
+          {
+            "docs": [],
+            "indexed": false,
+            "label": "amount",
+            "type": {
+              "displayName": [
+                "u128"
+              ],
+              "type": 6
+            }
+          },
+          {
+            "docs": [],
+            "indexed": false,
+            "label": "remaining",
+            "type": {
+              "displayName": [
+                "u128"
+              ],
+              "type": 6
+            }
+          }
+        ],
+        "docs": [
+          "Event emitted when a miner withdraws collateral"
+        ],
+        "label": "CollateralWithdrawn",
+        "module_path": "allways_swap_manager::events",
+        "signature_topic": "0x6a46470e2aaa52796db9914077c36a38e0b60fa14fdd29ebc522e6c8e47b2e22"
+      },
+      {
+        "args": [
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "previous_owner",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          },
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "new_owner",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          }
+        ],
+        "docs": [
+          "Event emitted when ownership is transferred"
+        ],
+        "label": "OwnershipTransferred",
+        "module_path": "allways_swap_manager::events",
+        "signature_topic": "0x71fda9b8681293670f8ece8228047377ab56a3a4d1ac29e4b1719b5df3433199"
+      },
+      {
+        "args": [
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "miner",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          }
+        ],
+        "docs": [
+          "Event emitted when a miner reservation is cancelled"
+        ],
+        "label": "ReservationCancelled",
+        "module_path": "allways_swap_manager::events",
+        "signature_topic": "0xdeb09a8c9cf9c53e7acdacc76ef22f680f0843fa5c70fd6e886c411505bcf114"
+      },
+      {
+        "args": [
+          {
+            "docs": [],
+            "indexed": false,
+            "label": "at_block",
+            "type": {
+              "displayName": [
+                "u32"
+              ],
+              "type": 5
+            }
+          }
+        ],
+        "docs": [
+          "One-way latch flip: custodial fallback is dead after this fires."
+        ],
+        "label": "ChainExtensionLatched",
+        "module_path": "allways_swap_manager::events",
+        "signature_topic": "0x1f7fe9663fde1c14d90f8ca3f32c9ec01849ca6a006dbc434013ee920e099cb0"
+      },
+      {
+        "args": [
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "swap_id",
+            "type": {
+              "displayName": [
+                "u64"
+              ],
+              "type": 8
+            }
+          },
+          {
+            "docs": [],
+            "indexed": false,
+            "label": "target_block",
+            "type": {
+              "displayName": [
+                "u32"
+              ],
+              "type": 5
+            }
+          },
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "by",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          }
+        ],
+        "docs": [
+          "Fulfillment-timeout extension proposed by a validator."
+        ],
+        "label": "TimeoutExtensionProposed",
+        "module_path": "allways_swap_manager::events",
+        "signature_topic": "0xcb10178ff61622db4b59357dece9c3bd2d44e5fb667ab44b0e0f6c79aa3b9fd9"
+      },
+      {
+        "args": [
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "swap_id",
+            "type": {
+              "displayName": [
+                "u64"
+              ],
+              "type": 8
+            }
+          },
+          {
+            "docs": [],
+            "indexed": false,
+            "label": "applied_target",
+            "type": {
+              "displayName": [
+                "u32"
+              ],
+              "type": 5
+            }
+          },
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "by",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          }
+        ],
+        "docs": [
+          "Fulfillment-timeout extension finalized — `timeout_block` is now",
+          "`applied_target`."
+        ],
+        "label": "TimeoutExtensionFinalized",
+        "module_path": "allways_swap_manager::events",
+        "signature_topic": "0x173e91f9a61e1cede4d9d8724dcb3abcb510ec986f6e1d986e1c04d7df69659f"
+      },
+      {
+        "args": [
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "swap_id",
+            "type": {
+              "displayName": [
+                "u64"
+              ],
+              "type": 8
+            }
+          },
+          {
+            "docs": [],
+            "indexed": false,
+            "label": "voided_target",
+            "type": {
+              "displayName": [
+                "u32"
+              ],
+              "type": 5
+            }
+          },
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "by",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          }
+        ],
+        "docs": [
+          "Fulfillment-timeout extension challenged within the challenge window."
+        ],
+        "label": "TimeoutExtensionChallenged",
+        "module_path": "allways_swap_manager::events",
+        "signature_topic": "0x0e386b25bb140921dbecf7c45ba0b351ffe8c47618c8f46e890e999f5e30868e"
+      },
+      {
+        "args": [
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "miner",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          },
+          {
+            "docs": [
+              "Source-tx hash this proposal correlates to. Lets indexers tie the",
+              "extension activity back to the swap attempt without a join."
+            ],
+            "indexed": false,
+            "label": "from_tx_hash",
+            "type": {
+              "displayName": [
+                "ink",
+                "primitives",
+                "Hash"
+              ],
+              "type": 38
+            }
+          },
+          {
+            "docs": [],
+            "indexed": false,
+            "label": "target_block",
+            "type": {
+              "displayName": [
+                "u32"
+              ],
+              "type": 5
+            }
+          },
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "by",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          }
+        ],
+        "docs": [
+          "Reservation extension proposed by a validator (single-validator, optimistic)."
+        ],
+        "label": "ReservationExtensionProposed",
+        "module_path": "allways_swap_manager::events",
+        "signature_topic": "0x958447021bb73ea7abbac7053ba3551a3c8aec41f972adfde12afed2e4bfd66c"
+      },
+      {
+        "args": [
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "miner",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          },
+          {
+            "docs": [],
+            "indexed": false,
+            "label": "applied_target",
+            "type": {
+              "displayName": [
+                "u32"
+              ],
+              "type": 5
+            }
+          },
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "by",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          }
+        ],
+        "docs": [
+          "Reservation extension finalized — `reserved_until` is now `applied_target`."
+        ],
+        "label": "ReservationExtensionFinalized",
+        "module_path": "allways_swap_manager::events",
+        "signature_topic": "0x9f653f039ecaecce684cbd19c331c81efdb5fd48930dcada4ff00d48e4428c5a"
+      },
+      {
+        "args": [
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "miner",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          },
+          {
+            "docs": [
+              "What target was being claimed; useful for \"how off?\" analytics."
+            ],
+            "indexed": false,
+            "label": "voided_target",
+            "type": {
+              "displayName": [
+                "u32"
+              ],
+              "type": 5
+            }
+          },
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "by",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          }
+        ],
+        "docs": [
+          "Reservation extension challenged within the challenge window. The pending",
+          "entry is deleted; any validator may re-propose immediately."
+        ],
+        "label": "ReservationExtensionChallenged",
+        "module_path": "allways_swap_manager::events",
+        "signature_topic": "0xb90f0c7be3c352d22858c9e5a828872273e88c11a03ab8215e658fcb5012535c"
+      },
+      {
+        "args": [
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "swap_id",
+            "type": {
+              "displayName": [
+                "u64"
+              ],
+              "type": 8
+            }
+          },
+          {
+            "docs": [],
+            "indexed": true,
+            "label": "validator",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          },
+          {
+            "docs": [],
+            "indexed": false,
+            "label": "vote_type",
+            "type": {
+              "displayName": [
+                "super",
+                "types",
+                "VoteType"
+              ],
+              "type": 101
+            }
+          },
+          {
+            "docs": [],
+            "indexed": false,
+            "label": "vote_count",
+            "type": {
+              "displayName": [
+                "u32"
+              ],
+              "type": 5
+            }
+          }
+        ],
+        "docs": [
+          "Event emitted when a validator casts a vote"
+        ],
+        "label": "VoteCast",
+        "module_path": "allways_swap_manager::events",
+        "signature_topic": "0xc4387331767099bc1c0756042bceefa228b615dd68d196c02dbaf5a53904bec8"
+      }
+    ],
+    "lang_error": {
+      "displayName": [
+        "ink",
+        "LangError"
+      ],
+      "type": 77
+    },
+    "messages": [
+      {
+        "args": [],
+        "default": false,
+        "docs": [],
+        "label": "post_collateral",
+        "mutates": true,
+        "payable": true,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 78
+        },
+        "selector": "0x31b3f423"
+      },
+      {
+        "args": [
+          {
+            "label": "amount",
+            "type": {
+              "displayName": [
+                "Balance"
+              ],
+              "type": 6
+            }
+          }
+        ],
+        "default": false,
+        "docs": [],
+        "label": "withdraw_collateral",
+        "mutates": true,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 78
+        },
+        "selector": "0xe098e62d"
+      },
+      {
+        "args": [
+          {
+            "label": "request_hash",
+            "type": {
+              "displayName": [
+                "Hash"
+              ],
+              "type": 38
+            }
+          },
+          {
+            "label": "miner",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          },
+          {
+            "label": "user_from_address",
+            "type": {
+              "displayName": [
+                "String"
+              ],
+              "type": 9
+            }
+          },
+          {
+            "label": "from_chain",
+            "type": {
+              "displayName": [
+                "String"
+              ],
+              "type": 9
+            }
+          },
+          {
+            "label": "to_chain",
+            "type": {
+              "displayName": [
+                "String"
+              ],
+              "type": 9
+            }
+          },
+          {
+            "label": "tao_amount",
+            "type": {
+              "displayName": [
+                "Balance"
+              ],
+              "type": 6
+            }
+          },
+          {
+            "label": "from_amount",
+            "type": {
+              "displayName": [
+                "Balance"
+              ],
+              "type": 6
+            }
+          },
+          {
+            "label": "to_amount",
+            "type": {
+              "displayName": [
+                "Balance"
+              ],
+              "type": 6
+            }
+          }
+        ],
+        "default": false,
+        "docs": [],
+        "label": "vote_reserve",
+        "mutates": true,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 78
+        },
+        "selector": "0xff3b86a0"
+      },
+      {
+        "args": [
+          {
+            "label": "miner",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          }
+        ],
+        "default": false,
+        "docs": [],
+        "label": "cancel_reservation",
+        "mutates": true,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 78
+        },
+        "selector": "0xc4cb59cb"
+      },
+      {
+        "args": [
+          {
+            "label": "miner",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          },
+          {
+            "label": "from_tx_hash",
+            "type": {
+              "displayName": [
+                "Hash"
+              ],
+              "type": 38
+            }
+          },
+          {
+            "label": "target_block",
+            "type": {
+              "displayName": [
+                "u32"
+              ],
+              "type": 5
+            }
+          }
+        ],
+        "default": false,
+        "docs": [],
+        "label": "propose_extend_reservation",
+        "mutates": true,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 78
+        },
+        "selector": "0x9c9a8e8e"
+      },
+      {
+        "args": [
+          {
+            "label": "miner",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          }
+        ],
+        "default": false,
+        "docs": [],
+        "label": "challenge_extend_reservation",
+        "mutates": true,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 78
+        },
+        "selector": "0x40b77e21"
+      },
+      {
+        "args": [
+          {
+            "label": "miner",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          }
+        ],
+        "default": false,
+        "docs": [],
+        "label": "finalize_extend_reservation",
+        "mutates": true,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 78
+        },
+        "selector": "0xbaf47953"
+      },
+      {
+        "args": [
+          {
+            "label": "miner",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          }
+        ],
+        "default": false,
+        "docs": [],
+        "label": "get_pending_reservation_extension",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 81
+        },
+        "selector": "0xd79424b8"
+      },
+      {
+        "args": [
+          {
+            "label": "miner",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          }
+        ],
+        "default": false,
+        "docs": [
+          " Number of finalized extensions on the miner's current reservation.",
+          " Used by validators to know which tier of evidence the next propose",
+          " requires. Returns 0 for miners with no reservation or no extensions",
+          " yet."
+        ],
+        "label": "get_reservation_extension_count",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 83
+        },
+        "selector": "0xc5f9a918"
+      },
+      {
+        "args": [
+          {
+            "label": "request_hash",
+            "type": {
+              "displayName": [
+                "Hash"
+              ],
+              "type": 38
+            }
+          },
+          {
+            "label": "user",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          },
+          {
+            "label": "miner",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          },
+          {
+            "label": "from_chain",
+            "type": {
+              "displayName": [
+                "String"
+              ],
+              "type": 9
+            }
+          },
+          {
+            "label": "to_chain",
+            "type": {
+              "displayName": [
+                "String"
+              ],
+              "type": 9
+            }
+          },
+          {
+            "label": "from_amount",
+            "type": {
+              "displayName": [
+                "Balance"
+              ],
+              "type": 6
+            }
+          },
+          {
+            "label": "tao_amount",
+            "type": {
+              "displayName": [
+                "Balance"
+              ],
+              "type": 6
+            }
+          },
+          {
+            "label": "user_from_address",
+            "type": {
+              "displayName": [
+                "String"
+              ],
+              "type": 9
+            }
+          },
+          {
+            "label": "user_to_address",
+            "type": {
+              "displayName": [
+                "String"
+              ],
+              "type": 9
+            }
+          },
+          {
+            "label": "from_tx_hash",
+            "type": {
+              "displayName": [
+                "String"
+              ],
+              "type": 9
+            }
+          },
+          {
+            "label": "from_tx_block",
+            "type": {
+              "displayName": [
+                "u32"
+              ],
+              "type": 5
+            }
+          },
+          {
+            "label": "to_amount",
+            "type": {
+              "displayName": [
+                "Balance"
+              ],
+              "type": 6
+            }
+          },
+          {
+            "label": "miner_from_address",
+            "type": {
+              "displayName": [
+                "String"
+              ],
+              "type": 9
+            }
+          },
+          {
+            "label": "miner_to_address",
+            "type": {
+              "displayName": [
+                "String"
+              ],
+              "type": 9
+            }
+          },
+          {
+            "label": "rate",
+            "type": {
+              "displayName": [
+                "String"
+              ],
+              "type": 9
+            }
+          }
+        ],
+        "default": false,
+        "docs": [],
+        "label": "vote_initiate",
+        "mutates": true,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 78
+        },
+        "selector": "0x90c444d8"
+      },
+      {
+        "args": [
+          {
+            "label": "swap_id",
+            "type": {
+              "displayName": [
+                "u64"
+              ],
+              "type": 8
+            }
+          },
+          {
+            "label": "to_tx_hash",
+            "type": {
+              "displayName": [
+                "String"
+              ],
+              "type": 9
+            }
+          },
+          {
+            "label": "to_tx_block",
+            "type": {
+              "displayName": [
+                "u32"
+              ],
+              "type": 5
+            }
+          },
+          {
+            "label": "to_amount",
+            "type": {
+              "displayName": [
+                "Balance"
+              ],
+              "type": 6
+            }
+          }
+        ],
+        "default": false,
+        "docs": [
+          " Mark a swap as fulfilled — miner direct (caller == swap.miner)"
+        ],
+        "label": "mark_fulfilled",
+        "mutates": true,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 78
+        },
+        "selector": "0x2dbeeb8d"
+      },
+      {
+        "args": [
+          {
+            "label": "swap_id",
+            "type": {
+              "displayName": [
+                "u64"
+              ],
+              "type": 8
+            }
+          }
+        ],
+        "default": false,
+        "docs": [
+          " Confirm a swap — validator-only, quorum mechanism"
+        ],
+        "label": "confirm_swap",
+        "mutates": true,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 78
+        },
+        "selector": "0xd0065335"
+      },
+      {
+        "args": [
+          {
+            "label": "swap_id",
+            "type": {
+              "displayName": [
+                "u64"
+              ],
+              "type": 8
+            }
+          }
+        ],
+        "default": false,
+        "docs": [
+          " Timeout a swap — validator-only, quorum mechanism"
+        ],
+        "label": "timeout_swap",
+        "mutates": true,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 78
+        },
+        "selector": "0x5325f39c"
+      },
+      {
+        "args": [
+          {
+            "label": "swap_id",
+            "type": {
+              "displayName": [
+                "u64"
+              ],
+              "type": 8
+            }
+          },
+          {
+            "label": "target_block",
+            "type": {
+              "displayName": [
+                "u32"
+              ],
+              "type": 5
+            }
+          }
+        ],
+        "default": false,
+        "docs": [],
+        "label": "propose_extend_timeout",
+        "mutates": true,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 78
+        },
+        "selector": "0x94c87a1d"
+      },
+      {
+        "args": [
+          {
+            "label": "swap_id",
+            "type": {
+              "displayName": [
+                "u64"
+              ],
+              "type": 8
+            }
+          }
+        ],
+        "default": false,
+        "docs": [],
+        "label": "challenge_extend_timeout",
+        "mutates": true,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 78
+        },
+        "selector": "0x682cf8eb"
+      },
+      {
+        "args": [
+          {
+            "label": "swap_id",
+            "type": {
+              "displayName": [
+                "u64"
+              ],
+              "type": 8
+            }
+          }
+        ],
+        "default": false,
+        "docs": [],
+        "label": "finalize_extend_timeout",
+        "mutates": true,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 78
+        },
+        "selector": "0xb23b4d80"
+      },
+      {
+        "args": [
+          {
+            "label": "swap_id",
+            "type": {
+              "displayName": [
+                "u64"
+              ],
+              "type": 8
+            }
+          }
+        ],
+        "default": false,
+        "docs": [],
+        "label": "get_pending_timeout_extension",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 81
+        },
+        "selector": "0x6bd06828"
+      },
+      {
+        "args": [
+          {
+            "label": "swap_id",
+            "type": {
+              "displayName": [
+                "u64"
+              ],
+              "type": 8
+            }
+          }
+        ],
+        "default": false,
+        "docs": [
+          " Number of finalized extensions on this swap's fulfillment timeout.",
+          " Used by validators to tier the next propose."
+        ],
+        "label": "get_swap_extension_count",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 83
+        },
+        "selector": "0xc2a875b1"
+      },
+      {
+        "args": [
+          {
+            "label": "swap_id",
+            "type": {
+              "displayName": [
+                "u64"
+              ],
+              "type": 8
+            }
+          }
+        ],
+        "default": false,
+        "docs": [
+          " Claim a pending slash payout (user calls after failed transfer)"
+        ],
+        "label": "claim_slash",
+        "mutates": true,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 78
+        },
+        "selector": "0xcf3c3dd9"
+      },
+      {
+        "args": [
+          {
+            "label": "miner",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          }
+        ],
+        "default": false,
+        "docs": [
+          " Deactivate a miner — only the miner themselves can deactivate, and only",
+          " when idle. Blocks mid-swap or while reserved so miners cannot dodge",
+          " in-flight obligations via self-deactivation."
+        ],
+        "label": "deactivate",
+        "mutates": true,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 78
+        },
+        "selector": "0x339db2a5"
+      },
+      {
+        "args": [
+          {
+            "label": "miner",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          }
+        ],
+        "default": false,
+        "docs": [
+          " Vote to activate a miner — validator-only, quorum required."
+        ],
+        "label": "vote_activate",
+        "mutates": true,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 78
+        },
+        "selector": "0x00088a2d"
+      },
+      {
+        "args": [
+          {
+            "label": "miner",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          }
+        ],
+        "default": false,
+        "docs": [
+          " Vote to deactivate a miner — validator-only, quorum required.",
+          "",
+          " Trust-based: on quorum the miner's active flag is cleared, full stop.",
+          " No collateral, status, or balance gates beyond \"currently active\".",
+          " Deliberately unconstrained so the validator consensus can cover any",
+          " remediation case (min_collateral raise, protocol abuse, operational",
+          " emergencies). Abuse protection comes from the quorum itself — the",
+          " same trust envelope as `vote_activate` / `vote_reserve`.",
+          "",
+          " Not blocked mid-swap: the existing swap lifecycle proceeds via its",
+          " persisted assignment. Miner cannot re-activate while below the",
+          " collateral floor because `vote_activate` still checks it."
+        ],
+        "label": "vote_deactivate",
+        "mutates": true,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 78
+        },
+        "selector": "0xdac13f65"
+      },
+      {
+        "args": [
+          {
+            "label": "new_owner",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          }
+        ],
+        "default": false,
+        "docs": [],
+        "label": "transfer_ownership",
+        "mutates": true,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 78
+        },
+        "selector": "0x107e33ea"
+      },
+      {
+        "args": [
+          {
+            "label": "validator",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          }
+        ],
+        "default": false,
+        "docs": [],
+        "label": "add_validator",
+        "mutates": true,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 78
+        },
+        "selector": "0x82f48fa6"
+      },
+      {
+        "args": [
+          {
+            "label": "validator",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          }
+        ],
+        "default": false,
+        "docs": [],
+        "label": "remove_validator",
+        "mutates": true,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 78
+        },
+        "selector": "0x62135acd"
+      },
+      {
+        "args": [
+          {
+            "label": "blocks",
+            "type": {
+              "displayName": [
+                "u32"
+              ],
+              "type": 5
+            }
+          }
+        ],
+        "default": false,
+        "docs": [],
+        "label": "set_fulfillment_timeout",
+        "mutates": true,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 78
+        },
+        "selector": "0xe9cb777b"
+      },
+      {
+        "args": [
+          {
+            "label": "amount",
+            "type": {
+              "displayName": [
+                "Balance"
+              ],
+              "type": 6
+            }
+          }
+        ],
+        "default": false,
+        "docs": [],
+        "label": "set_min_collateral",
+        "mutates": true,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 78
+        },
+        "selector": "0xb3f48b5e"
+      },
+      {
+        "args": [
+          {
+            "label": "amount",
+            "type": {
+              "displayName": [
+                "Balance"
+              ],
+              "type": 6
+            }
+          }
+        ],
+        "default": false,
+        "docs": [],
+        "label": "set_max_collateral",
+        "mutates": true,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 78
+        },
+        "selector": "0xb7fae7fd"
+      },
+      {
+        "args": [
+          {
+            "label": "percent",
+            "type": {
+              "displayName": [
+                "u8"
+              ],
+              "type": 2
+            }
+          }
+        ],
+        "default": false,
+        "docs": [],
+        "label": "set_consensus_threshold",
+        "mutates": true,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 78
+        },
+        "selector": "0xc0d8ec47"
+      },
+      {
+        "args": [
+          {
+            "label": "amount",
+            "type": {
+              "displayName": [
+                "Balance"
+              ],
+              "type": 6
+            }
+          }
+        ],
+        "default": false,
+        "docs": [],
+        "label": "set_min_swap_amount",
+        "mutates": true,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 78
+        },
+        "selector": "0x800e1573"
+      },
+      {
+        "args": [
+          {
+            "label": "amount",
+            "type": {
+              "displayName": [
+                "Balance"
+              ],
+              "type": 6
+            }
+          }
+        ],
+        "default": false,
+        "docs": [],
+        "label": "set_max_swap_amount",
+        "mutates": true,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 78
+        },
+        "selector": "0x3e868f32"
+      },
+      {
+        "args": [
+          {
+            "label": "blocks",
+            "type": {
+              "displayName": [
+                "u32"
+              ],
+              "type": 5
+            }
+          }
+        ],
+        "default": false,
+        "docs": [],
+        "label": "set_reservation_ttl",
+        "mutates": true,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 78
+        },
+        "selector": "0x3143d9e3"
+      },
+      {
+        "args": [
+          {
+            "label": "halted",
+            "type": {
+              "displayName": [
+                "bool"
+              ],
+              "type": 4
+            }
+          }
+        ],
+        "default": false,
+        "docs": [],
+        "label": "set_halted",
+        "mutates": true,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 78
+        },
+        "selector": "0x8fe1c210"
+      },
+      {
+        "args": [],
+        "default": false,
+        "docs": [
+          " Permissionless. Pre-latch: transfer to recycle_address. Post-latch:",
+          " add_stake_recycle on (staking_hotkey, netuid); reverts on chain-ext",
+          " failure (decode the u32 from the revert trace via subtensor's Output enum)."
+        ],
+        "label": "recycle_fees",
+        "mutates": true,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 78
+        },
+        "selector": "0x97756ea1"
+      },
+      {
+        "args": [],
+        "default": false,
+        "docs": [
+          " Owner-only one-way latch flip. Call after subtensor PR #2560 is",
+          " live and staking_hotkey is registered on netuid."
+        ],
+        "label": "enable_chain_ext",
+        "mutates": true,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 78
+        },
+        "selector": "0xaef4a766"
+      },
+      {
+        "args": [
+          {
+            "label": "swap_id",
+            "type": {
+              "displayName": [
+                "u64"
+              ],
+              "type": 8
+            }
+          }
+        ],
+        "default": false,
+        "docs": [],
+        "label": "get_swap",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 84
+        },
+        "selector": "0xa35f1bbf"
+      },
+      {
+        "args": [
+          {
+            "label": "hotkey",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          }
+        ],
+        "default": false,
+        "docs": [],
+        "label": "get_collateral",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 86
+        },
+        "selector": "0xf48343ad"
+      },
+      {
+        "args": [
+          {
+            "label": "hotkey",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          }
+        ],
+        "default": false,
+        "docs": [],
+        "label": "get_miner_active",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 87
+        },
+        "selector": "0x25652be8"
+      },
+      {
+        "args": [
+          {
+            "label": "hotkey",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          }
+        ],
+        "default": false,
+        "docs": [],
+        "label": "get_miner_has_active_swap",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 87
+        },
+        "selector": "0x1d07dec1"
+      },
+      {
+        "args": [
+          {
+            "label": "account",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          }
+        ],
+        "default": false,
+        "docs": [],
+        "label": "is_validator",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 87
+        },
+        "selector": "0xf844fc5f"
+      },
+      {
+        "args": [],
+        "default": false,
+        "docs": [
+          " Returns the full whitelisted validator set. O(N) storage read with N",
+          " bounded by the (small) validator count. Callers wanting just the",
+          " count should prefer `get_validator_count` which skips the clone."
+        ],
+        "label": "get_validators",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 88
+        },
+        "selector": "0xa28acf8e"
+      },
+      {
+        "args": [],
+        "default": false,
+        "docs": [],
+        "label": "get_next_swap_id",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 89
+        },
+        "selector": "0xd80244d2"
+      },
+      {
+        "args": [],
+        "default": false,
+        "docs": [],
+        "label": "get_fulfillment_timeout",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 90
+        },
+        "selector": "0xe820174a"
+      },
+      {
+        "args": [],
+        "default": false,
+        "docs": [],
+        "label": "get_min_collateral",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 86
+        },
+        "selector": "0x233a7832"
+      },
+      {
+        "args": [],
+        "default": false,
+        "docs": [],
+        "label": "get_max_collateral",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 86
+        },
+        "selector": "0x54945717"
+      },
+      {
+        "args": [],
+        "default": false,
+        "docs": [],
+        "label": "get_accumulated_fees",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 86
+        },
+        "selector": "0xbf3b5d4e"
+      },
+      {
+        "args": [],
+        "default": false,
+        "docs": [],
+        "label": "get_total_recycled_fees",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 86
+        },
+        "selector": "0x9910e939"
+      },
+      {
+        "args": [],
+        "default": false,
+        "docs": [],
+        "label": "get_owner",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 91
+        },
+        "selector": "0x07fcd0b1"
+      },
+      {
+        "args": [],
+        "default": false,
+        "docs": [],
+        "label": "get_halted",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 87
+        },
+        "selector": "0xec540804"
+      },
+      {
+        "args": [],
+        "default": false,
+        "docs": [],
+        "label": "get_recycle_address",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 91
+        },
+        "selector": "0x3847e06c"
+      },
+      {
+        "args": [],
+        "default": false,
+        "docs": [],
+        "label": "get_staking_hotkey",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 91
+        },
+        "selector": "0x47e11891"
+      },
+      {
+        "args": [],
+        "default": false,
+        "docs": [],
+        "label": "get_netuid",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 92
+        },
+        "selector": "0x75b98cec"
+      },
+      {
+        "args": [],
+        "default": false,
+        "docs": [],
+        "label": "get_chain_ext_enabled",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 87
+        },
+        "selector": "0x06d94687"
+      },
+      {
+        "args": [
+          {
+            "label": "swap_id",
+            "type": {
+              "displayName": [
+                "u64"
+              ],
+              "type": 8
+            }
+          }
+        ],
+        "default": false,
+        "docs": [],
+        "label": "get_pending_slash",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 86
+        },
+        "selector": "0x48c78c4a"
+      },
+      {
+        "args": [],
+        "default": false,
+        "docs": [],
+        "label": "get_min_swap_amount",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 86
+        },
+        "selector": "0xfca7daa4"
+      },
+      {
+        "args": [],
+        "default": false,
+        "docs": [],
+        "label": "get_max_swap_amount",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 86
+        },
+        "selector": "0x97826e04"
+      },
+      {
+        "args": [
+          {
+            "label": "miner",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          }
+        ],
+        "default": false,
+        "docs": [],
+        "label": "get_miner_reserved_until",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 90
+        },
+        "selector": "0xd5ed7150"
+      },
+      {
+        "args": [],
+        "default": false,
+        "docs": [],
+        "label": "get_reservation_ttl",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 90
+        },
+        "selector": "0xf7e24a31"
+      },
+      {
+        "args": [
+          {
+            "label": "miner",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          }
+        ],
+        "default": false,
+        "docs": [],
+        "label": "get_miner_deactivation_block",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 90
+        },
+        "selector": "0x361acc31"
+      },
+      {
+        "args": [
+          {
+            "label": "miner",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          }
+        ],
+        "default": false,
+        "docs": [
+          " Composite miner read: (collateral, active, has_active_swap,",
+          " reserved_until, deactivation_block). One RPC for the CLI views",
+          " that otherwise make four to six separate contract reads per",
+          " render."
+        ],
+        "label": "get_miner_snapshot",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 93
+        },
+        "selector": "0xffd9e2e6"
+      },
+      {
+        "args": [],
+        "default": false,
+        "docs": [],
+        "label": "get_consensus_threshold",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 83
+        },
+        "selector": "0x2c283460"
+      },
+      {
+        "args": [],
+        "default": false,
+        "docs": [],
+        "label": "get_validator_count",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 90
+        },
+        "selector": "0xa30ab5c4"
+      },
+      {
+        "args": [
+          {
+            "label": "miner",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          }
+        ],
+        "default": false,
+        "docs": [
+          " Returns the reservation amounts (tao, from, to) if one exists.",
+          " Callers that also need `reserved_until` can query",
+          " `get_miner_reserved_until` separately — it's a cheap single-field",
+          " read on the same struct."
+        ],
+        "label": "get_reservation_data",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 95
+        },
+        "selector": "0x79fe2717"
+      },
+      {
+        "args": [
+          {
+            "label": "miner",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          }
+        ],
+        "default": false,
+        "docs": [],
+        "label": "get_reservation",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 98
+        },
+        "selector": "0x3690f521"
+      },
+      {
+        "args": [
+          {
+            "label": "miner",
+            "type": {
+              "displayName": [
+                "AccountId"
+              ],
+              "type": 0
+            }
+          }
+        ],
+        "default": false,
+        "docs": [],
+        "label": "get_pending_reserve_vote_count",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 90
+        },
+        "selector": "0x3781315a"
+      },
+      {
+        "args": [
+          {
+            "label": "from_address",
+            "type": {
+              "displayName": [
+                "String"
+              ],
+              "type": 9
+            }
+          }
+        ],
+        "default": false,
+        "docs": [],
+        "label": "get_cooldown",
+        "mutates": false,
+        "payable": false,
+        "returnType": {
+          "displayName": [
+            "ink",
+            "MessageResult"
+          ],
+          "type": 100
+        },
+        "selector": "0x19a837c6"
+      }
+    ]
+  },
+  "storage": {
+    "root": {
+      "layout": {
+        "struct": {
+          "fields": [
+            {
+              "layout": {
+                "leaf": {
+                  "key": "0x00000000",
+                  "ty": 0
+                }
+              },
+              "name": "owner"
+            },
+            {
+              "layout": {
+                "leaf": {
+                  "key": "0x00000000",
+                  "ty": 0
+                }
+              },
+              "name": "recycle_address"
+            },
+            {
+              "layout": {
+                "leaf": {
+                  "key": "0x00000000",
+                  "ty": 0
+                }
+              },
+              "name": "staking_hotkey"
+            },
+            {
+              "layout": {
+                "leaf": {
+                  "key": "0x00000000",
+                  "ty": 3
+                }
+              },
+              "name": "netuid"
+            },
+            {
+              "layout": {
+                "leaf": {
+                  "key": "0x00000000",
+                  "ty": 4
+                }
+              },
+              "name": "chain_ext_enabled"
+            },
+            {
+              "layout": {
+                "leaf": {
+                  "key": "0x00000000",
+                  "ty": 5
+                }
+              },
+              "name": "fulfillment_timeout_blocks"
+            },
+            {
+              "layout": {
+                "leaf": {
+                  "key": "0x00000000",
+                  "ty": 5
+                }
+              },
+              "name": "reservation_ttl"
+            },
+            {
+              "layout": {
+                "leaf": {
+                  "key": "0x00000000",
+                  "ty": 6
+                }
+              },
+              "name": "min_collateral"
+            },
+            {
+              "layout": {
+                "leaf": {
+                  "key": "0x00000000",
+                  "ty": 6
+                }
+              },
+              "name": "max_collateral"
+            },
+            {
+              "layout": {
+                "leaf": {
+                  "key": "0x00000000",
+                  "ty": 6
+                }
+              },
+              "name": "min_swap_amount"
+            },
+            {
+              "layout": {
+                "leaf": {
+                  "key": "0x00000000",
+                  "ty": 6
+                }
+              },
+              "name": "max_swap_amount"
+            },
+            {
+              "layout": {
+                "leaf": {
+                  "key": "0x00000000",
+                  "ty": 2
+                }
+              },
+              "name": "consensus_threshold_percent"
+            },
+            {
+              "layout": {
+                "leaf": {
+                  "key": "0x00000000",
+                  "ty": 4
+                }
+              },
+              "name": "halted"
+            },
+            {
+              "layout": {
+                "leaf": {
+                  "key": "0x00000000",
+                  "ty": 7
+                }
+              },
+              "name": "validators"
+            },
+            {
+              "layout": {
+                "leaf": {
+                  "key": "0x00000000",
+                  "ty": 8
+                }
+              },
+              "name": "next_swap_id"
+            },
+            {
+              "layout": {
+                "root": {
+                  "layout": {
+                    "struct": {
+                      "fields": [
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x2b1d1362",
+                              "ty": 8
+                            }
+                          },
+                          "name": "id"
+                        },
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x2b1d1362",
+                              "ty": 0
+                            }
+                          },
+                          "name": "user"
+                        },
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x2b1d1362",
+                              "ty": 0
+                            }
+                          },
+                          "name": "miner"
+                        },
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x2b1d1362",
+                              "ty": 9
+                            }
+                          },
+                          "name": "from_chain"
+                        },
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x2b1d1362",
+                              "ty": 9
+                            }
+                          },
+                          "name": "to_chain"
+                        },
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x2b1d1362",
+                              "ty": 6
+                            }
+                          },
+                          "name": "from_amount"
+                        },
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x2b1d1362",
+                              "ty": 6
+                            }
+                          },
+                          "name": "to_amount"
+                        },
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x2b1d1362",
+                              "ty": 6
+                            }
+                          },
+                          "name": "tao_amount"
+                        },
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x2b1d1362",
+                              "ty": 9
+                            }
+                          },
+                          "name": "user_from_address"
+                        },
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x2b1d1362",
+                              "ty": 9
+                            }
+                          },
+                          "name": "user_to_address"
+                        },
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x2b1d1362",
+                              "ty": 9
+                            }
+                          },
+                          "name": "miner_from_address"
+                        },
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x2b1d1362",
+                              "ty": 9
+                            }
+                          },
+                          "name": "miner_to_address"
+                        },
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x2b1d1362",
+                              "ty": 9
+                            }
+                          },
+                          "name": "rate"
+                        },
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x2b1d1362",
+                              "ty": 9
+                            }
+                          },
+                          "name": "from_tx_hash"
+                        },
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x2b1d1362",
+                              "ty": 5
+                            }
+                          },
+                          "name": "from_tx_block"
+                        },
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x2b1d1362",
+                              "ty": 9
+                            }
+                          },
+                          "name": "to_tx_hash"
+                        },
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x2b1d1362",
+                              "ty": 5
+                            }
+                          },
+                          "name": "to_tx_block"
+                        },
+                        {
+                          "layout": {
+                            "enum": {
+                              "dispatchKey": "0x2b1d1362",
+                              "name": "SwapStatus",
+                              "variants": {
+                                "0": {
+                                  "fields": [],
+                                  "name": "Active"
+                                },
+                                "1": {
+                                  "fields": [],
+                                  "name": "Fulfilled"
+                                },
+                                "2": {
+                                  "fields": [],
+                                  "name": "Completed"
+                                },
+                                "3": {
+                                  "fields": [],
+                                  "name": "TimedOut"
+                                }
+                              }
+                            }
+                          },
+                          "name": "status"
+                        },
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x2b1d1362",
+                              "ty": 5
+                            }
+                          },
+                          "name": "initiated_block"
+                        },
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x2b1d1362",
+                              "ty": 5
+                            }
+                          },
+                          "name": "timeout_block"
+                        },
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x2b1d1362",
+                              "ty": 5
+                            }
+                          },
+                          "name": "fulfilled_block"
+                        },
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x2b1d1362",
+                              "ty": 5
+                            }
+                          },
+                          "name": "completed_block"
+                        }
+                      ],
+                      "name": "SwapData"
+                    }
+                  },
+                  "root_key": "0x2b1d1362",
+                  "ty": 10
+                }
+              },
+              "name": "swaps"
+            },
+            {
+              "layout": {
+                "root": {
+                  "layout": {
+                    "leaf": {
+                      "key": "0xe47028c4",
+                      "ty": 4
+                    }
+                  },
+                  "root_key": "0xe47028c4",
+                  "ty": 17
+                }
+              },
+              "name": "used_from_tx"
+            },
+            {
+              "layout": {
+                "root": {
+                  "layout": {
+                    "leaf": {
+                      "key": "0xf62525e8",
+                      "ty": 6
+                    }
+                  },
+                  "root_key": "0xf62525e8",
+                  "ty": 20
+                }
+              },
+              "name": "collateral"
+            },
+            {
+              "layout": {
+                "root": {
+                  "layout": {
+                    "leaf": {
+                      "key": "0x67d295fa",
+                      "ty": 4
+                    }
+                  },
+                  "root_key": "0x67d295fa",
+                  "ty": 23
+                }
+              },
+              "name": "miner_active"
+            },
+            {
+              "layout": {
+                "root": {
+                  "layout": {
+                    "leaf": {
+                      "key": "0x236f4565",
+                      "ty": 4
+                    }
+                  },
+                  "root_key": "0x236f4565",
+                  "ty": 26
+                }
+              },
+              "name": "miner_has_active_swap"
+            },
+            {
+              "layout": {
+                "root": {
+                  "layout": {
+                    "leaf": {
+                      "key": "0x8e2b6134",
+                      "ty": 5
+                    }
+                  },
+                  "root_key": "0x8e2b6134",
+                  "ty": 29
+                }
+              },
+              "name": "miner_deactivation_block"
+            },
+            {
+              "layout": {
+                "leaf": {
+                  "key": "0x00000000",
+                  "ty": 8
+                }
+              },
+              "name": "next_request_id"
+            },
+            {
+              "layout": {
+                "root": {
+                  "layout": {
+                    "leaf": {
+                      "key": "0x5b5a9911",
+                      "ty": 7
+                    }
+                  },
+                  "root_key": "0x5b5a9911",
+                  "ty": 32
+                }
+              },
+              "name": "request_voters"
+            },
+            {
+              "layout": {
+                "root": {
+                  "layout": {
+                    "leaf": {
+                      "key": "0x681b05e3",
+                      "ty": 5
+                    }
+                  },
+                  "root_key": "0x681b05e3",
+                  "ty": 35
+                }
+              },
+              "name": "request_created"
+            },
+            {
+              "layout": {
+                "root": {
+                  "layout": {
+                    "leaf": {
+                      "key": "0x57f4431e",
+                      "ty": 38
+                    }
+                  },
+                  "root_key": "0x57f4431e",
+                  "ty": 39
+                }
+              },
+              "name": "request_hash"
+            },
+            {
+              "layout": {
+                "root": {
+                  "layout": {
+                    "leaf": {
+                      "key": "0x7467cc7b",
+                      "ty": 8
+                    }
+                  },
+                  "root_key": "0x7467cc7b",
+                  "ty": 42
+                }
+              },
+              "name": "miner_active_request"
+            },
+            {
+              "layout": {
+                "root": {
+                  "layout": {
+                    "leaf": {
+                      "key": "0xb0bed7f4",
+                      "ty": 8
+                    }
+                  },
+                  "root_key": "0xb0bed7f4",
+                  "ty": 46
+                }
+              },
+              "name": "pending_swap_votes"
+            },
+            {
+              "layout": {
+                "root": {
+                  "layout": {
+                    "struct": {
+                      "fields": [
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x834add48",
+                              "ty": 38
+                            }
+                          },
+                          "name": "hash"
+                        },
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x834add48",
+                              "ty": 9
+                            }
+                          },
+                          "name": "from_addr"
+                        },
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x834add48",
+                              "ty": 9
+                            }
+                          },
+                          "name": "from_chain"
+                        },
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x834add48",
+                              "ty": 9
+                            }
+                          },
+                          "name": "to_chain"
+                        },
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x834add48",
+                              "ty": 6
+                            }
+                          },
+                          "name": "tao_amount"
+                        },
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x834add48",
+                              "ty": 6
+                            }
+                          },
+                          "name": "from_amount"
+                        },
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x834add48",
+                              "ty": 6
+                            }
+                          },
+                          "name": "to_amount"
+                        },
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x834add48",
+                              "ty": 5
+                            }
+                          },
+                          "name": "reserved_until"
+                        }
+                      ],
+                      "name": "Reservation"
+                    }
+                  },
+                  "root_key": "0x834add48",
+                  "ty": 50
+                }
+              },
+              "name": "reservations"
+            },
+            {
+              "layout": {
+                "root": {
+                  "layout": {
+                    "struct": {
+                      "fields": [
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x5f12d584",
+                              "ty": 0
+                            }
+                          },
+                          "name": "submitter"
+                        },
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x5f12d584",
+                              "ty": 5
+                            }
+                          },
+                          "name": "target_block"
+                        },
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x5f12d584",
+                              "ty": 5
+                            }
+                          },
+                          "name": "proposed_at"
+                        }
+                      ],
+                      "name": "PendingExtension"
+                    }
+                  },
+                  "root_key": "0x5f12d584",
+                  "ty": 54
+                }
+              },
+              "name": "pending_reservation_extensions"
+            },
+            {
+              "layout": {
+                "root": {
+                  "layout": {
+                    "struct": {
+                      "fields": [
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0xb4e15eb6",
+                              "ty": 0
+                            }
+                          },
+                          "name": "submitter"
+                        },
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0xb4e15eb6",
+                              "ty": 5
+                            }
+                          },
+                          "name": "target_block"
+                        },
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0xb4e15eb6",
+                              "ty": 5
+                            }
+                          },
+                          "name": "proposed_at"
+                        }
+                      ],
+                      "name": "PendingExtension"
+                    }
+                  },
+                  "root_key": "0xb4e15eb6",
+                  "ty": 58
+                }
+              },
+              "name": "pending_timeout_extensions"
+            },
+            {
+              "layout": {
+                "root": {
+                  "layout": {
+                    "leaf": {
+                      "key": "0x40ba57a5",
+                      "ty": 2
+                    }
+                  },
+                  "root_key": "0x40ba57a5",
+                  "ty": 61
+                }
+              },
+              "name": "reservation_extension_count"
+            },
+            {
+              "layout": {
+                "root": {
+                  "layout": {
+                    "leaf": {
+                      "key": "0xda0640a7",
+                      "ty": 2
+                    }
+                  },
+                  "root_key": "0xda0640a7",
+                  "ty": 64
+                }
+              },
+              "name": "swap_extension_count"
+            },
+            {
+              "layout": {
+                "root": {
+                  "layout": {
+                    "struct": {
+                      "fields": [
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x049f2f6f",
+                              "ty": 2
+                            }
+                          },
+                          "name": "0"
+                        },
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x049f2f6f",
+                              "ty": 5
+                            }
+                          },
+                          "name": "1"
+                        }
+                      ],
+                      "name": "(A, B)"
+                    }
+                  },
+                  "root_key": "0x049f2f6f",
+                  "ty": 67
+                }
+              },
+              "name": "address_cooldown"
+            },
+            {
+              "layout": {
+                "leaf": {
+                  "key": "0x00000000",
+                  "ty": 6
+                }
+              },
+              "name": "accumulated_fees"
+            },
+            {
+              "layout": {
+                "leaf": {
+                  "key": "0x00000000",
+                  "ty": 6
+                }
+              },
+              "name": "total_recycled_fees"
+            },
+            {
+              "layout": {
+                "root": {
+                  "layout": {
+                    "struct": {
+                      "fields": [
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x0a1285bc",
+                              "ty": 0
+                            }
+                          },
+                          "name": "0"
+                        },
+                        {
+                          "layout": {
+                            "leaf": {
+                              "key": "0x0a1285bc",
+                              "ty": 6
+                            }
+                          },
+                          "name": "1"
+                        }
+                      ],
+                      "name": "(A, B)"
+                    }
+                  },
+                  "root_key": "0x0a1285bc",
+                  "ty": 71
+                }
+              },
+              "name": "pending_slashes"
+            }
+          ],
+          "name": "AllwaysSwapManager"
+        }
+      },
+      "root_key": "0x00000000",
+      "ty": 75
+    }
+  },
+  "types": [
+    {
+      "id": 0,
+      "type": {
+        "def": {
+          "composite": {
+            "fields": [
+              {
+                "type": 1,
+                "typeName": "[u8; 32]"
+              }
+            ]
+          }
+        },
+        "path": [
+          "ink_primitives",
+          "types",
+          "AccountId"
+        ]
+      }
+    },
+    {
+      "id": 1,
+      "type": {
+        "def": {
+          "array": {
+            "len": 32,
+            "type": 2
+          }
+        }
+      }
+    },
+    {
+      "id": 2,
+      "type": {
+        "def": {
+          "primitive": "u8"
+        }
+      }
+    },
+    {
+      "id": 3,
+      "type": {
+        "def": {
+          "primitive": "u16"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": {
+        "def": {
+          "primitive": "bool"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": {
+        "def": {
+          "primitive": "u32"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": {
+        "def": {
+          "primitive": "u128"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "type": {
+        "def": {
+          "sequence": {
+            "type": 0
+          }
+        }
+      }
+    },
+    {
+      "id": 8,
+      "type": {
+        "def": {
+          "primitive": "u64"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "type": {
+        "def": {
+          "primitive": "str"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "K",
+            "type": 8
+          },
+          {
+            "name": "V",
+            "type": 11
+          },
+          {
+            "name": "KeyType",
+            "type": 13
+          }
+        ],
+        "path": [
+          "ink_storage",
+          "lazy",
+          "mapping",
+          "Mapping"
+        ]
+      }
+    },
+    {
+      "id": 11,
+      "type": {
+        "def": {
+          "composite": {
+            "fields": [
+              {
+                "name": "id",
+                "type": 8,
+                "typeName": "u64"
+              },
+              {
+                "name": "user",
+                "type": 0,
+                "typeName": "AccountId"
+              },
+              {
+                "name": "miner",
+                "type": 0,
+                "typeName": "AccountId"
+              },
+              {
+                "name": "from_chain",
+                "type": 9,
+                "typeName": "String"
+              },
+              {
+                "name": "to_chain",
+                "type": 9,
+                "typeName": "String"
+              },
+              {
+                "name": "from_amount",
+                "type": 6,
+                "typeName": "Balance"
+              },
+              {
+                "name": "to_amount",
+                "type": 6,
+                "typeName": "Balance"
+              },
+              {
+                "name": "tao_amount",
+                "type": 6,
+                "typeName": "Balance"
+              },
+              {
+                "name": "user_from_address",
+                "type": 9,
+                "typeName": "String"
+              },
+              {
+                "name": "user_to_address",
+                "type": 9,
+                "typeName": "String"
+              },
+              {
+                "name": "miner_from_address",
+                "type": 9,
+                "typeName": "String"
+              },
+              {
+                "name": "miner_to_address",
+                "type": 9,
+                "typeName": "String"
+              },
+              {
+                "name": "rate",
+                "type": 9,
+                "typeName": "String"
+              },
+              {
+                "name": "from_tx_hash",
+                "type": 9,
+                "typeName": "String"
+              },
+              {
+                "name": "from_tx_block",
+                "type": 5,
+                "typeName": "u32"
+              },
+              {
+                "name": "to_tx_hash",
+                "type": 9,
+                "typeName": "String"
+              },
+              {
+                "name": "to_tx_block",
+                "type": 5,
+                "typeName": "u32"
+              },
+              {
+                "name": "status",
+                "type": 12,
+                "typeName": "SwapStatus"
+              },
+              {
+                "name": "initiated_block",
+                "type": 5,
+                "typeName": "u32"
+              },
+              {
+                "name": "timeout_block",
+                "type": 5,
+                "typeName": "u32"
+              },
+              {
+                "name": "fulfilled_block",
+                "type": 5,
+                "typeName": "u32"
+              },
+              {
+                "name": "completed_block",
+                "type": 5,
+                "typeName": "u32"
+              }
+            ]
+          }
+        },
+        "path": [
+          "allways_swap_manager",
+          "types",
+          "SwapData"
+        ]
+      }
+    },
+    {
+      "id": 12,
+      "type": {
+        "def": {
+          "variant": {
+            "variants": [
+              {
+                "index": 0,
+                "name": "Active"
+              },
+              {
+                "index": 1,
+                "name": "Fulfilled"
+              },
+              {
+                "index": 2,
+                "name": "Completed"
+              },
+              {
+                "index": 3,
+                "name": "TimedOut"
+              }
+            ]
+          }
+        },
+        "path": [
+          "allways_swap_manager",
+          "types",
+          "SwapStatus"
+        ]
+      }
+    },
+    {
+      "id": 13,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "L",
+            "type": 14
+          },
+          {
+            "name": "R",
+            "type": 15
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ResolverKey"
+        ]
+      }
+    },
+    {
+      "id": 14,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "AutoKey"
+        ]
+      }
+    },
+    {
+      "id": 15,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "ParentKey",
+            "type": 16
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ManualKey"
+        ]
+      }
+    },
+    {
+      "id": 16,
+      "type": {
+        "def": {
+          "tuple": []
+        }
+      }
+    },
+    {
+      "id": 17,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "K",
+            "type": 9
+          },
+          {
+            "name": "V",
+            "type": 4
+          },
+          {
+            "name": "KeyType",
+            "type": 18
+          }
+        ],
+        "path": [
+          "ink_storage",
+          "lazy",
+          "mapping",
+          "Mapping"
+        ]
+      }
+    },
+    {
+      "id": 18,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "L",
+            "type": 14
+          },
+          {
+            "name": "R",
+            "type": 19
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ResolverKey"
+        ]
+      }
+    },
+    {
+      "id": 19,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "ParentKey",
+            "type": 16
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ManualKey"
+        ]
+      }
+    },
+    {
+      "id": 20,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "K",
+            "type": 0
+          },
+          {
+            "name": "V",
+            "type": 6
+          },
+          {
+            "name": "KeyType",
+            "type": 21
+          }
+        ],
+        "path": [
+          "ink_storage",
+          "lazy",
+          "mapping",
+          "Mapping"
+        ]
+      }
+    },
+    {
+      "id": 21,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "L",
+            "type": 14
+          },
+          {
+            "name": "R",
+            "type": 22
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ResolverKey"
+        ]
+      }
+    },
+    {
+      "id": 22,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "ParentKey",
+            "type": 16
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ManualKey"
+        ]
+      }
+    },
+    {
+      "id": 23,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "K",
+            "type": 0
+          },
+          {
+            "name": "V",
+            "type": 4
+          },
+          {
+            "name": "KeyType",
+            "type": 24
+          }
+        ],
+        "path": [
+          "ink_storage",
+          "lazy",
+          "mapping",
+          "Mapping"
+        ]
+      }
+    },
+    {
+      "id": 24,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "L",
+            "type": 14
+          },
+          {
+            "name": "R",
+            "type": 25
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ResolverKey"
+        ]
+      }
+    },
+    {
+      "id": 25,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "ParentKey",
+            "type": 16
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ManualKey"
+        ]
+      }
+    },
+    {
+      "id": 26,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "K",
+            "type": 0
+          },
+          {
+            "name": "V",
+            "type": 4
+          },
+          {
+            "name": "KeyType",
+            "type": 27
+          }
+        ],
+        "path": [
+          "ink_storage",
+          "lazy",
+          "mapping",
+          "Mapping"
+        ]
+      }
+    },
+    {
+      "id": 27,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "L",
+            "type": 14
+          },
+          {
+            "name": "R",
+            "type": 28
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ResolverKey"
+        ]
+      }
+    },
+    {
+      "id": 28,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "ParentKey",
+            "type": 16
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ManualKey"
+        ]
+      }
+    },
+    {
+      "id": 29,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "K",
+            "type": 0
+          },
+          {
+            "name": "V",
+            "type": 5
+          },
+          {
+            "name": "KeyType",
+            "type": 30
+          }
+        ],
+        "path": [
+          "ink_storage",
+          "lazy",
+          "mapping",
+          "Mapping"
+        ]
+      }
+    },
+    {
+      "id": 30,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "L",
+            "type": 14
+          },
+          {
+            "name": "R",
+            "type": 31
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ResolverKey"
+        ]
+      }
+    },
+    {
+      "id": 31,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "ParentKey",
+            "type": 16
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ManualKey"
+        ]
+      }
+    },
+    {
+      "id": 32,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "K",
+            "type": 8
+          },
+          {
+            "name": "V",
+            "type": 7
+          },
+          {
+            "name": "KeyType",
+            "type": 33
+          }
+        ],
+        "path": [
+          "ink_storage",
+          "lazy",
+          "mapping",
+          "Mapping"
+        ]
+      }
+    },
+    {
+      "id": 33,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "L",
+            "type": 14
+          },
+          {
+            "name": "R",
+            "type": 34
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ResolverKey"
+        ]
+      }
+    },
+    {
+      "id": 34,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "ParentKey",
+            "type": 16
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ManualKey"
+        ]
+      }
+    },
+    {
+      "id": 35,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "K",
+            "type": 8
+          },
+          {
+            "name": "V",
+            "type": 5
+          },
+          {
+            "name": "KeyType",
+            "type": 36
+          }
+        ],
+        "path": [
+          "ink_storage",
+          "lazy",
+          "mapping",
+          "Mapping"
+        ]
+      }
+    },
+    {
+      "id": 36,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "L",
+            "type": 14
+          },
+          {
+            "name": "R",
+            "type": 37
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ResolverKey"
+        ]
+      }
+    },
+    {
+      "id": 37,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "ParentKey",
+            "type": 16
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ManualKey"
+        ]
+      }
+    },
+    {
+      "id": 38,
+      "type": {
+        "def": {
+          "composite": {
+            "fields": [
+              {
+                "type": 1,
+                "typeName": "[u8; 32]"
+              }
+            ]
+          }
+        },
+        "path": [
+          "ink_primitives",
+          "types",
+          "Hash"
+        ]
+      }
+    },
+    {
+      "id": 39,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "K",
+            "type": 8
+          },
+          {
+            "name": "V",
+            "type": 38
+          },
+          {
+            "name": "KeyType",
+            "type": 40
+          }
+        ],
+        "path": [
+          "ink_storage",
+          "lazy",
+          "mapping",
+          "Mapping"
+        ]
+      }
+    },
+    {
+      "id": 40,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "L",
+            "type": 14
+          },
+          {
+            "name": "R",
+            "type": 41
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ResolverKey"
+        ]
+      }
+    },
+    {
+      "id": 41,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "ParentKey",
+            "type": 16
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ManualKey"
+        ]
+      }
+    },
+    {
+      "id": 42,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "K",
+            "type": 43
+          },
+          {
+            "name": "V",
+            "type": 8
+          },
+          {
+            "name": "KeyType",
+            "type": 44
+          }
+        ],
+        "path": [
+          "ink_storage",
+          "lazy",
+          "mapping",
+          "Mapping"
+        ]
+      }
+    },
+    {
+      "id": 43,
+      "type": {
+        "def": {
+          "tuple": [
+            0,
+            2
+          ]
+        }
+      }
+    },
+    {
+      "id": 44,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "L",
+            "type": 14
+          },
+          {
+            "name": "R",
+            "type": 45
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ResolverKey"
+        ]
+      }
+    },
+    {
+      "id": 45,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "ParentKey",
+            "type": 16
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ManualKey"
+        ]
+      }
+    },
+    {
+      "id": 46,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "K",
+            "type": 47
+          },
+          {
+            "name": "V",
+            "type": 8
+          },
+          {
+            "name": "KeyType",
+            "type": 48
+          }
+        ],
+        "path": [
+          "ink_storage",
+          "lazy",
+          "mapping",
+          "Mapping"
+        ]
+      }
+    },
+    {
+      "id": 47,
+      "type": {
+        "def": {
+          "tuple": [
+            8,
+            2
+          ]
+        }
+      }
+    },
+    {
+      "id": 48,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "L",
+            "type": 14
+          },
+          {
+            "name": "R",
+            "type": 49
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ResolverKey"
+        ]
+      }
+    },
+    {
+      "id": 49,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "ParentKey",
+            "type": 16
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ManualKey"
+        ]
+      }
+    },
+    {
+      "id": 50,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "K",
+            "type": 0
+          },
+          {
+            "name": "V",
+            "type": 51
+          },
+          {
+            "name": "KeyType",
+            "type": 52
+          }
+        ],
+        "path": [
+          "ink_storage",
+          "lazy",
+          "mapping",
+          "Mapping"
+        ]
+      }
+    },
+    {
+      "id": 51,
+      "type": {
+        "def": {
+          "composite": {
+            "fields": [
+              {
+                "name": "hash",
+                "type": 38,
+                "typeName": "Hash"
+              },
+              {
+                "name": "from_addr",
+                "type": 9,
+                "typeName": "String"
+              },
+              {
+                "name": "from_chain",
+                "type": 9,
+                "typeName": "String"
+              },
+              {
+                "name": "to_chain",
+                "type": 9,
+                "typeName": "String"
+              },
+              {
+                "name": "tao_amount",
+                "type": 6,
+                "typeName": "Balance"
+              },
+              {
+                "name": "from_amount",
+                "type": 6,
+                "typeName": "Balance"
+              },
+              {
+                "name": "to_amount",
+                "type": 6,
+                "typeName": "Balance"
+              },
+              {
+                "name": "reserved_until",
+                "type": 5,
+                "typeName": "u32"
+              }
+            ]
+          }
+        },
+        "path": [
+          "allways_swap_manager",
+          "types",
+          "Reservation"
+        ]
+      }
+    },
+    {
+      "id": 52,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "L",
+            "type": 14
+          },
+          {
+            "name": "R",
+            "type": 53
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ResolverKey"
+        ]
+      }
+    },
+    {
+      "id": 53,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "ParentKey",
+            "type": 16
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ManualKey"
+        ]
+      }
+    },
+    {
+      "id": 54,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "K",
+            "type": 0
+          },
+          {
+            "name": "V",
+            "type": 55
+          },
+          {
+            "name": "KeyType",
+            "type": 56
+          }
+        ],
+        "path": [
+          "ink_storage",
+          "lazy",
+          "mapping",
+          "Mapping"
+        ]
+      }
+    },
+    {
+      "id": 55,
+      "type": {
+        "def": {
+          "composite": {
+            "fields": [
+              {
+                "name": "submitter",
+                "type": 0,
+                "typeName": "AccountId"
+              },
+              {
+                "name": "target_block",
+                "type": 5,
+                "typeName": "u32"
+              },
+              {
+                "name": "proposed_at",
+                "type": 5,
+                "typeName": "u32"
+              }
+            ]
+          }
+        },
+        "path": [
+          "allways_swap_manager",
+          "types",
+          "PendingExtension"
+        ]
+      }
+    },
+    {
+      "id": 56,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "L",
+            "type": 14
+          },
+          {
+            "name": "R",
+            "type": 57
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ResolverKey"
+        ]
+      }
+    },
+    {
+      "id": 57,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "ParentKey",
+            "type": 16
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ManualKey"
+        ]
+      }
+    },
+    {
+      "id": 58,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "K",
+            "type": 8
+          },
+          {
+            "name": "V",
+            "type": 55
+          },
+          {
+            "name": "KeyType",
+            "type": 59
+          }
+        ],
+        "path": [
+          "ink_storage",
+          "lazy",
+          "mapping",
+          "Mapping"
+        ]
+      }
+    },
+    {
+      "id": 59,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "L",
+            "type": 14
+          },
+          {
+            "name": "R",
+            "type": 60
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ResolverKey"
+        ]
+      }
+    },
+    {
+      "id": 60,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "ParentKey",
+            "type": 16
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ManualKey"
+        ]
+      }
+    },
+    {
+      "id": 61,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "K",
+            "type": 0
+          },
+          {
+            "name": "V",
+            "type": 2
+          },
+          {
+            "name": "KeyType",
+            "type": 62
+          }
+        ],
+        "path": [
+          "ink_storage",
+          "lazy",
+          "mapping",
+          "Mapping"
+        ]
+      }
+    },
+    {
+      "id": 62,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "L",
+            "type": 14
+          },
+          {
+            "name": "R",
+            "type": 63
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ResolverKey"
+        ]
+      }
+    },
+    {
+      "id": 63,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "ParentKey",
+            "type": 16
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ManualKey"
+        ]
+      }
+    },
+    {
+      "id": 64,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "K",
+            "type": 8
+          },
+          {
+            "name": "V",
+            "type": 2
+          },
+          {
+            "name": "KeyType",
+            "type": 65
+          }
+        ],
+        "path": [
+          "ink_storage",
+          "lazy",
+          "mapping",
+          "Mapping"
+        ]
+      }
+    },
+    {
+      "id": 65,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "L",
+            "type": 14
+          },
+          {
+            "name": "R",
+            "type": 66
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ResolverKey"
+        ]
+      }
+    },
+    {
+      "id": 66,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "ParentKey",
+            "type": 16
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ManualKey"
+        ]
+      }
+    },
+    {
+      "id": 67,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "K",
+            "type": 9
+          },
+          {
+            "name": "V",
+            "type": 68
+          },
+          {
+            "name": "KeyType",
+            "type": 69
+          }
+        ],
+        "path": [
+          "ink_storage",
+          "lazy",
+          "mapping",
+          "Mapping"
+        ]
+      }
+    },
+    {
+      "id": 68,
+      "type": {
+        "def": {
+          "tuple": [
+            2,
+            5
+          ]
+        }
+      }
+    },
+    {
+      "id": 69,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "L",
+            "type": 14
+          },
+          {
+            "name": "R",
+            "type": 70
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ResolverKey"
+        ]
+      }
+    },
+    {
+      "id": 70,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "ParentKey",
+            "type": 16
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ManualKey"
+        ]
+      }
+    },
+    {
+      "id": 71,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "K",
+            "type": 8
+          },
+          {
+            "name": "V",
+            "type": 72
+          },
+          {
+            "name": "KeyType",
+            "type": 73
+          }
+        ],
+        "path": [
+          "ink_storage",
+          "lazy",
+          "mapping",
+          "Mapping"
+        ]
+      }
+    },
+    {
+      "id": 72,
+      "type": {
+        "def": {
+          "tuple": [
+            0,
+            6
+          ]
+        }
+      }
+    },
+    {
+      "id": 73,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "L",
+            "type": 14
+          },
+          {
+            "name": "R",
+            "type": 74
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ResolverKey"
+        ]
+      }
+    },
+    {
+      "id": 74,
+      "type": {
+        "def": {
+          "composite": {}
+        },
+        "params": [
+          {
+            "name": "ParentKey",
+            "type": 16
+          }
+        ],
+        "path": [
+          "ink_storage_traits",
+          "impls",
+          "ManualKey"
+        ]
+      }
+    },
+    {
+      "id": 75,
+      "type": {
+        "def": {
+          "composite": {
+            "fields": [
+              {
+                "name": "owner",
+                "type": 0,
+                "typeName": "<AccountId as::ink::storage::traits::AutoStorableHint<::ink::\nstorage::traits::ManualKey<2833659908u32, ()>,>>::Type"
+              },
+              {
+                "name": "recycle_address",
+                "type": 0,
+                "typeName": "<AccountId as::ink::storage::traits::AutoStorableHint<::ink::\nstorage::traits::ManualKey<3462413410u32, ()>,>>::Type"
+              },
+              {
+                "name": "staking_hotkey",
+                "type": 0,
+                "typeName": "<AccountId as::ink::storage::traits::AutoStorableHint<::ink::\nstorage::traits::ManualKey<588097489u32, ()>,>>::Type"
+              },
+              {
+                "name": "netuid",
+                "type": 3,
+                "typeName": "<u16 as::ink::storage::traits::AutoStorableHint<::ink::storage\n::traits::ManualKey<2503007889u32, ()>,>>::Type"
+              },
+              {
+                "name": "chain_ext_enabled",
+                "type": 4,
+                "typeName": "<bool as::ink::storage::traits::AutoStorableHint<::ink::storage\n::traits::ManualKey<3182895261u32, ()>,>>::Type"
+              },
+              {
+                "name": "fulfillment_timeout_blocks",
+                "type": 5,
+                "typeName": "<u32 as::ink::storage::traits::AutoStorableHint<::ink::storage\n::traits::ManualKey<140410277u32, ()>,>>::Type"
+              },
+              {
+                "name": "reservation_ttl",
+                "type": 5,
+                "typeName": "<u32 as::ink::storage::traits::AutoStorableHint<::ink::storage\n::traits::ManualKey<196722775u32, ()>,>>::Type"
+              },
+              {
+                "name": "min_collateral",
+                "type": 6,
+                "typeName": "<Balance as::ink::storage::traits::AutoStorableHint<::ink::\nstorage::traits::ManualKey<1188786366u32, ()>,>>::Type"
+              },
+              {
+                "name": "max_collateral",
+                "type": 6,
+                "typeName": "<Balance as::ink::storage::traits::AutoStorableHint<::ink::\nstorage::traits::ManualKey<948383453u32, ()>,>>::Type"
+              },
+              {
+                "name": "min_swap_amount",
+                "type": 6,
+                "typeName": "<Balance as::ink::storage::traits::AutoStorableHint<::ink::\nstorage::traits::ManualKey<1125021002u32, ()>,>>::Type"
+              },
+              {
+                "name": "max_swap_amount",
+                "type": 6,
+                "typeName": "<Balance as::ink::storage::traits::AutoStorableHint<::ink::\nstorage::traits::ManualKey<3490700323u32, ()>,>>::Type"
+              },
+              {
+                "name": "consensus_threshold_percent",
+                "type": 2,
+                "typeName": "<u8 as::ink::storage::traits::AutoStorableHint<::ink::storage::\ntraits::ManualKey<208322737u32, ()>,>>::Type"
+              },
+              {
+                "name": "halted",
+                "type": 4,
+                "typeName": "<bool as::ink::storage::traits::AutoStorableHint<::ink::storage\n::traits::ManualKey<3271630610u32, ()>,>>::Type"
+              },
+              {
+                "name": "validators",
+                "type": 7,
+                "typeName": "<Vec<AccountId> as::ink::storage::traits::AutoStorableHint<::\nink::storage::traits::ManualKey<1375580815u32, ()>,>>::Type"
+              },
+              {
+                "name": "next_swap_id",
+                "type": 8,
+                "typeName": "<u64 as::ink::storage::traits::AutoStorableHint<::ink::storage\n::traits::ManualKey<3204266513u32, ()>,>>::Type"
+              },
+              {
+                "name": "swaps",
+                "type": 10,
+                "typeName": "<Mapping<u64, SwapData> as::ink::storage::traits::AutoStorableHint\n<::ink::storage::traits::ManualKey<1645419819u32, ()>,>>::Type"
+              },
+              {
+                "name": "used_from_tx",
+                "type": 17,
+                "typeName": "<Mapping<String, bool> as::ink::storage::traits::AutoStorableHint\n<::ink::storage::traits::ManualKey<3290984676u32, ()>,>>::Type"
+              },
+              {
+                "name": "collateral",
+                "type": 20,
+                "typeName": "<Mapping<AccountId, Balance> as::ink::storage::traits::\nAutoStorableHint<::ink::storage::traits::ManualKey<3894748662u32,\n()>,>>::Type"
+              },
+              {
+                "name": "miner_active",
+                "type": 23,
+                "typeName": "<Mapping<AccountId, bool> as::ink::storage::traits::\nAutoStorableHint<::ink::storage::traits::ManualKey<4204122727u32,\n()>,>>::Type"
+              },
+              {
+                "name": "miner_has_active_swap",
+                "type": 26,
+                "typeName": "<Mapping<AccountId, bool> as::ink::storage::traits::\nAutoStorableHint<::ink::storage::traits::ManualKey<1699049251u32,\n()>,>>::Type"
+              },
+              {
+                "name": "miner_deactivation_block",
+                "type": 29,
+                "typeName": "<Mapping<AccountId, u32> as::ink::storage::traits::\nAutoStorableHint<::ink::storage::traits::ManualKey<878783374u32, ()\n>,>>::Type"
+              },
+              {
+                "name": "next_request_id",
+                "type": 8,
+                "typeName": "<u64 as::ink::storage::traits::AutoStorableHint<::ink::storage\n::traits::ManualKey<3094324075u32, ()>,>>::Type"
+              },
+              {
+                "name": "request_voters",
+                "type": 32,
+                "typeName": "<Mapping<u64, Vec<AccountId>> as::ink::storage::traits::\nAutoStorableHint<::ink::storage::traits::ManualKey<295262811u32, ()\n>,>>::Type"
+              },
+              {
+                "name": "request_created",
+                "type": 35,
+                "typeName": "<Mapping<u64, u32> as::ink::storage::traits::AutoStorableHint<::\nink::storage::traits::ManualKey<3808762728u32, ()>,>>::Type"
+              },
+              {
+                "name": "request_hash",
+                "type": 39,
+                "typeName": "<Mapping<u64, Hash> as::ink::storage::traits::AutoStorableHint<\n::ink::storage::traits::ManualKey<507769943u32, ()>,>>::Type"
+              },
+              {
+                "name": "miner_active_request",
+                "type": 42,
+                "typeName": "<Mapping<(AccountId, u8), u64> as::ink::storage::traits::\nAutoStorableHint<::ink::storage::traits::ManualKey<2076993396u32,\n()>,>>::Type"
+              },
+              {
+                "name": "pending_swap_votes",
+                "type": 46,
+                "typeName": "<Mapping<(u64, u8), u64> as::ink::storage::traits::\nAutoStorableHint<::ink::storage::traits::ManualKey<4107779760u32,\n()>,>>::Type"
+              },
+              {
+                "name": "reservations",
+                "type": 50,
+                "typeName": "<Mapping<AccountId, Reservation> as::ink::storage::traits::\nAutoStorableHint<::ink::storage::traits::ManualKey<1222462083u32,\n()>,>>::Type"
+              },
+              {
+                "name": "pending_reservation_extensions",
+                "type": 54,
+                "typeName": "<Mapping<AccountId, PendingExtension> as::ink::storage::traits::\nAutoStorableHint<::ink::storage::traits::ManualKey<2228556383u32,\n()>,>>::Type"
+              },
+              {
+                "name": "pending_timeout_extensions",
+                "type": 58,
+                "typeName": "<Mapping<u64, PendingExtension> as::ink::storage::traits::\nAutoStorableHint<::ink::storage::traits::ManualKey<3059671476u32,\n()>,>>::Type"
+              },
+              {
+                "name": "reservation_extension_count",
+                "type": 61,
+                "typeName": "<Mapping<AccountId, u8> as::ink::storage::traits::AutoStorableHint\n<::ink::storage::traits::ManualKey<2773989952u32, ()>,>>::Type"
+              },
+              {
+                "name": "swap_extension_count",
+                "type": 64,
+                "typeName": "<Mapping<u64, u8> as::ink::storage::traits::AutoStorableHint<::\nink::storage::traits::ManualKey<2805991130u32, ()>,>>::Type"
+              },
+              {
+                "name": "address_cooldown",
+                "type": 67,
+                "typeName": "<Mapping<String, (u8, u32)> as::ink::storage::traits::\nAutoStorableHint<::ink::storage::traits::ManualKey<1865391876u32,\n()>,>>::Type"
+              },
+              {
+                "name": "accumulated_fees",
+                "type": 6,
+                "typeName": "<Balance as::ink::storage::traits::AutoStorableHint<::ink::\nstorage::traits::ManualKey<3593079788u32, ()>,>>::Type"
+              },
+              {
+                "name": "total_recycled_fees",
+                "type": 6,
+                "typeName": "<Balance as::ink::storage::traits::AutoStorableHint<::ink::\nstorage::traits::ManualKey<259358120u32, ()>,>>::Type"
+              },
+              {
+                "name": "pending_slashes",
+                "type": 71,
+                "typeName": "<Mapping<u64, (AccountId, Balance)> as::ink::storage::traits::\nAutoStorableHint<::ink::storage::traits::ManualKey<3162837514u32,\n()>,>>::Type"
+              }
+            ]
+          }
+        },
+        "path": [
+          "allways_swap_manager",
+          "allways_swap_manager",
+          "AllwaysSwapManager"
+        ]
+      }
+    },
+    {
+      "id": 76,
+      "type": {
+        "def": {
+          "variant": {
+            "variants": [
+              {
+                "fields": [
+                  {
+                    "type": 16
+                  }
+                ],
+                "index": 0,
+                "name": "Ok"
+              },
+              {
+                "fields": [
+                  {
+                    "type": 77
+                  }
+                ],
+                "index": 1,
+                "name": "Err"
+              }
+            ]
+          }
+        },
+        "params": [
+          {
+            "name": "T",
+            "type": 16
+          },
+          {
+            "name": "E",
+            "type": 77
+          }
+        ],
+        "path": [
+          "Result"
+        ]
+      }
+    },
+    {
+      "id": 77,
+      "type": {
+        "def": {
+          "variant": {
+            "variants": [
+              {
+                "index": 1,
+                "name": "CouldNotReadInput"
+              }
+            ]
+          }
+        },
+        "path": [
+          "ink_primitives",
+          "LangError"
+        ]
+      }
+    },
+    {
+      "id": 78,
+      "type": {
+        "def": {
+          "variant": {
+            "variants": [
+              {
+                "fields": [
+                  {
+                    "type": 79
+                  }
+                ],
+                "index": 0,
+                "name": "Ok"
+              },
+              {
+                "fields": [
+                  {
+                    "type": 77
+                  }
+                ],
+                "index": 1,
+                "name": "Err"
+              }
+            ]
+          }
+        },
+        "params": [
+          {
+            "name": "T",
+            "type": 79
+          },
+          {
+            "name": "E",
+            "type": 77
+          }
+        ],
+        "path": [
+          "Result"
+        ]
+      }
+    },
+    {
+      "id": 79,
+      "type": {
+        "def": {
+          "variant": {
+            "variants": [
+              {
+                "fields": [
+                  {
+                    "type": 16
+                  }
+                ],
+                "index": 0,
+                "name": "Ok"
+              },
+              {
+                "fields": [
+                  {
+                    "type": 80
+                  }
+                ],
+                "index": 1,
+                "name": "Err"
+              }
+            ]
+          }
+        },
+        "params": [
+          {
+            "name": "T",
+            "type": 16
+          },
+          {
+            "name": "E",
+            "type": 80
+          }
+        ],
+        "path": [
+          "Result"
+        ]
+      }
+    },
+    {
+      "id": 80,
+      "type": {
+        "def": {
+          "variant": {
+            "variants": [
+              {
+                "index": 0,
+                "name": "NotOwner"
+              },
+              {
+                "index": 1,
+                "name": "InsufficientCollateral"
+              },
+              {
+                "index": 2,
+                "name": "SwapNotFound"
+              },
+              {
+                "index": 3,
+                "name": "AlreadyVoted"
+              },
+              {
+                "index": 4,
+                "name": "InvalidStatus"
+              },
+              {
+                "index": 5,
+                "name": "MinerNotActive"
+              },
+              {
+                "index": 6,
+                "name": "MinerStillActive"
+              },
+              {
+                "index": 7,
+                "name": "TransferFailed"
+              },
+              {
+                "index": 8,
+                "name": "NotTimedOut"
+              },
+              {
+                "index": 9,
+                "name": "NotAssignedMiner"
+              },
+              {
+                "index": 10,
+                "name": "NotValidator"
+              },
+              {
+                "index": 11,
+                "name": "DuplicateSourceTx"
+              },
+              {
+                "index": 12,
+                "name": "InvalidAmount"
+              },
+              {
+                "index": 13,
+                "name": "NoPendingSlash"
+              },
+              {
+                "index": 14,
+                "name": "InputEmpty"
+              },
+              {
+                "index": 15,
+                "name": "InputTooLong"
+              },
+              {
+                "index": 16,
+                "name": "MinerHasActiveSwap"
+              },
+              {
+                "index": 17,
+                "name": "WithdrawalCooldown"
+              },
+              {
+                "index": 18,
+                "name": "AmountBelowMinimum"
+              },
+              {
+                "index": 19,
+                "name": "AmountAboveMaximum"
+              },
+              {
+                "index": 20,
+                "name": "MinerReserved"
+              },
+              {
+                "index": 21,
+                "name": "NoReservation"
+              },
+              {
+                "index": 22,
+                "name": "ExceedsMaxCollateral"
+              },
+              {
+                "index": 23,
+                "name": "HashMismatch"
+              },
+              {
+                "index": 24,
+                "name": "PendingConflict"
+              },
+              {
+                "index": 25,
+                "name": "SameChain"
+              },
+              {
+                "index": 26,
+                "name": "SystemHalted"
+              },
+              {
+                "index": 27,
+                "name": "ProposalAlreadyPending"
+              },
+              {
+                "index": 28,
+                "name": "ChallengeWindowOpen"
+              },
+              {
+                "index": 29,
+                "name": "ChallengeWindowClosed"
+              },
+              {
+                "index": 30,
+                "name": "NoProposal"
+              },
+              {
+                "index": 31,
+                "name": "ExtensionTooLong"
+              },
+              {
+                "index": 32,
+                "name": "TargetNotForward"
+              },
+              {
+                "index": 33,
+                "name": "InvalidTarget"
+              },
+              {
+                "index": 34,
+                "name": "MaxExtensionsExceeded"
+              }
+            ]
+          }
+        },
+        "path": [
+          "allways_swap_manager",
+          "errors",
+          "Error"
+        ]
+      }
+    },
+    {
+      "id": 81,
+      "type": {
+        "def": {
+          "variant": {
+            "variants": [
+              {
+                "fields": [
+                  {
+                    "type": 82
+                  }
+                ],
+                "index": 0,
+                "name": "Ok"
+              },
+              {
+                "fields": [
+                  {
+                    "type": 77
+                  }
+                ],
+                "index": 1,
+                "name": "Err"
+              }
+            ]
+          }
+        },
+        "params": [
+          {
+            "name": "T",
+            "type": 82
+          },
+          {
+            "name": "E",
+            "type": 77
+          }
+        ],
+        "path": [
+          "Result"
+        ]
+      }
+    },
+    {
+      "id": 82,
+      "type": {
+        "def": {
+          "variant": {
+            "variants": [
+              {
+                "index": 0,
+                "name": "None"
+              },
+              {
+                "fields": [
+                  {
+                    "type": 55
+                  }
+                ],
+                "index": 1,
+                "name": "Some"
+              }
+            ]
+          }
+        },
+        "params": [
+          {
+            "name": "T",
+            "type": 55
+          }
+        ],
+        "path": [
+          "Option"
+        ]
+      }
+    },
+    {
+      "id": 83,
+      "type": {
+        "def": {
+          "variant": {
+            "variants": [
+              {
+                "fields": [
+                  {
+                    "type": 2
+                  }
+                ],
+                "index": 0,
+                "name": "Ok"
+              },
+              {
+                "fields": [
+                  {
+                    "type": 77
+                  }
+                ],
+                "index": 1,
+                "name": "Err"
+              }
+            ]
+          }
+        },
+        "params": [
+          {
+            "name": "T",
+            "type": 2
+          },
+          {
+            "name": "E",
+            "type": 77
+          }
+        ],
+        "path": [
+          "Result"
+        ]
+      }
+    },
+    {
+      "id": 84,
+      "type": {
+        "def": {
+          "variant": {
+            "variants": [
+              {
+                "fields": [
+                  {
+                    "type": 85
+                  }
+                ],
+                "index": 0,
+                "name": "Ok"
+              },
+              {
+                "fields": [
+                  {
+                    "type": 77
+                  }
+                ],
+                "index": 1,
+                "name": "Err"
+              }
+            ]
+          }
+        },
+        "params": [
+          {
+            "name": "T",
+            "type": 85
+          },
+          {
+            "name": "E",
+            "type": 77
+          }
+        ],
+        "path": [
+          "Result"
+        ]
+      }
+    },
+    {
+      "id": 85,
+      "type": {
+        "def": {
+          "variant": {
+            "variants": [
+              {
+                "index": 0,
+                "name": "None"
+              },
+              {
+                "fields": [
+                  {
+                    "type": 11
+                  }
+                ],
+                "index": 1,
+                "name": "Some"
+              }
+            ]
+          }
+        },
+        "params": [
+          {
+            "name": "T",
+            "type": 11
+          }
+        ],
+        "path": [
+          "Option"
+        ]
+      }
+    },
+    {
+      "id": 86,
+      "type": {
+        "def": {
+          "variant": {
+            "variants": [
+              {
+                "fields": [
+                  {
+                    "type": 6
+                  }
+                ],
+                "index": 0,
+                "name": "Ok"
+              },
+              {
+                "fields": [
+                  {
+                    "type": 77
+                  }
+                ],
+                "index": 1,
+                "name": "Err"
+              }
+            ]
+          }
+        },
+        "params": [
+          {
+            "name": "T",
+            "type": 6
+          },
+          {
+            "name": "E",
+            "type": 77
+          }
+        ],
+        "path": [
+          "Result"
+        ]
+      }
+    },
+    {
+      "id": 87,
+      "type": {
+        "def": {
+          "variant": {
+            "variants": [
+              {
+                "fields": [
+                  {
+                    "type": 4
+                  }
+                ],
+                "index": 0,
+                "name": "Ok"
+              },
+              {
+                "fields": [
+                  {
+                    "type": 77
+                  }
+                ],
+                "index": 1,
+                "name": "Err"
+              }
+            ]
+          }
+        },
+        "params": [
+          {
+            "name": "T",
+            "type": 4
+          },
+          {
+            "name": "E",
+            "type": 77
+          }
+        ],
+        "path": [
+          "Result"
+        ]
+      }
+    },
+    {
+      "id": 88,
+      "type": {
+        "def": {
+          "variant": {
+            "variants": [
+              {
+                "fields": [
+                  {
+                    "type": 7
+                  }
+                ],
+                "index": 0,
+                "name": "Ok"
+              },
+              {
+                "fields": [
+                  {
+                    "type": 77
+                  }
+                ],
+                "index": 1,
+                "name": "Err"
+              }
+            ]
+          }
+        },
+        "params": [
+          {
+            "name": "T",
+            "type": 7
+          },
+          {
+            "name": "E",
+            "type": 77
+          }
+        ],
+        "path": [
+          "Result"
+        ]
+      }
+    },
+    {
+      "id": 89,
+      "type": {
+        "def": {
+          "variant": {
+            "variants": [
+              {
+                "fields": [
+                  {
+                    "type": 8
+                  }
+                ],
+                "index": 0,
+                "name": "Ok"
+              },
+              {
+                "fields": [
+                  {
+                    "type": 77
+                  }
+                ],
+                "index": 1,
+                "name": "Err"
+              }
+            ]
+          }
+        },
+        "params": [
+          {
+            "name": "T",
+            "type": 8
+          },
+          {
+            "name": "E",
+            "type": 77
+          }
+        ],
+        "path": [
+          "Result"
+        ]
+      }
+    },
+    {
+      "id": 90,
+      "type": {
+        "def": {
+          "variant": {
+            "variants": [
+              {
+                "fields": [
+                  {
+                    "type": 5
+                  }
+                ],
+                "index": 0,
+                "name": "Ok"
+              },
+              {
+                "fields": [
+                  {
+                    "type": 77
+                  }
+                ],
+                "index": 1,
+                "name": "Err"
+              }
+            ]
+          }
+        },
+        "params": [
+          {
+            "name": "T",
+            "type": 5
+          },
+          {
+            "name": "E",
+            "type": 77
+          }
+        ],
+        "path": [
+          "Result"
+        ]
+      }
+    },
+    {
+      "id": 91,
+      "type": {
+        "def": {
+          "variant": {
+            "variants": [
+              {
+                "fields": [
+                  {
+                    "type": 0
+                  }
+                ],
+                "index": 0,
+                "name": "Ok"
+              },
+              {
+                "fields": [
+                  {
+                    "type": 77
+                  }
+                ],
+                "index": 1,
+                "name": "Err"
+              }
+            ]
+          }
+        },
+        "params": [
+          {
+            "name": "T",
+            "type": 0
+          },
+          {
+            "name": "E",
+            "type": 77
+          }
+        ],
+        "path": [
+          "Result"
+        ]
+      }
+    },
+    {
+      "id": 92,
+      "type": {
+        "def": {
+          "variant": {
+            "variants": [
+              {
+                "fields": [
+                  {
+                    "type": 3
+                  }
+                ],
+                "index": 0,
+                "name": "Ok"
+              },
+              {
+                "fields": [
+                  {
+                    "type": 77
+                  }
+                ],
+                "index": 1,
+                "name": "Err"
+              }
+            ]
+          }
+        },
+        "params": [
+          {
+            "name": "T",
+            "type": 3
+          },
+          {
+            "name": "E",
+            "type": 77
+          }
+        ],
+        "path": [
+          "Result"
+        ]
+      }
+    },
+    {
+      "id": 93,
+      "type": {
+        "def": {
+          "variant": {
+            "variants": [
+              {
+                "fields": [
+                  {
+                    "type": 94
+                  }
+                ],
+                "index": 0,
+                "name": "Ok"
+              },
+              {
+                "fields": [
+                  {
+                    "type": 77
+                  }
+                ],
+                "index": 1,
+                "name": "Err"
+              }
+            ]
+          }
+        },
+        "params": [
+          {
+            "name": "T",
+            "type": 94
+          },
+          {
+            "name": "E",
+            "type": 77
+          }
+        ],
+        "path": [
+          "Result"
+        ]
+      }
+    },
+    {
+      "id": 94,
+      "type": {
+        "def": {
+          "tuple": [
+            6,
+            4,
+            4,
+            5,
+            5
+          ]
+        }
+      }
+    },
+    {
+      "id": 95,
+      "type": {
+        "def": {
+          "variant": {
+            "variants": [
+              {
+                "fields": [
+                  {
+                    "type": 96
+                  }
+                ],
+                "index": 0,
+                "name": "Ok"
+              },
+              {
+                "fields": [
+                  {
+                    "type": 77
+                  }
+                ],
+                "index": 1,
+                "name": "Err"
+              }
+            ]
+          }
+        },
+        "params": [
+          {
+            "name": "T",
+            "type": 96
+          },
+          {
+            "name": "E",
+            "type": 77
+          }
+        ],
+        "path": [
+          "Result"
+        ]
+      }
+    },
+    {
+      "id": 96,
+      "type": {
+        "def": {
+          "variant": {
+            "variants": [
+              {
+                "index": 0,
+                "name": "None"
+              },
+              {
+                "fields": [
+                  {
+                    "type": 97
+                  }
+                ],
+                "index": 1,
+                "name": "Some"
+              }
+            ]
+          }
+        },
+        "params": [
+          {
+            "name": "T",
+            "type": 97
+          }
+        ],
+        "path": [
+          "Option"
+        ]
+      }
+    },
+    {
+      "id": 97,
+      "type": {
+        "def": {
+          "tuple": [
+            6,
+            6,
+            6
+          ]
+        }
+      }
+    },
+    {
+      "id": 98,
+      "type": {
+        "def": {
+          "variant": {
+            "variants": [
+              {
+                "fields": [
+                  {
+                    "type": 99
+                  }
+                ],
+                "index": 0,
+                "name": "Ok"
+              },
+              {
+                "fields": [
+                  {
+                    "type": 77
+                  }
+                ],
+                "index": 1,
+                "name": "Err"
+              }
+            ]
+          }
+        },
+        "params": [
+          {
+            "name": "T",
+            "type": 99
+          },
+          {
+            "name": "E",
+            "type": 77
+          }
+        ],
+        "path": [
+          "Result"
+        ]
+      }
+    },
+    {
+      "id": 99,
+      "type": {
+        "def": {
+          "variant": {
+            "variants": [
+              {
+                "index": 0,
+                "name": "None"
+              },
+              {
+                "fields": [
+                  {
+                    "type": 51
+                  }
+                ],
+                "index": 1,
+                "name": "Some"
+              }
+            ]
+          }
+        },
+        "params": [
+          {
+            "name": "T",
+            "type": 51
+          }
+        ],
+        "path": [
+          "Option"
+        ]
+      }
+    },
+    {
+      "id": 100,
+      "type": {
+        "def": {
+          "variant": {
+            "variants": [
+              {
+                "fields": [
+                  {
+                    "type": 68
+                  }
+                ],
+                "index": 0,
+                "name": "Ok"
+              },
+              {
+                "fields": [
+                  {
+                    "type": 77
+                  }
+                ],
+                "index": 1,
+                "name": "Err"
+              }
+            ]
+          }
+        },
+        "params": [
+          {
+            "name": "T",
+            "type": 68
+          },
+          {
+            "name": "E",
+            "type": 77
+          }
+        ],
+        "path": [
+          "Result"
+        ]
+      }
+    },
+    {
+      "id": 101,
+      "type": {
+        "def": {
+          "variant": {
+            "variants": [
+              {
+                "index": 0,
+                "name": "Confirm"
+              },
+              {
+                "index": 1,
+                "name": "Timeout"
+              }
+            ]
+          }
+        },
+        "path": [
+          "allways_swap_manager",
+          "types",
+          "VoteType"
+        ]
+      }
+    },
+    {
+      "id": 102,
+      "type": {
+        "def": {
+          "variant": {}
+        },
+        "path": [
+          "allways_swap_manager",
+          "SubtensorExtension"
+        ]
+      }
+    }
+  ],
+  "version": 5
+}

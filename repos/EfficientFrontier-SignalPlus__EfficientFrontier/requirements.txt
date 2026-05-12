@@ -1,0 +1,8 @@
+websockets==14.1
+bittensor==9.10.1
+bittensor-cli==9.4.0
+bittensor-wallet==4.0.0
+# bittensor-commit-reveal==0.1.0
+# bt-decode==0.4.0
+cryptography==43.0.3
+loguru==0.7.2

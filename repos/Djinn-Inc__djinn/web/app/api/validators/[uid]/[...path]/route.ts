@@ -1,0 +1,156 @@
+import { NextRequest, NextResponse } from "next/server";
+import { discoverMetagraph, isPublicIp, probeDjinnValidator, DJINN_VALIDATOR_PORT } from "@/lib/bt-metagraph";
+import { getIp, isRateLimited, rateLimitResponse } from "@/lib/rate-limit";
+
+const ALLOWED_PATHS = new Set(["health", "v1/signal", "v1/check", "v1/activity", "v1/attest", "v1/attest/capacity", "v1/telemetry", "v1/metrics/attestations", "v1/metrics/timeseries"]);
+const PURCHASE_RE = /^v1\/signal\/[a-zA-Z0-9_-]+\/purchase$/;
+const REGISTER_RE = /^v1\/signal\/[a-zA-Z0-9_-]+\/register$/;
+const STATUS_RE = /^v1\/signal\/[a-zA-Z0-9_-]+\/status$/;
+const SHARE_INFO_RE = /^v1\/signal\/[a-zA-Z0-9_-]+\/share_info$/;
+const CHECK_ODDS_RE = /^v1\/signal\/[a-zA-Z0-9_-]+\/check-odds$/;
+const MPC_DIAG_RE = /^v1\/signal\/[a-zA-Z0-9_-]+\/mpc_diagnostic$/;
+const ATTEST_CREDITS_RE = /^v1\/attest\/credits\/[a-fA-F0-9x]+$/;
+const MINER_SCORES_RE = /^v1\/miner\/\d+\/scores$/;
+
+function isAllowed(path: string): boolean {
+  return ALLOWED_PATHS.has(path) || PURCHASE_RE.test(path) || REGISTER_RE.test(path) || STATUS_RE.test(path) || SHARE_INFO_RE.test(path) || CHECK_ODDS_RE.test(path) || MPC_DIAG_RE.test(path) || ATTEST_CREDITS_RE.test(path) || MINER_SCORES_RE.test(path);
+}
+
+// Cache the resolved service port per UID so we don't probe on every request.
+// Some validators (e.g. Rizzo on SN103) publish a non-Djinn axon port; we
+// fall back to the standard Djinn port and remember which one worked.
+const portCache = new Map<number, { port: number; at: number }>();
+const PORT_CACHE_TTL = 60_000;
+
+async function resolveValidatorUrl(uid: number): Promise<string | null> {
+  const { nodes } = await discoverMetagraph();
+  const node = nodes.find((n) => n.uid === uid && n.port > 0 && n.ip !== "0.0.0.0" && isPublicIp(n.ip));
+  if (!node) return null;
+
+  const cached = portCache.get(uid);
+  if (cached && Date.now() - cached.at < PORT_CACHE_TTL) {
+    return `http://${node.ip}:${cached.port}`;
+  }
+
+  // If the metagraph axon port already equals the Djinn standard, skip the
+  // probe — most validators are correctly configured and we don't want to
+  // add a 5s round-trip on every proxied request.
+  if (node.port === DJINN_VALIDATOR_PORT) {
+    portCache.set(uid, { port: node.port, at: Date.now() });
+    return `http://${node.ip}:${node.port}`;
+  }
+
+  const probe = await probeDjinnValidator(node.ip, node.port, 5000);
+  const port = probe?.port ?? node.port;
+  portCache.set(uid, { port, at: Date.now() });
+  return `http://${node.ip}:${port}`;
+}
+
+function isValidOrigin(request: NextRequest): boolean {
+  const origin = request.headers.get("origin") ?? "";
+  if (!origin) return true; // same-origin requests omit Origin
+  const allowed = [
+    process.env.NEXT_PUBLIC_APP_URL || "https://djinn.gg",
+    "https://www.djinn.gg",
+    ...(process.env.NODE_ENV !== "production" ? ["http://localhost:3000"] : []),
+  ];
+  return allowed.includes(origin) || origin.endsWith(".djinn-inc-djinn.vercel.app");
+}
+
+async function proxy(
+  request: NextRequest,
+  { params }: { params: { uid: string; path: string[] } },
+) {
+  // Purchase flow fans out to all validators (check + share_info + purchase
+  // = 20+ requests). Use a generous limit to avoid self-blocking.
+  if (isRateLimited("validator-uid-proxy", getIp(request), 200)) {
+    return rateLimitResponse();
+  }
+
+  // CSRF: validate Origin header on state-changing requests
+  if (request.method === "POST" && !isValidOrigin(request)) {
+    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+  }
+
+  const uid = parseInt(params.uid, 10);
+  if (isNaN(uid) || uid < 0 || uid > 65535) {
+    return NextResponse.json({ error: "Invalid UID" }, { status: 400 });
+  }
+
+  const path = params.path.join("/");
+  if (!isAllowed(path)) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
+
+  const baseUrl = await resolveValidatorUrl(uid);
+  if (!baseUrl) {
+    return NextResponse.json(
+      { error: `Validator UID ${uid} not found in metagraph` },
+      { status: 404 },
+    );
+  }
+
+  const qs = request.nextUrl.search; // includes leading "?" if present
+  const target = `${baseUrl}/${path}${qs}`;
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+
+  const MAX_BODY = 1_000_000; // 1 MB
+  const init: RequestInit = { method: request.method, headers };
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    const cl = parseInt(request.headers.get("content-length") || "0");
+    if (cl > MAX_BODY) {
+      return NextResponse.json({ error: "Payload too large" }, { status: 413 });
+    }
+    init.body = await request.text();
+  }
+
+  // Purchase + MPC endpoints need longer timeouts: distributed MPC runs
+  // 10 sequential gate computations across multiple validators (~50s).
+  const isPurchaseOrMPC = path.includes("purchase") || path.includes("mpc/");
+  const timeoutMs = isPurchaseOrMPC ? 120_000 : 30_000;
+
+  // Retry once on connection errors (Vercel cold-start or intermittent connectivity)
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await fetch(target, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+      const body = await res.text();
+      return new NextResponse(body, {
+        status: res.status,
+        headers: {
+          "Content-Type": "application/json",
+        },
+      });
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      const errName = err instanceof Error ? err.name : "unknown";
+      if (attempt === 0 && errName === "TypeError") {
+        // Connection refused: retry once after brief delay
+        console.warn(`[proxy] UID ${uid} connection refused, retrying in 1s...`);
+        await new Promise((r) => setTimeout(r, 1000));
+        continue;
+      }
+      console.error(`[proxy] UID ${uid} -> ${target} failed: ${errName}: ${errMsg}`);
+      return NextResponse.json(
+        {
+          error: "Validator unavailable",
+          detail: errName === "TimeoutError" ? "timeout" : errName === "TypeError" ? "connection_refused" : errName,
+          target: target.replace(/\d+\.\d+\.\d+\.\d+/, "x.x.x.x"),
+          timeout_ms: timeoutMs,
+        },
+        { status: 502 },
+      );
+    }
+  }
+  // Should never reach here
+  return NextResponse.json({ error: "Validator unavailable" }, { status: 502 });
+}
+
+// MPC purchase verification takes 30-90s depending on network conditions
+// and validator count. Vercel Pro allows up to 300s.
+// Set to 120s to accommodate MPC + OT triple generation + retries.
+export const maxDuration = 120;
+
+export const GET = proxy;
+export const POST = proxy;

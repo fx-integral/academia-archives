@@ -1,0 +1,40 @@
+FIRST_DATE = '2025-03-20'
+API_ROOT = 'http://api.investing88.ai'
+RAWGIT_ROOT = 'https://raw.githubusercontent.com/mobiusfund/investing'
+
+PNL_DIR = '/tmp' # empty string disables output
+
+VALI_TAKE = 0.18
+TAO_WEIGHT = 0.18
+
+DD_POWER = 1
+DD_TRIGGER = 0.01
+
+DEC_UID = 0
+DEC_DECAY = 3
+DEC_CUTOFF = 0.03
+DEC1_DECAY = 2
+DEC1_START = 5
+DEC1_CLIFF = 20
+
+CASH_DECAY = 1
+CASH_RESIDUE = 0.01
+
+#DAYS_INIT = 5
+DAYS_FINAL = 30
+DAYS_DELAY = 1
+
+CLIP_OUTLIERS = 2
+CLIP_DEFAULT = 1
+
+RISK_INIT_DTAO = 5
+RISK_INIT_STK = 5
+
+WIN_SIZE_DTAO = 50
+WIN_SIZE_STK = 50
+
+STK_MOO = -120
+STK_MOC = -600
+STK_FEE = 0.002
+STK_BENCH = 'SPY'
+STK_TZ = 'America/New_York'

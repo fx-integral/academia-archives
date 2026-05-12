@@ -1,0 +1,434 @@
+"""
+Validator main orchestrator.
+
+The central coordinator that manages the validator lifecycle:
+- Tournament monitoring
+- State machine transitions
+- Phase handlers (setup, evaluation, reward)
+"""
+
+import asyncio
+import os
+import time
+from pathlib import Path
+from typing import Optional
+
+from nepher_core.api import TournamentAPI, Tournament
+from nepher_core.config import ValidatorConfig, ConfigManager
+from nepher_core.config.loader import load_config
+from nepher_core.wallet import load_wallet, get_hotkey
+from nepher_core.utils.logging import get_logger, setup_logging
+
+from validator.state import (
+    TournamentPeriod,
+    ValidatorStateManager,
+    get_current_period,
+)
+from validator.setup import SetupManager
+from validator.evaluation import EvaluationOrchestrator
+from validator.reward import WeightSetter
+
+logger = get_logger(__name__)
+
+
+class ValidatorOrchestrator:
+    """
+    Main validator orchestrator.
+    
+    Manages the complete validator lifecycle:
+    1. Monitor for active tournaments
+    2. Run setup during submit window
+    3. Evaluate agents during evaluation period
+    4. Set weights during reward period
+    5. When the API reports no active tournament, burn on UID 0 on the same cadence
+       as other idle phases while continuing to poll for the next tournament
+
+    Supports two run modes controlled by ``config.mode``:
+    - **gpu** (default): full behaviour — setup, evaluation, reward, and
+      hourly burn when not in reward period (same as CPU).
+    - **cpu**: lightweight — reward (set-weights) and hourly burn only;
+      skips setup and evaluation entirely.
+    """
+
+    # Polling intervals (seconds)
+    NO_TOURNAMENT_INTERVAL = 300  # 5 minutes
+    CONTEST_INTERVAL = 60  # 1 minute
+    REVIEW_INTERVAL = 60  # 1 minute
+    COMPLETED_INTERVAL = 300  # 5 minutes
+    ERROR_INTERVAL = 60  # 1 minute
+    BURN_INTERVAL = 1800  # 30 minutes — cadence for UID-0 burns in CPU mode
+
+    def __init__(
+        self,
+        config: ValidatorConfig,
+        config_path: Path,
+        mode_override: Optional[str] = None,
+    ):
+        """
+        Initialize validator orchestrator.
+        
+        Args:
+            config: Validator configuration
+            config_path: Path to the user config file (for hot-reloading)
+            mode_override: CLI mode override, preserved across reloads
+        """
+        self.config = config
+        self._config_path = config_path
+        self._mode_override = mode_override
+        self.mode = config.mode  # "gpu" or "cpu"
+        
+        # Load wallet and get hotkey
+        wallet = load_wallet(
+            name=config.wallet.name,
+            hotkey=config.wallet.hotkey,
+            path=config.wallet.path,
+        )
+        self.validator_hotkey = get_hotkey(wallet)
+        
+        self.api = TournamentAPI(
+            api_key=config.api_key,
+            base_url=config.api_url,
+            wallet=wallet,
+        )
+        
+        # State manager
+        self.state = ValidatorStateManager()
+        
+        # Phase handlers (initialized lazily)
+        self._setup_manager: Optional[SetupManager] = None
+        self._evaluation_orchestrator: Optional[EvaluationOrchestrator] = None
+        self._weight_setter: Optional[WeightSetter] = None
+        
+        # Current tournament
+        self._current_tournament: Optional[Tournament] = None
+        # Throttle UID-0 burns when API reports no active tournament (see _main_loop)
+        self._last_no_tournament_burn_monotonic: Optional[float] = None
+
+    def _reload_config(self) -> None:
+        """
+        Re-read config files from disk so that changes to common_config.yaml
+        (lab_version, sim_version, eval_repo_url, etc.) are picked up
+        automatically when a new tournament starts.
+        """
+        logger.info("Reloading configuration from disk...")
+        try:
+            new_config = load_config(self._config_path, ValidatorConfig)
+            if self._mode_override is not None:
+                new_config.mode = self._mode_override
+
+            old_isaac = self.config.isaac
+            old_paths = self.config.paths
+            new_isaac = new_config.isaac
+            new_paths = new_config.paths
+
+            changes: list[str] = []
+            if old_isaac.lab_version != new_isaac.lab_version:
+                changes.append(f"lab_version: {old_isaac.lab_version} -> {new_isaac.lab_version}")
+            if old_isaac.sim_version != new_isaac.sim_version:
+                changes.append(f"sim_version: {old_isaac.sim_version} -> {new_isaac.sim_version}")
+            if old_paths.eval_repo_url != new_paths.eval_repo_url:
+                changes.append(f"eval_repo_url: {old_paths.eval_repo_url} -> {new_paths.eval_repo_url}")
+
+            if changes:
+                for c in changes:
+                    logger.info(f"  Config changed — {c}")
+            else:
+                logger.info("  No config changes detected")
+
+            self.config = new_config
+            self.mode = new_config.mode
+
+            self._setup_manager = None
+            self._evaluation_orchestrator = None
+            self._weight_setter = None
+            logger.info("Configuration reloaded; phase handlers will be re-initialized")
+        except Exception as e:
+            logger.error(f"Failed to reload config — continuing with previous config: {e}")
+
+    async def run(self) -> None:
+        """
+        Run the main validator loop.
+        
+        This is the primary entry point that handles all tournament phases.
+        """
+        logger.info("=" * 60)
+        logger.info("Nepher Validator Starting")
+        logger.info(f"Mode: {self.mode.upper()}")
+        logger.info(f"Validator Hotkey: {self.validator_hotkey}")
+        logger.info(f"Network: {self.config.subnet.network}")
+        logger.info(f"Subnet UID: {self.config.subnet.subnet_uid}")
+        logger.info("=" * 60)
+        
+        try:
+            await self._main_loop()
+        finally:
+            await self.api.close()
+
+    async def _main_loop(self) -> None:
+        """Main validator loop."""
+        logger.info(
+            "Entering main loop",
+            api_url=self.config.api_url,
+            poll_interval=f"{self.NO_TOURNAMENT_INTERVAL}s",
+        )
+
+        iteration = 0
+        while True:
+            iteration += 1
+            try:
+                # 1. Check for active tournament
+                logger.info(f"[iter {iteration}] Checking for active tournament...")
+                tournament = await self.api.get_active_tournament()
+                self._current_tournament = tournament
+                
+                if tournament is None:
+                    if self._weight_setter is None:
+                        self._weight_setter = WeightSetter(self.config, self.api)
+                    now = time.monotonic()
+                    if (
+                        self._last_no_tournament_burn_monotonic is None
+                        or (now - self._last_no_tournament_burn_monotonic)
+                        >= self.BURN_INTERVAL
+                    ):
+                        logger.info(
+                            "No active tournament — burning 100% on UID 0 "
+                            f"(idle burn cadence: {self.BURN_INTERVAL}s)"
+                        )
+                        await self._weight_setter.burn(
+                            tournament_id=None,
+                            phase="public",
+                        )
+                        self._last_no_tournament_burn_monotonic = now
+                    else:
+                        secs = self.BURN_INTERVAL - (
+                            now - self._last_no_tournament_burn_monotonic
+                        )
+                        logger.debug(
+                            f"No active tournament — next UID-0 burn in ~{int(secs)}s "
+                            f"(polling API every {self.NO_TOURNAMENT_INTERVAL}s)"
+                        )
+                    await asyncio.sleep(self.NO_TOURNAMENT_INTERVAL)
+                    continue
+                
+                self._last_no_tournament_burn_monotonic = None
+                
+                # Detect new or changed tournament — reload config so
+                # common_config updates take effect, and reset setup state
+                # so the eval repo is freshly cloned.
+                if self.state.check_tournament_change(tournament.id):
+                    logger.info(f"New tournament detected: {tournament.id}")
+                    self._reload_config()
+                    self.state.reset()
+                self.state.track_tournament(tournament.id)
+                
+                # 2. Determine current period
+                current_time = int(time.time())
+                period = get_current_period(tournament, current_time)
+                logger.info(
+                    f"[iter {iteration}] Tournament {tournament.id} — "
+                    f"period={period.name}, status={tournament.status}"
+                )
+    
+                # 3. Detect period transitions
+                if self.state._last_period is not None and self.state._last_period != period:
+                    self.state.on_period_change(self.state._last_period, period)
+                self.state._last_period = period
+                
+                # 4. Handle state transitions
+                await self._handle_period(tournament, period)
+                
+            except Exception as e:
+                logger.error(
+                    f"[iter {iteration}] Main loop error: {e}",
+                    exc_info=True,
+                )
+                await asyncio.sleep(self.ERROR_INTERVAL)
+
+    async def _handle_period(
+        self,
+        tournament: Tournament,
+        period: TournamentPeriod,
+    ) -> None:
+        """
+        Handle current tournament period.
+        
+        Behaviour depends on ``self.mode``:
+        - **gpu** (default): full lifecycle — setup, evaluation, reward, idle waits.
+        - **cpu**: reward + hourly burn only; evaluation/setup are skipped.
+        
+        Args:
+            tournament: Current tournament
+            period: Current period
+        """
+        match period:
+            # ── Shared across both modes ─────────────────────────────
+            case TournamentPeriod.NO_TOURNAMENT:
+                self.state.reset()
+                await asyncio.sleep(self.NO_TOURNAMENT_INTERVAL)
+
+            case TournamentPeriod.REWARD:
+                await self._run_reward(tournament)
+
+            # ── CPU-only: burn on UID 0 once per hour ────────────────
+            case _ if self.mode == "cpu":
+                await self._hourly_burn(tournament)
+
+            # ── GPU-only handlers (full behaviour) ───────────────────
+            # When not in reward, GPU also burns on UID 0 hourly (same as CPU).
+            case TournamentPeriod.CONTEST:
+                logger.debug("Contest period - burning then waiting...")
+                await self._hourly_burn(tournament)
+
+            case TournamentPeriod.PUBLIC_EVALUATION:
+                if not self.state.is_setup_complete:
+                    await self._run_setup(tournament)
+                await self._run_evaluation(tournament, phase="public")
+
+            case TournamentPeriod.QUIET_ZONE:
+                eval_start = tournament.evaluation_start_time
+                logger.info(
+                    "Quiet zone — resetting setup for private phase. "
+                    f"Private evaluation starts at {eval_start or 'unknown'}"
+                )
+                if self._evaluation_orchestrator:
+                    self._evaluation_orchestrator.reset_stats()
+                if self._setup_manager:
+                    self._setup_manager.reset()
+                self.state.reset()
+                await self._hourly_burn(tournament)
+
+            case TournamentPeriod.SUBMIT_WINDOW:
+                logger.debug("Submit window - burning then waiting...")
+                await self._hourly_burn(tournament)
+                    
+            case TournamentPeriod.EVALUATION:
+                if not self.state.is_setup_complete:
+                    await self._run_setup(tournament)
+                await self._run_evaluation(tournament, phase="private")
+                
+            case TournamentPeriod.REVIEW:
+                logger.info("Review period - burning then waiting...")
+                await self._hourly_burn(tournament, phase="private")
+
+            case TournamentPeriod.COMPLETED:
+                logger.info("Tournament completed")
+                self.state.reset()
+                await self._hourly_burn(tournament)
+
+    async def _run_setup(self, tournament: Tournament) -> None:
+        """Run setup phase.
+
+        Always reloads configuration from disk so that any changes to
+        common_config.yaml (eval_repo_url, lab_version, etc.) are picked
+        up before the fresh setup.
+        """
+        self._reload_config()
+
+        self._setup_manager = SetupManager(self.config, self.api)
+        
+        try:
+            await self._setup_manager.run_setup(tournament.id)
+            self.state.mark_setup_complete(tournament.id)
+            
+            # Load task config into validator config
+            task_config_path = self.config.paths.workspace / "task_config.yaml"
+            if task_config_path.exists():
+                config_manager = ConfigManager()
+                self.config.task_config = config_manager.load_task_config(task_config_path)
+                
+        except Exception as e:
+            logger.error(f"Setup failed: {e}")
+            raise
+
+    async def _run_evaluation(self, tournament: Tournament, phase: str = "private") -> None:
+        """Run evaluation loop for the given phase. Burns on UID 0 periodically like CPU validator."""
+        if self._evaluation_orchestrator is None:
+            self._evaluation_orchestrator = EvaluationOrchestrator(
+                config=self.config,
+                api=self.api,
+                validator_hotkey=self.validator_hotkey,
+            )
+        
+        if self._weight_setter is None:
+            self._weight_setter = WeightSetter(self.config, self.api)
+        
+        expected_period = (
+            TournamentPeriod.PUBLIC_EVALUATION if phase == "public"
+            else TournamentPeriod.EVALUATION
+        )
+        
+        async def is_evaluation_period() -> bool:
+            fresh = await self.api.get_active_tournament()
+            return get_current_period(fresh) == expected_period
+        
+        logger.info(f"Starting {phase} evaluation loop (burn every {self.BURN_INTERVAL}s)")
+        await self._evaluation_orchestrator.run_evaluation_loop(
+            tournament=tournament,
+            is_evaluation_period_fn=is_evaluation_period,
+            phase=phase,
+            burn_callback=lambda: self._weight_setter.burn(tournament_id=tournament.id, phase=phase),
+            burn_interval_sec=self.BURN_INTERVAL,
+        )
+
+    async def _hourly_burn(
+        self,
+        tournament: Optional[Tournament] = None,
+        phase: str = "public",
+    ) -> None:
+        """
+        Burn on UID 0 once (with optional 1% leader allocation), then sleep.
+
+        When *tournament* is provided the weight setter will attempt to
+        allocate 1% of emissions to the current leaderboard leader.
+
+        Args:
+            tournament: Current tournament (if any).
+            phase: Leaderboard phase to query for the leader.
+        """
+        if self._weight_setter is None:
+            self._weight_setter = WeightSetter(self.config, self.api)
+
+        await self._weight_setter.burn(
+            tournament_id=tournament.id if tournament else None,
+            phase=phase,
+        )
+
+        logger.info(f"Burn complete. Next burn in ~{self.BURN_INTERVAL}s")
+        await asyncio.sleep(self.BURN_INTERVAL)
+
+    async def _run_reward(self, tournament: Tournament) -> None:
+        """Run reward phase."""
+        if self._weight_setter is None:
+            self._weight_setter = WeightSetter(self.config, self.api)
+        
+        async def is_reward_period() -> bool:
+            """Re-fetch tournament each check so schedule changes are detected."""
+            fresh = await self.api.get_active_tournament()
+            return get_current_period(fresh) == TournamentPeriod.REWARD
+        
+        await self._weight_setter.run_reward(
+            tournament=tournament,
+            is_reward_period_fn=is_reward_period,
+        )
+
+
+async def run_validator(config_path: Path, mode: Optional[str] = None) -> None:
+    """
+    Run the validator with the given configuration.
+    
+    Args:
+        config_path: Path to validator configuration file
+        mode: Optional run-mode override ("cpu" or "gpu").
+              When provided, takes precedence over the config file value.
+    """
+    # Load configuration
+    config = load_config(config_path, ValidatorConfig)
+    
+    # CLI flag overrides config file value
+    if mode is not None:
+        config.mode = mode
+    
+    # Create and run orchestrator
+    orchestrator = ValidatorOrchestrator(config, config_path, mode_override=mode)
+    await orchestrator.run()
+

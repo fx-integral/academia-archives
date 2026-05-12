@@ -1,0 +1,187 @@
+# TAOHash Validator Setup
+
+This guide will walk you through setting up and running a TAOHash validator on the Bittensor network.
+
+TAOHash enables Bitcoin miners to contribute hashpower to a collective mining pool. All miners direct their hashpower to a single subnet pool, where validators evaluate and rank miners based on the share value they generate.
+
+Validators are rewarded in TAOHash's subnet-specific (alpha) token on the Bittensor blockchain, which represents *stake* in the subnet. This alpha stake can be exited from the subnet by unstaking it to TAO (Bittensor's primary currency).
+
+**Share value** is the difficulty at which the miner solved a blockhash. The higher the difficulty solved, the more incentive a miner gets during *emissions*, the process by which Bittensor periodically distributes tokens to participants based on the Yuma Consensus algorithm. In general, the higher the hashpower, the higher the share value submitted.
+
+See also:
+
+- [Introduction to TAOHash](../README.md)
+- [Introduction to Bittensor](https://docs.learnbittensor.org/learn/introduction)
+- [Yuma Consensus](https://docs.learnbittensor.org/yuma-consensus/)
+- [Emissions](https://docs.learnbittensor.org/emissions/)
+
+> **Deployment note:** We have now shifted to Docker + Watchtower stack for validators. This will ensure that the validator code is always up-to date whenever a new update rolls out. 
+
+## Prerequisites
+
+- A Bittensor wallet with coldkey and hotkey, registered on TAOHash, with sufficient stake weight.
+- Subnet proxy credentials (provided by subnet maintainers)
+- Docker Engine 24+ and Docker Compose
+
+Bittensor Docs:
+
+- [Requirements for Validation](https://docs.learnbittensor.org/validators/#requirements-for-validation)
+- [Validator registration](./validators/index.md#validator-registration)
+- [Wallets, Coldkeys and Hotkeys in Bittensor](https://docs.learnbittensor.org/getting-started/wallets)
+
+## Setup Steps
+
+### Get Subnet Proxy Credentials
+
+Contact the subnet owner via the [TAOHash Discord channel](https://discord.gg/sz9MDMm5sb) to receive **credentials for all active pools**. 
+Currently, you will receive two pairs of URL/token values:
+
+- **BTC Proxy API URL / Token** – used to fetch Bitcoin share values
+- **BCH Proxy API URL / Token** – used to fetch Bitcoin Cash share values
+
+These credentials allow your validator to evaluate miners based on their mining contributions for both pools.
+
+### Bittensor Wallet Setup
+
+Check your wallet, or create one if you have not already.
+
+Bittensor Documentation: [Creating/Importing a Bittensor Wallet
+](https://docs.learnbittensor.org/working-with-keys)
+
+### List wallet
+```bash
+btcli wallet list
+```
+```console
+Wallets
+├── Coldkey YourColdkey  ss58_address 5F...
+│   ├── Hotkey YourHotkey  ss58_address
+│   │   5E...
+```
+
+### Check your wallet's balance
+
+```bash
+btcli wallet balance \
+--wallet.name <your wallet name> \
+--network finney
+```
+
+```console
+                             Wallet Coldkey Balance
+                                  Network: finney
+
+    Walle…   Coldkey Address                             Free…   Stake…   Total…
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    realm…   5DvSxCaMW9tCPBS4TURmw4hDzXx5Bif51jq4baC6…   …       …        …
+
+
+
+    Total…                                               …       …        …
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+### Register on TAOHash, subnet 14 on Bittensor mainnet ("finney")
+
+```bash
+btcli subnet register --netuid 14 --wallet.name YOUR_WALLET --wallet.hotkey YOUR_HOTKEY --network finney
+```
+
+### Clone Repository and Install
+
+```bash
+# Clone the repository
+git clone https://github.com/latent-to/taohash.git
+cd taohash
+
+# Create virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# Install the package
+pip install -e .
+```
+
+### Configuration
+
+Create a `.env` file in the root directory:
+
+```bash
+cd taohash
+cp .env.validator.example .env
+nano .env
+```
+
+Update the `.env` file with your credentials:
+```env
+# Bittensor Configuration
+NETUID=14
+SUBTENSOR_NETWORK=finney
+BT_WALLET_NAME="your_wallet_name"
+BT_WALLET_HOTKEY="your_hotkey_name"
+BT_LOGGING_INFO=1
+
+# Subnet Proxy Configuration (from subnet owner)
+# One set per supported coin (currently BTC and BCH)
+BTC_POOL_API_URL="http://proxy.taohash.com:8888"
+BTC_POOL_API_TOKEN="your-api-token-here"
+
+BCH_POOL_API_URL="http://proxy.taohash-bch.com:8888"
+BCH_POOL_API_TOKEN="your-api-token-here"
+```
+
+### Running the Validator
+
+### Using Docker (Recommended)
+
+1. Ensure you have Docker and Docker Compose installed in your operating system. 
+You can get more details here: https://docs.docker.com/engine/install/
+
+2. Ensure you have correctly set-up the environment variables in the root directory (the previous section).
+
+3. Start the validator
+```bash
+docker compose down && docker compose pull && docker compose up -d && docker compose logs -f 
+```
+
+4. The validator should start and you should see all the info logs. 
+Verify it started to correctly score miners. 
+
+
+## Important Parameters
+
+- `netuid`: Set to 14 for TAOHash subnet
+- `subtensor.network`: Set to `finney` for mainnet
+- `wallet.name`: Your Bittensor wallet name
+- `wallet.hotkey`: Your wallet's hotkey
+
+## Validator Evaluation Process
+
+1. Validators fetch miner statistics from **each configured coin pool** every 5 minutes (25 blocks)
+2. They calculate share values per coin, aggregate them, and update miner scores
+3. Weights are set every `tempo` blocks (every epoch) based on moving averages
+4. All validators use the same proxy endpoint for consistent evaluation
+
+## Troubleshooting
+
+**Cannot connect to subnet proxy**
+- Verify the `<COIN>_POOL_API_URL` and `<COIN>_POOL_API_TOKEN` values are correct for *each* coin (BTC, BCH)
+- Check that the provided API token hasn’t expired or been revoked
+- Ensure network connectivity to the proxy host/port in your environment
+
+**No miner data received**
+- Confirm miners are actively mining by checking the [TAOHash leaderboard](https://taohash.com/leaderboard)
+- Check BTC and BCH proxy logs independently for issues with data collection
+- Verify network connectivity between your validator and every proxy endpoint
+
+**Wallet issues**
+- Ensure wallet is properly created and registered (see [Bittensor Wallet Setup](#bittensor-wallet-setup) above or [Bittensor wallet documentation](https://docs.learnbittensor.org/working-with-keys/))
+- Check that wallet path is correct
+- Verify you're using the correct network
+
+## Support
+
+- GitHub Issues: https://github.com/latent-to/taohash/issues
+- Bittensor Discord: Subnet 14 channel
+
+Happy validating!

@@ -1,0 +1,17 @@
+#!/bin/bash
+
+set -euo pipefail
+
+SERVICE_NAME=subvortex-validator-redis
+
+echo "🛑 Stopping $SERVICE_NAME..."
+
+# Stop the service
+echo "🔍 Checking $SERVICE_NAME..."
+if pm2 describe "$SERVICE_NAME" >/dev/null 2>&1; then
+    echo "🛑 $SERVICE_NAME is currently running — stopping it..."
+    pm2 stop "$SERVICE_NAME"
+    echo "✅ $SERVICE_NAME stopped successfully."
+else
+    echo "ℹ️ $SERVICE_NAME is not running. No action needed."
+fi

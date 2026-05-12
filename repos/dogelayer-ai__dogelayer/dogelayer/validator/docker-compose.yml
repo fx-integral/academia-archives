@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  dogelayer-validator:
+    image: coinflow/dogelayer-validator:latest
+    container_name: dogelayer-validator
+    restart: unless-stopped
+    command: [
+      "python", "-m", "dogelayer.validator.validator",
+      "--netuid", "${NETUID}",
+      "--subtensor.network", "${SUBTENSOR_NETWORK}",
+      "--wallet.name", "${BT_WALLET_NAME}",
+      "--wallet.hotkey", "${BT_WALLET_HOTKEY}",
+      # The following parameters are ONLY for subnet owner to publish pool info
+      # Regular validators should NOT set these in .env file
+      "--pool.domain", "${PROXY_DOMAIN:-}",
+      "--pool.port", "${PROXY_PORT:-3331}",
+      "--pool.high_diff_port", "${PROXY_HIGH_DIFF_PORT:-3332}",
+      "--pool.username", "${PROXY_USERNAME:-}",
+      "--pool.password", "${PROXY_PASSWORD:-x}",
+      "--pool.proxy_api_token", "${PROXY_API_TOKEN:-}",
+      "--logging.level", "info"
+    ]
+    env_file:
+      - .env
+    environment:
+      - RECOVERY_FILE_PATH=/app/data
+      - RECOVERY_FILE_NAME=validator_state.json
+      - LOGGING_LEVEL=info
+    volumes:
+      - ~/.bittensor:/root/.bittensor
+      - ./data:/app/data
+      - ./config:/app/config
+
+    network_mode: host
+
+volumes:
+  validator-data:

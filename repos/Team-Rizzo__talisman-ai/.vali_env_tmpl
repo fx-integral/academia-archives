@@ -1,0 +1,21 @@
+# LLM Analysis
+# Required for validating miner submissions (tokens/relevance and sentiment analysis)
+MODEL=Qwen/Qwen3-32B
+API_KEY=
+LLM_BASE=https://llm.chutes.ai/v1
+
+# Validator API Configuration (API v2)
+# Base URL for the miner API (API v2 endpoints: /v2/validation, /v2/validation_result, /v2/scores)
+MINER_API_URL=https://talisman.rizzo.network/api
+# HTTP timeout in seconds for API requests
+BATCH_HTTP_TIMEOUT=30.0
+# Interval in seconds between polling for new validations
+VALIDATION_POLL_SECONDS=10
+# Blocks between fetching scores from /v2/scores endpoint (default: 100 blocks, ~20 minutes)
+SCORES_BLOCK_INTERVAL=100
+# Max concurrent validation threads making LLM calls.
+VALIDATION_MAX_WORKERS=2
+# How long (seconds) to cache LLM classification results for identical post text.
+LLM_CACHE_TTL=300
+# Maximum number of cached classification results held in memory.
+LLM_CACHE_MAX_SIZE=1024

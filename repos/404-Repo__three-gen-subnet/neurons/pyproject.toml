@@ -1,0 +1,142 @@
+[tool.poetry]
+name = "neurons"
+version = "0.1.0"
+description = ""
+authors = ["Maxim Bladyko <max@404.xyz>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.13"
+bittensor = { version = "9.0.0" }
+bittensor-wallet = { version = "3.0.3" }
+pybase64 = { version = "1.4.0" }
+pyspz = { git = "https://github.com/404-Repo/spz.git", tag = "0.1" }
+mnemonic = "^0.21"
+
+[tool.poetry.group.dev.dependencies]
+poetry = { version = "1.8.3" }
+poethepoet = { version = "0.31.1", extras = ["poetry_plugin"] }
+bandit = { version = "1.8.0" }
+black = { version = "24.10.0" }
+mypy = { version = "1.15.0" }
+ruff = { version = "0.8.1" }
+time-machine = { version = "2.16.0" }
+types-requests = { version = "2.32.*" }
+pytest-asyncio = { version = "0.24.0" }
+pytest-httpserver = { version = "1.1.0" }
+
+[build-system]
+requires = ["poetry-core", "setuptools", "wheel"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+target-version = ['py311']
+line-length = 120
+include = '\.pyi?$'
+exclude = '''
+/(
+    \.git
+  | \.pytest_cache
+  | \.idea
+  | \.venv
+  | \.vscode
+  | subtensor_mock.py
+)/
+'''
+
+[tool.ruff]
+target-version = "py311"
+cache-dir = ".reports/ruff_cache"
+line-length = 120
+src = ["sources"]
+namespace-packages = ["sources"]
+fix = true
+output-format = "full"
+include = ["*.py"]
+exclude = [
+    ".*",
+    "tests/",
+    "**/subtensor_mock.py"
+]
+
+[tool.ruff.lint]
+select = [
+    "E", # pycodestyle
+    "F", # pyflakes
+    "UP", # pyupgrade
+    "I", # isort
+    "S", # flake8-bandit
+    "B", # flake8-bugbear
+    "Q", # flake8-quotes
+    "ASYNC", # flake8-async
+    "PTH", # flake8-use-pathlib
+]
+fixable = ["ALL"]
+unfixable = []
+per-file-ignores = { "tests/**/*.py" = ["S101"], "**/subtensor_mock.py" = ["ALL"] }
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = []
+
+[tool.ruff.lint.flake8-quotes]
+docstring-quotes = "double"
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+lines-after-imports = 2
+
+[tool.bandit]
+skips = ["B104"]
+exclude_dirs = [
+    "./.*/**",
+    "./tests/**",
+    "**/subtensor_mock.py",
+]
+
+[tool.mypy]
+cache_dir = ".reports/mypy_cache/"
+ignore_missing_imports = true
+disallow_incomplete_defs = true
+disallow_untyped_defs = true
+warn_unused_ignores = false
+warn_return_any = true
+warn_no_return = false
+warn_unreachable = true
+strict_equality = true
+warn_redundant_casts = true
+exclude = [
+    '.venv/.*',
+]
+
+[[tool.mypy.overrides]]
+module = ["tests.test_validator.subtensor_mock"]
+ignore_errors = true
+
+
+[[tool.mypy.overrides]]
+module = [
+    # place modules to skip here
+]
+ignore_errors = true
+
+[tool.pytest.ini_options]
+cache_dir = ".reports/pytest_cache"
+minversion = "6.0"
+addopts = "-ra -v --asyncio-mode=auto"
+testpaths = ["tests", ]
+pythonpath = ["."]
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.poe]
+poetry_command = ""
+
+[tool.poe.tasks.run-check]
+help = "Run tests and try fix format"
+ignore_fail = "return_non_zero"
+sequence = [
+    { cmd = "ruff check ." },
+    { cmd = "black ." },
+    { cmd = "bandit . -rq -c pyproject.toml" },
+    { cmd = "mypy --junit-xml .reports/mypy-junit-report.xml ." },
+    { cmd = "pytest" },
+]
