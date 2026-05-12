@@ -1,0 +1,159 @@
+# Copyright © 2025 Mobius Fund
+
+import os, math, datetime
+import json, requests
+import bittensor as bt
+import pandas as pd
+from .constants import *
+st = bt.Subtensor('finney')
+
+def update():
+    init = 'ETF/__init__.py'
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+    lv = open(f'{root}/{init}').read()
+    rv = requests.get(f'{RAWGIT_ROOT}/refs/heads/main/{init}').text
+    lv, rv = [eval(v.split('\n')[0].split('=')[1]) for v in [lv, rv]]
+    ln, rn = [sum(int(n) * 100 ** i for i, n in enumerate(v.split('.')[::-1])) for v in [lv, rv]]
+    if ln >= rn: return
+    print(f'Updating... {lv} -> {rv}')
+    cmd = f'cd {root}; git pull && pip install -e .'
+    err = os.system(cmd)
+    if err: print(f'Update failed. Please manually update using command:\n{cmd}')
+    else: print('Update succeeded')
+    return err
+
+def score1(netuid=NETUID):
+    sc = pd.DataFrame(columns=['uid', 'hotkey', 'coldkey', 'count', 'index', 'block', 'days', 'balance', 'score'])
+    bl = requests.get(COLDKEY_BL).json()
+    ckblk = [{d['address']:d['fromBlock'] for d in requests.get(f'{INDEX_API}/{i}').json()['delegators']
+        if d['type'] == 'Staking' and d['address'] not in bl} for i in INDEX_IDS]
+    ckbal = {}
+
+    global st
+    bk = 0
+    while not bk:
+        try: bk = st.block
+        except: st, bk = bt.Subtensor('finney'), 0
+    mg = st.get_metagraph_info(netuid)
+    nn = st.all_subnets()
+
+    def scoring(bal, blk):
+        return bal ** GAMMA * (1 + KAPPA * math.log(1 + min((mg.block - blk) / 7200, DMAX) / DNORM)) if mg.block > blk else float('nan')
+
+    def balance(ck):
+        return sum([float(s.stake) * float(nn[s.netuid].price) for s in st.get_stake_info_for_coldkey(ck) if s.netuid])
+
+    for ck in set(mg.coldkeys): ckbal[ck] = balance(ck)
+    for i in range(mg.num_uids):
+        hk, ck = mg.hotkeys[i], mg.coldkeys[i]
+        try:
+            idx = [ck in kk for kk in ckblk].index(True)
+            blk = max(ckblk[idx][ck], FIRST_BLOCK)
+        except: idx, blk = [float('nan')] * 2
+        days, bal = (mg.block - blk) // 7200 if mg.block > blk else float('nan'), ckbal[ck]
+        sc.loc[len(sc)] = i, hk, ck, 0, idx, blk, days, bal, scoring(bal, blk)
+
+    sc['count'] = sc.join(sc.groupby('coldkey').count()['uid'], 'coldkey', lsuffix='_')['uid']
+    sc['score'] /= sc['count']
+
+    ir = INDEX_RATIO if len(INDEX_RATIO) == len(INDEX_IDS) else []
+    scz = sc['score'].sum()
+    for i in range(len(ir)):
+        sci = sc[sc['index'] == i]['score'].sum()
+        if sci: sc.loc[sc['index'] == i, 'score'] *= ir[i] * scz / sci
+
+    tt = sc[~sc['index'].isna()]['balance'].sum()
+    it = [sc[sc['index'] == i]['balance'].sum() for i in range(len(INDEX_IDS))]
+    ic = [len(sc[sc['index'] == i]) for i in range(len(INDEX_IDS))]
+
+    sc['balance'] = sc['balance'].round(2)
+    sc.loc[sc['score'].isna(), 'score'] = 0.0
+    #if not sc['score'].sum(): sc.loc[sc['uid'] == OWNER_UID, 'score'] = 1
+    try: ratio = json.loads(requests.get(IMM_RATIO).json())
+    except: ratio = [1.0, 0.0, 0.0]
+    if not ratio[1]: sc['score'] = 0.0
+
+    for j in 'index', 'block', 'days':
+        sc[j] = sc[j].astype(object)
+        sc.loc[~sc[j].isna(), j] = sc[~sc[j].isna()][j].astype(int)
+    il = str(INDEX_LABEL).replace("'", '')
+    ir = str([f'{i:.2f}' for i in ir]).replace("'", '')
+    it = str([f'{i:.2f}' for i in it]).replace("'", '')
+
+    print('ETF:')
+    print(sc.sort_values(['score', 'block'], na_position='first').to_string(index=False))
+    print(f'index label: {il}')
+    print(f'index ratio: {ir}')
+    print(f'index total: {it}, total: {tt:.2f} TAO')
+    print(f'miner count: {ic}, total: {sum(ic)}')
+    return sc
+
+def score2(sc, netuid=NETUID):
+    print('IMM:')
+    jj = ['wallet', 'asset', 'type', 'tao']
+    try:
+        ratio = json.loads(requests.get(IMM_RATIO).json())
+        window = json.loads(requests.get(IMM_WINDOW).json())
+        date = dtms(days=-window)
+        df = pd.DataFrame(json.loads(requests.get(f'{IMM_DATA}/{date}').json()))[jj]
+    except: return sc
+    df.columns = [*df.columns[:-1], 'volume']
+
+    kk = sc[sc['index'].isna()]['coldkey'].unique()
+    d1 = df[(df['type'] == 1) & df['wallet'].isin(kk)].groupby(jj[:-1]).sum().reset_index()
+    d2 = df[(df['type'] == 2) & df['wallet'].isin(kk)].groupby(jj[:-1]).sum().reset_index()
+    print(d1.to_string(index=False))
+
+    nn = st.all_subnets()
+    d3 = pd.DataFrame(columns=jj)
+    for ck in d2['wallet'].unique():
+        sn = d2[d2['wallet'] == ck]['asset'].unique()
+        for s in st.get_stake_info_for_coldkey(ck):
+            if s.netuid not in sn: continue
+            d3.loc[len(d3)] = ck, s.netuid, 2, float(s.stake) * float(nn[s.netuid].price)
+    d3 = d3.groupby(jj[:-1]).sum().reset_index()
+
+    d2 = d2.join(d3.set_index(jj[:-1])['tao'], jj[:-1])
+    d2.columns = [*d2.columns[:-1], 'stake']
+    d2.loc[d2['stake'].isna(), 'stake'] = 0.0
+    print(d2.to_string(index=False))
+
+    if len(d2): d2['volume'] = d2[['volume', 'stake']].min(1)
+    d2 = d2.drop('stake', axis=1, errors='ignore')
+
+    df = pd.concat([d1, d2])
+    df = df.groupby(jj[:1]).sum().reset_index().drop(jj[1:-1], axis=1)
+    df.columns = [*df.columns[:-1], 'total']
+
+    df = sc.join(df.set_index(jj[:1])['total'], 'coldkey')
+    df = df.drop(sc.columns[-4:], axis=1).dropna(subset='total')
+    df['score'] = df['total']
+
+    if not ratio[1]: sc['score'] = 0.0
+    if not ratio[2]: df['score'] = 0.0
+    if ratio[1] and ratio[2]:
+        dfz = sc['score'].sum() * ratio[2] / ratio[1]
+        if dfz and df['score'].sum():
+            df['score'] = dfz * df['score'] / df['score'].sum()
+    df['score'] /= df['count']
+
+    sc = sc.join(df.set_index('uid')['score'], 'uid', rsuffix='2')
+    sc.loc[~sc['score2'].isna(), 'score'] = sc['score2']
+    sc = sc.drop('score2', axis=1)
+    print(df.sort_values('score').to_string(index=False))
+    print(f'imm window: {window} days')
+
+    sc.loc[sc['uid'] == BRN_UID, 'score'] = sc['score'].sum() / sum(ratio[1:]) * ratio[0] if sum(ratio[1:]) else 1.0
+    print('BRN:')
+    print(sc[sc['uid'] == BRN_UID].to_string(index=False))
+    print(f'incentive ratio: {ratio}')
+    return sc
+
+def score(netuid=NETUID): return score2(score1(netuid), netuid)['score'].values
+
+def dtms(**kw): return (datetime.datetime.utcnow() + datetime.timedelta(**kw)).isoformat(' ', 'milliseconds')
+
+def concat(ls, *kv, **kw):
+    ds = [df for df in ls if len(df)]
+    return _concat(ds, *kv, **kw) if len(ds) else ls[0].copy()
+pd.concat, _concat = concat, pd.concat

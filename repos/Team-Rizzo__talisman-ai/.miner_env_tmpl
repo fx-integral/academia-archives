@@ -1,0 +1,21 @@
+# LLM Analysis
+MODEL=Qwen/Qwen3-32B
+API_KEY=
+LLM_BASE=https://llm.chutes.ai/v1
+
+# X/Twitter API Configuration
+X_BEARER_TOKEN=
+X_API_BASE=https://api.twitter.com/2
+
+# Miner API Configuration (API v2)
+# Base URL for the miner API (API v2 endpoint: /v2/submit)
+MINER_API_URL=https://talisman.rizzo.network/api
+# HTTP timeout in seconds for API requests
+BATCH_HTTP_TIMEOUT=30.0
+
+# Block-based Rate Limiting Configuration
+# Number of blocks per rate limit window (default: 100 blocks, ~20 minutes at 12s per block)
+BLOCKS_PER_WINDOW=100
+# Maximum posts to scrape and submit per block window (default: 5, matches API v2 rate limit)
+# Must match MAX_SUBMISSION_RATE in api_v2 if using API v2
+MAX_SUBMISSIONS_PER_WINDOW=5

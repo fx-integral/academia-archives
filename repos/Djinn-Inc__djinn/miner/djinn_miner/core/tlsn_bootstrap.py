@@ -1,0 +1,237 @@
+"""Auto-download TLSNotary binaries if not found locally.
+
+On first run, checks for djinn-tlsn-prover (miner) and djinn-tlsn-verifier
+(validator). If missing, downloads pre-built binaries from the latest GitHub
+release of Djinn-Inc/djinn and installs them to ~/.local/bin/.
+
+On subsequent runs, checks whether a newer release exists and upgrades
+automatically. The installed release tag is tracked in a version file.
+
+Can be overridden with TLSN_PROVER_BINARY / TLSN_VERIFIER_BINARY env vars
+pointing to existing binaries.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import platform
+import shutil
+import stat
+import tarfile
+import tempfile
+import urllib.request
+
+import structlog
+
+log = structlog.get_logger()
+
+GITHUB_REPO = "Djinn-Inc/djinn"
+
+# Pinned SHA256 hashes for release tarballs.
+# Key: (release_tag, platform_suffix) -> expected SHA256 hex digest.
+# If a (tag, platform) pair is not listed, the download proceeds with a warning.
+PINNED_HASHES: dict[tuple[str, str], str] = {
+    ("v790", "linux-x86_64"): "9ecb0725e4c150b8a20c381e02531abe08e63ef727bab784667c20a99e000659",
+    ("v1153", "linux-x86_64"): "f2e9b379599c851be3cc04dd87c416dd757df284aca024e999d45226e9eeedd5",
+    ("v1153", "macos-aarch64"): "571775b58d1d5d9c2c11f9a597527db99349a3bff7e83301ee8985692a58717a",
+}
+INSTALL_DIR = os.path.expanduser("~/.local/bin")
+BINARIES = ("djinn-tlsn-prover", "djinn-tlsn-verifier", "djinn-tlsn-notary")
+VERSION_FILE = os.path.join(INSTALL_DIR, ".djinn-tlsn-version")
+
+
+def _detect_platform() -> str | None:
+    """Return the platform suffix for release asset names, or None if unsupported."""
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+
+    os_name = {"linux": "linux", "darwin": "macos"}.get(system)
+    arch = {"x86_64": "x86_64", "amd64": "x86_64", "aarch64": "aarch64", "arm64": "aarch64"}.get(machine)
+
+    if not os_name or not arch:
+        return None
+    return f"{os_name}-{arch}"
+
+
+def _latest_release_tag() -> str | None:
+    """Fetch the latest release tag from GitHub."""
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/vnd.github.v3+json"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            import json
+
+            data = json.loads(resp.read())
+            return data.get("tag_name")
+    except Exception as e:
+        log.debug("tlsn_bootstrap_release_check_failed", error=str(e))
+        return None
+
+
+def _installed_version() -> str | None:
+    """Read the currently installed release tag, or None if unknown."""
+    try:
+        if os.path.isfile(VERSION_FILE):
+            return open(VERSION_FILE).read().strip() or None
+    except OSError:
+        pass
+    return None
+
+
+def _write_version(tag: str) -> None:
+    """Record the installed release tag."""
+    try:
+        os.makedirs(INSTALL_DIR, exist_ok=True)
+        with open(VERSION_FILE, "w") as f:
+            f.write(tag)
+    except OSError as e:
+        log.debug("tlsn_bootstrap_version_write_failed", error=str(e))
+
+
+def _sha256_file(path: str) -> str:
+    """Compute the SHA256 hex digest of a file."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 16), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _verify_hash(archive_path: str, tag: str, plat: str) -> bool:
+    """Verify the SHA256 hash of a downloaded archive.
+
+    Returns True if verification passes (hash matches or no pinned hash exists).
+    Returns False if the hash does not match the pinned value.
+    """
+    actual = _sha256_file(archive_path)
+    expected = PINNED_HASHES.get((tag, plat))
+
+    if expected is None:
+        log.warning(
+            "tlsn_bootstrap_unverified_binary",
+            tag=tag,
+            platform=plat,
+            sha256=actual,
+            msg="No pinned hash for this version/platform; proceeding without verification",
+        )
+        return True
+
+    if actual != expected:
+        log.error(
+            "tlsn_bootstrap_hash_mismatch",
+            tag=tag,
+            platform=plat,
+            expected=expected,
+            actual=actual,
+            msg="SHA256 hash mismatch, refusing to extract. The binary may be corrupted or tampered with.",
+        )
+        return False
+
+    log.info("tlsn_bootstrap_hash_verified", tag=tag, platform=plat, sha256=actual)
+    return True
+
+
+def _download_and_install(tag: str, plat: str) -> bool:
+    """Download the release tarball and extract binaries to INSTALL_DIR."""
+    asset_name = f"djinn-tlsn-tools-{plat}.tar.gz"
+    url = f"https://github.com/{GITHUB_REPO}/releases/download/{tag}/{asset_name}"
+
+    log.info("tlsn_bootstrap_downloading", url=url, install_dir=INSTALL_DIR)
+
+    try:
+        os.makedirs(INSTALL_DIR, exist_ok=True)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            archive_path = os.path.join(tmpdir, asset_name)
+            urllib.request.urlretrieve(url, archive_path)
+
+            if not _verify_hash(archive_path, tag, plat):
+                os.remove(archive_path)
+                return False
+
+            with tarfile.open(archive_path, "r:gz") as tar:
+                # Security: only extract known binary names
+                for member in tar.getmembers():
+                    basename = os.path.basename(member.name)
+                    if basename in BINARIES:
+                        member.name = basename  # flatten path
+                        tar.extract(member, tmpdir)
+
+            for binary in BINARIES:
+                src = os.path.join(tmpdir, binary)
+                dst = os.path.join(INSTALL_DIR, binary)
+                if os.path.isfile(src):
+                    shutil.move(src, dst)
+                    os.chmod(dst, os.stat(dst).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+                    log.info("tlsn_bootstrap_installed", binary=binary, path=dst)
+
+        _write_version(tag)
+        return True
+    except Exception as e:
+        log.warning("tlsn_bootstrap_download_failed", error=str(e))
+        return False
+
+
+def _check_upgrade() -> None:
+    """Check for a newer release and upgrade if available."""
+    installed = _installed_version()
+    latest = _latest_release_tag()
+    if not latest:
+        return
+    if installed == latest:
+        return
+
+    plat = _detect_platform()
+    if not plat:
+        return
+
+    log.info("tlsn_bootstrap_upgrading", installed=installed or "unknown", latest=latest)
+    _download_and_install(latest, plat)
+
+
+def ensure_binary(name: str) -> str:
+    """Ensure a TLSNotary binary is available, downloading if necessary.
+
+    Always checks for upgrades regardless of where the binary is found.
+    When a newer version is available in ~/.local/bin, it takes priority
+    over PATH or env-override binaries so that critical fixes (like the
+    notary timeout fix in v517) propagate to all miners via watchtower.
+
+    Args:
+        name: Binary name, e.g. "djinn-tlsn-prover" or "djinn-tlsn-verifier"
+
+    Returns:
+        Path to the binary (may be just the name if it's on PATH).
+    """
+    installed = os.path.join(INSTALL_DIR, name)
+
+    # Always check for upgrades first. This ensures miners on watchtower
+    # pick up critical binary fixes (e.g. notary timeout) automatically.
+    if os.path.isfile(installed) and os.access(installed, os.X_OK):
+        _check_upgrade()
+    else:
+        # Not installed yet; try to download
+        plat = _detect_platform()
+        if plat:
+            tag = _latest_release_tag()
+            if tag:
+                _download_and_install(tag, plat)
+
+    # Prefer the managed install dir (gets auto-upgraded) over PATH/env
+    if os.path.isfile(installed) and os.access(installed, os.X_OK):
+        return installed
+
+    # Check env override
+    _ENV_KEYS = {"prover": "TLSN_PROVER_BINARY", "verifier": "TLSN_VERIFIER_BINARY", "notary": "TLSN_NOTARY_BINARY"}
+    env_key = next((v for k, v in _ENV_KEYS.items() if k in name), "TLSN_PROVER_BINARY")
+    env_val = os.getenv(env_key)
+    if env_val:
+        if shutil.which(env_val) or (os.path.isfile(env_val) and os.access(env_val, os.X_OK)):
+            return env_val
+
+    # Check if already on PATH
+    found = shutil.which(name)
+    if found:
+        return found
+
+    return name  # Fallback to bare name; will fail at runtime with clear error

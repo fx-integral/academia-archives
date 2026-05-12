@@ -1,0 +1,34 @@
+# Environment
+.env
+.env.*
+
+# Config (use .example files)
+config/generator_config.yaml
+config/narrative_eval.yaml
+config/narrative_config.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+
+# Bittensor
+wallets/
+.bittensor/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+
+# Logs
+*.log
+logs/
+private/

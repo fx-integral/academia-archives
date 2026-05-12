@@ -1,0 +1,140 @@
+defaults: []
+
+seed: 42
+
+# ============================================================================
+# MODEL CONFIGURATION (from .env GRAIL_TRAIN_MODEL_ID and GRAIL_REF_MODEL_ID)
+# ============================================================================
+model:
+  train_id: "Qwen/Qwen2.5-1.5B-Instruct"
+  ref_id: "Qwen/Qwen2.5-1.5B-Instruct"
+  # Note: device is derived from gpu.strategy and gpu.training_gpu, not set here
+
+# ============================================================================
+# MULTI-GPU CONFIGURATION
+# ============================================================================
+gpu:
+  # GPU allocation strategy: "single" or "multi"
+  # - single: Run everything on one GPU (good for small models, limited memory)
+  # - multi: Use separate GPUs for server and training (recommended for production)
+  strategy: "single"  # single|multi
+
+  # GPU assignments (only used when strategy="multi")
+  vllm_gpu: 1  # GPU ID for inference server
+  training_gpu: 0  # GPU ID for training model
+
+  # Server memory settings (adjusted based on strategy)
+  # For multi-GPU: can use more memory since server has dedicated GPU
+  # For single-GPU: must leave room for training model
+  vllm_gpu_memory_utilization: 0.85  # For multi-GPU
+  vllm_gpu_memory_utilization_single: 0.25  # For single-GPU
+  sglang_mem_fraction_static: 0.85  # SGLang memory fraction (multi-GPU)
+  sglang_mem_fraction_static_single: 0.30  # SGLang memory fraction (single-GPU, shared with training)
+
+# ============================================================================
+# GENERATION CONFIGURATION (for rollout generation)
+# ============================================================================
+generation:
+  backend: "sglang_server"  # vllm_server|sglang_server (for offline_rollouts.py)
+  port: 30001  # Inference server port (managed by pipeline)
+  max_model_len: 4096  # Server max sequence length (prompt + completion)
+  max_num_seqs: 64  # Server concurrent sequences
+  batch_size: 16  # Match GRAIL_GENERATION_BATCH_SIZE
+  max_new_tokens: 512  # Completion tokens (prompt ~250 tokens, so total < max_model_len)
+  temperature: 0.7
+  top_p: 0.95
+  top_k: 50
+  repetition_penalty: 1.1
+
+# ============================================================================
+# TRAINING CONFIGURATION (matched to .env and constants.py)
+# ============================================================================
+train:
+  iterations: 5  # Number of training iterations to run
+  batch_size: 4  # Reduced for memory efficiency (1.5B model)
+  lr: 2.0e-6  # GRAIL_TRAINER_LR
+  grad_clip: 1.0  # GRAIL_TRAINER_GRAD_CLIP
+  grad_accum_steps: 32  # Increased to maintain effective batch size of 128
+  warmup_steps: 50  # GRAIL_TRAINER_WARMUP_STEPS
+  max_length: 1536  # GRAIL_TRAINER_MAX_LENGTH
+
+  # Loss coefficients
+  kl_coef: 0.00  # GRAIL_TRAINER_KL_COEF (disabled)
+  entropy_coef: 0.0005  # GRAIL_TRAINER_ENTROPY_COEF
+
+  # Advantage and clipping
+  adv_clip_percentile: 98.0  # More aggressive outlier removal (optimized from 99.0)
+  group_adv_sum_tol: 0.01  # TRAINER_GROUP_ADV_SUM_TOL
+
+  # Importance sampling and PPO clipping
+  use_is: true  # TRAINER_USE_IS
+  ppo_clip_eps: 0.2  # TRAINER_PPO_CLIP_EPS
+  ppo_clip_eps_upper: 0.28  # TRAINER_PPO_CLIP_EPS_UPPER
+  is_ratio_max: 2.5  # GRAIL_TRAINER_IS_RATIO_MAX
+  logratio_clamp: 0.92  # GRAIL_TRAINER_LOGRATIO_CLAMP
+
+  # GRPO variant and importance sampling level
+  # Variants: grpo (per-sequence avg), bnpo (global token avg), dapo (distributed), dr_grpo (fixed denom)
+  grpo_variant: "grpo"  # "grpo" for offline (dapo needs distributed context)
+  importance_sampling_level: "sequence"  # sequence|token
+
+  # Memory efficiency
+  use_gradient_checkpointing: true  # Reduces activation memory ~20-30%
+  chunked_logits: false  # Apply lm_head in chunks (useful for large models)
+  logit_chunk_size: 256  # Tokens per chunk when chunked_logits=true
+
+  # Adaptive KL (disabled when kl_coef=0)
+  adaptive_kl: false  # Disabled since kl_coef=0
+  kl_target: 0.04  # TRAINER_KL_TARGET (inactive)
+  kl_adapt_rate: 1.5  # GRAIL_TRAINER_KL_ADAPT_RATE
+  kl_min: 0.001  # TRAINER_KL_MIN
+  kl_max: 0.2  # TRAINER_KL_MAX
+
+# ============================================================================
+# DATA CONFIGURATION (GSM8K environment)
+# ============================================================================
+data:
+  environment: "gsm8k"  # Environment type: gsm8k or sat
+  problems_per_iteration: 8  # Number of problems per training iteration
+  rollouts_per_problem: 16  # ROLLOUTS_PER_PROBLEM from constants
+  train_seed_start: 1000  # Starting seed for training problems
+  num_train_seeds: 320  # Larger pool to reduce seed reuse (5 iter × 8 prob = 40 unique calls)
+  generation_batch_size: 4  # Number of problem seeds per generation batch
+
+# ============================================================================
+# EVALUATION CONFIGURATION
+# ============================================================================
+eval:
+  enabled: true
+  interval: 1  # Evaluate every N iterations
+  backend: "sglang"  # vllm|sglang|hf (evaluator.py expects these names)
+  batch_size: 16
+  do_sample: true
+  max_new_tokens: 2048
+  temperature: 0.7
+  top_p: 0.95
+  replicates: 8  # Number of rollouts per eval problem
+  ids: []  # if empty, will derive from seeds
+  seed_base: 4242
+  num_ids: 32  # Number of evaluation problems
+  id_seed_start: 5000
+
+# ============================================================================
+# LOGGING CONFIGURATION
+# ============================================================================
+logging:
+  wandb:
+    enabled: true
+    project: "grail-offline"
+    entity: "tplr"
+    run_name: null  # Auto-generated if null
+    tags: ["offline", "gsm8k", "grpo", "multi-gpu"]
+    notes: "Offline GRPO training on GSM8K with multi-GPU setup"
+
+# ============================================================================
+# CHECKPOINT CONFIGURATION
+# ============================================================================
+checkpoint:
+  save_interval: 1  # Save checkpoint every N iterations
+  keep_last_k: 3  # Keep only the last K training checkpoints
+  keep_last_vllm_k: 3  # Keep only the last K vLLM/SGLang server checkpoints

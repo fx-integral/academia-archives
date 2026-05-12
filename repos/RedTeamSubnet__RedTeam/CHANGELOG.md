@@ -1,0 +1,566 @@
+# Changelog
+
+## v4.6.0 (2026-05-11)
+
+## Features
+- adding hfp-2 (@aliyuldashev)
+- add Historical Fingerprinter v2 documentation and update challenge versions (@aliyuldashev)
+
+## Improvements
+- update challenge dependencies and incentive weights for historical fingerprinter and flowradar (@aliyuldashev)
+
+## Bug Fixes
+- increase default timeout for challenge comparison requests to 240 seconds (@aliyuldashev)
+
+## Other Changes
+- enhance miner lifecycle and validation documentation with detailed flow and Ruff checks (@aliyuldashev)
+- add Ruff format check instructions to FlowRadar v1 documentation (@aliyuldashev)
+- Update SVG logos and documentation for device fingerprinting challenges (@aliyuldashev)
+
+## v4.5.8 (2026-05-03)
+
+## Other Changes
+- update historical_fingerprinter and flr_challenge versions to v1.1.8 and v1.0.3 respectively (@aliyuldashev)
+
+## v4.5.7 (2026-04-27)
+
+## Other Changes
+- updating flr version (@aliyuldashev)
+
+## v4.5.6 (2026-04-26)
+
+## Other Changes
+- update commit limits to reflect one commit per day and latest commit wins policy (@aliyuldashev)
+- update flowradar challenge image version to 1.0.1 (@aliyuldashev)
+- update reveal interval documentation to reflect 24-hour commit cooldown (@aliyuldashev)
+
+## v4.5.5 (2026-04-24)
+
+## Features
+- Update FlowRadar challenge configuration for image and script path (@aliyuldashev)
+- Update FlowRadar challenge configuration for logging and data directory (@aliyuldashev)
+- Update FlowRadar challenge configuration for image, target, manager, and script path (@aliyuldashev)
+- Adding FlowRadar VPN detection challenge (@aliyuldashev)
+
+## Bug Fixes
+- Miner issues (@aliyuldashev)
+
+## Other Changes
+- Adjust comparison score threshold for validation skipping (@aliyuldashev)
+- Updating testing manuals of hfp challenge (@aliyuldashev)
+- Updating challenge version (@aliyuldashev)
+- Update historical_fingerprinter dependency to version 1.1.6 (@aliyuldashev)
+- Multiple updates (@aliyuldashev)
+- Potential fix for pull request finding (@aliyuldashev)
+- Merge remote-tracking branch 'origin/dependabot/pip/mkdocstrings-gte-1.0.4-and-lt-2.0.0' into rt-474-release-webflow-vpn-detection-challenge (@aliyuldashev)
+- Merge remote-tracking branch 'origin/dependabot/pip/mkdocs-awesome-nav-gte-3.3.0-and-lt-4.0.0' into rt-474-release-webflow-vpn-detection-challenge (@aliyuldashev)
+- Merge pull request #124 from RedTeamSubnet/rt-474-release-webflow-vpn-detection-challenge (@aliyuldashev)
+- Update active challenge yml file to include FLR challenge (@aliyuldashev)
+- Removing old challenge (@aliyuldashev)
+
+## v4.5.4 (2026-04-21)
+
+## Bug Fixes
+- ensure docker_username retrieval uses string index for consistency (@aliyuldashev)
+
+## v4.5.3 (2026-04-20)
+
+## Features
+- Update submission workflow to include Docker Hub credentials configuration and security guidelines (@abdibekbolot)
+- Enhance challenge score calculations to include Docker usernames (@aliyuldashev)
+
+## Improvements
+- Update documentation for Docker Hub Registry and Personal Access Token (PAT) usage (@abdibekbolot)
+- Update .env variable table formatting for clarity in Docker Hub credentials section (@abdibekbolot)
+- Add documentation for Docker Hub Registry and Personal Access Token (PAT) usage (@abdibekbolot)
+
+## Other Changes
+- Merge remote-tracking branch 'origin/main' into dev (@aliyuldashev)
+
+## v4.5.2 (2026-04-19)
+
+## Features
+- Enhance run_container to support miner authentication and improve image cleanup (@aliyuldashev)
+
+## Other Changes
+- Update subproject commits for dev_fingerprinter and historical_fingerprinter (@aliyuldashev)
+
+## v4.5.1 (2026-04-18)
+
+## Bug Fixes
+- update commit time check to 24 hours (@aliyuldashev)
+
+## v4.5.0 (2026-04-18)
+
+## Features
+- Rename REVEAL_INTERVAL to COMMIT_COOLDOWN and update references (@aliyuldashev)
+- Increase commit cooldown to 1 day (@aliyuldashev)
+
+## Other Changes
+- Merge pull request #118 from RedTeamSubnet/rt-496-increase-the-commit-cooldown-to-1-day (@aliyuldashev)
+
+## v4.4.5 (2026-04-15)
+
+## Other Changes
+- Updating timeout and setting log directory (@aliyuldashev)
+
+## v4.4.4 (2026-04-12)
+
+## Features
+- Enhance comparison logic and add same score comparison functionality (@aliyuldashev)
+
+## Other Changes
+- Updating challenge version (@aliyuldashev)
+
+## v4.4.3 (2026-04-09)
+
+## Other Changes
+- update historical_fingerprinter to version 1.1.3 (@aliyuldashev)
+
+## v4.4.2 (2026-04-08)
+
+## Other Changes
+- updating challenge versions (@aliyuldashev)
+
+## v4.4.1 (2026-04-08)
+
+## Bug Fixes
+- hfp challenge ulimit issue (@aliyuldashev)
+
+## Other Changes
+- update challenge images to latest versions (@aliyuldashev)
+
+## v4.4.0 (2026-04-01)
+
+## Changes
+
+- Update navigation and documentation for Historical Fingerprinter challenge (@aliyuldashev)
+- Update historical_fingerprinter configuration for API data directory (@aliyuldashev)
+- Update historical fingerprinter version and challenge image in configuration (@aliyuldashev)
+- Update README and v1 documentation for clarity and formatting (@aliyuldashev)
+- Remove ada_detection submodule and add dev_fingerprinter submodule (@aliyuldashev)
+- Improve clarity and structure in incentive mechanism documentation (@aliyuldashev)
+- Clean up formatting and improve clarity in issue templates (@aliyuldashev)
+- Clean up bug report template formatting and improve clarity (@aliyuldashev)
+- Merge remote-tracking branch 'origin/main' into dev (@aliyuldashev)
+- Merge remote-tracking branch 'origin/docs/incentive' into challenge/hfp (@aliyuldashev)
+- Merge pull request #113 from RedTeamSubnet/challenge/hfp (@ali yuldashev)
+- Update test case weights and improve challenge documentation (@aliyuldashev)
+- Update environment variable references (@aliyuldashev)
+- Refactor commit data collection to use project directory for git commands (@aliyuldashev)
+- Add initial documentation for Historical Fingerprinter challenge (@aliyuldashev)
+- Update scripts/lib/gemini-client.sh (@ali yuldashev)
+- Update .gitmodules (@ali yuldashev)
+- update subproject commit for historical_fingerprinter (@aliyuldashev)
+- remove unused dev_fingerprinter submodule from .gitmodules (@aliyuldashev)
+- integrate Gemini API for enhanced changelog and release notes generation with commit analysis (@aliyuldashev)
+- Merge pull request #112 from RedTeamSubnet/dependabot/pip/setuptools-scm-gte-8.0.4-and-lt-11.0.0 (@B. Batkhuu)
+- enhance release script with commit analysis for AI-generated release notes (@aliyuldashev)
+- update contact links in issue template for better community engagement and security reporting (@aliyuldashev)
+- add issue templates for bug reports, feature requests, documentation, challenges, and questions (@aliyuldashev)
+- update security issue reporting link in issue template for clarity (@aliyuldashev)
+- enhance changelog automation with commit analysis and Gemini integration (@aliyuldashev)
+- add historical_fingerprinter subproject (@aliyuldashev)
+- update challenge configuration for historical_fingerprinter (@aliyuldashev)
+- reduce single request timeout for historical_fingerprinter (@aliyuldashev)
+- adding new challenge repo (@aliyuldashev)
+- enhance incentive mechanism documentation with detailed reward calculation and validator roles (@Baratov Sokhibjon)
+
+## v4.3.1 (2026-03-18)
+
+<!-- Release notes generated using configuration in .github/release.yml at v4.3.1 -->
+
+## What's Changed
+### 💬 Other
+* documentation to clarify and streamline the process for building and publishing a miner solution as a Docker image. by @abdibekbolot in https://github.com/RedTeamSubnet/RedTeam/pull/110
+
+
+**Full Changelog**: https://github.com/RedTeamSubnet/RedTeam/compare/v4.3.0...v4.3.1
+
+## v4.3.0 (2026-03-11)
+
+<!-- Release notes generated using configuration in .github/release.yml at v4.3.0 -->
+
+## What's Changed
+### ✨ Features
+* Update DFP version and reduce reveal interval to 3 hours by @aliyuldashev in https://github.com/RedTeamSubnet/RedTeam/pull/109
+
+
+**Full Changelog**: https://github.com/RedTeamSubnet/RedTeam/compare/v4.2.2...v4.3.0
+
+## v4.2.2 (2026-03-04)
+
+<!-- Release notes generated using configuration in .github/release.yml at v4.2.2 -->
+
+
+
+**Full Changelog**: https://github.com/RedTeamSubnet/RedTeam/compare/v4.2.1...v4.2.2
+
+## v4.2.1 (2026-03-04)
+
+<!-- Release notes generated using configuration in .github/release.yml at v4.2.1 -->
+
+
+
+**Full Changelog**: https://github.com/RedTeamSubnet/RedTeam/compare/v4.2.0...v4.2.1
+
+## v4.2.0 (2026-02-26)
+
+<!-- Release notes generated using configuration in .github/release.yml at v4.2.0 -->
+
+## What's Changed
+### ✨ Features
+* Device Fingerprinter V2 by @aliyuldashev in https://github.com/RedTeamSubnet/RedTeam/pull/105
+### 📝 Documentation
+* documentation for the Device Fingerprinter challenge, clarifies requirements and scoring by @abdibekbolot in https://github.com/RedTeamSubnet/RedTeam/pull/106
+
+
+**Full Changelog**: https://github.com/RedTeamSubnet/RedTeam/compare/v4.1.1...v4.2.0
+
+## v4.1.1 (2026-02-16)
+
+<!-- Release notes generated using configuration in .github/release.yml at v4.1.1 -->
+
+
+
+**Full Changelog**: https://github.com/RedTeamSubnet/RedTeam/compare/v4.1.0...v4.1.1
+
+## v4.1.0 (2026-02-14)
+
+<!-- Release notes generated using configuration in .github/release.yml at v4.1.0 -->
+
+## What's Changed
+### ✨ Features
+* New challenge & improve stability by @aliyuldashev in https://github.com/RedTeamSubnet/RedTeam/pull/104
+### 💬 Other
+* chore(deps): update setuptools requirement from <81.0.0,>=70.0.0 to >=70.0.0,<83.0.0 by @dependabot[bot] in https://github.com/RedTeamSubnet/RedTeam/pull/103
+
+
+**Full Changelog**: https://github.com/RedTeamSubnet/RedTeam/compare/v4.0.1...v4.1.0
+
+## v4.0.1 (2026-01-28)
+
+<!-- Release notes generated using configuration in .github/release.yml at v4.0.1 -->
+
+## What's Changed
+### 💬 Other
+* chore(deps): update pytest requirement from <9.0.0,>=8.0.2 to >=8.0.2,<10.0.0 by @dependabot[bot] in https://github.com/RedTeamSubnet/RedTeam/pull/101
+
+## New Contributors
+* @dependabot[bot] made their first contribution in https://github.com/RedTeamSubnet/RedTeam/pull/101
+
+**Full Changelog**: https://github.com/RedTeamSubnet/RedTeam/compare/v4.0.0...v4.0.1
+
+## v4.0.0 (2026-01-28)
+
+<!-- Release notes generated using configuration in .github/release.yml at v4.0.0 -->
+
+## What's Changed
+### 💥 Breaking Changes
+* Refactor: Restructuring & Separation by @aliyuldashev in https://github.com/RedTeamSubnet/RedTeam/pull/94
+
+
+**Full Changelog**: https://github.com/RedTeamSubnet/RedTeam/compare/v3.1.2...v4.0.0
+
+## v3.1.2 (2025-12-23)
+
+<!-- Release notes generated using configuration in .github/release.yml at v3.1.2 -->
+
+
+
+**Full Changelog**: https://github.com/RedTeamSubnet/RedTeam/compare/v3.1.1...v3.1.2
+
+## v3.1.1 (2025-12-18)
+
+<!-- Release notes generated using configuration in .github/release.yml at v3.1.1 -->
+
+## What's Changed
+### 🐛 Fixes
+* Synchronisation of states by @aliyuldashev in https://github.com/RedTeamSubnet/RedTeam/pull/92
+
+
+**Full Changelog**: https://github.com/RedTeamSubnet/RedTeam/compare/v3.1.0...v3.1.1
+
+## v3.1.0 (2025-12-15)
+
+<!-- Release notes generated using configuration in .github/release.yml at v3.1.0 -->
+
+## What's Changed
+### ✨ Features
+* Anti-Detect Automation Detection by @abdibekbolot in https://github.com/RedTeamSubnet/RedTeam/pull/90
+
+## New Contributors
+* @abdibekbolot made their first contribution in https://github.com/RedTeamSubnet/RedTeam/pull/90
+
+**Full Changelog**: https://github.com/RedTeamSubnet/RedTeam/compare/v3.0.0...v3.1.0
+
+## v3.0.0 (2025-12-02)
+
+<!-- Release notes generated using configuration in .github/release.yml at v3.0.0 -->
+
+## What's Changed
+### ✨ Features
+* Auto Browser Sniffer & New Subnet Structure for the Challenges by @aliyuldashev in https://github.com/RedTeamSubnet/RedTeam/pull/87
+
+
+**Full Changelog**: https://github.com/RedTeamSubnet/RedTeam/compare/v2.9.0...v3.0.0
+
+## v2.9.0 (2025-11-03)
+
+<!-- Release notes generated using configuration in .github/release.yml at v2.9.0 -->
+
+## What's Changed
+### ✨ Features
+* feat: integrate internal services by @aliyuldashev in https://github.com/RedTeamSubnet/RedTeam/pull/85
+
+
+**Full Changelog**: https://github.com/RedTeamSubnet/RedTeam/compare/v2.8.4...v2.9.0
+
+## v2.8.4 (2025-10-28)
+
+<!-- Release notes generated using configuration in .github/release.yml at v2.8.4 -->
+
+
+
+**Full Changelog**: https://github.com/RedTeamSubnet/RedTeam/compare/v2.8.3...v2.8.4
+
+## v2.8.3 (2025-10-25)
+
+<!-- Release notes generated using configuration in .github/release.yml at v2.8.3 -->
+
+
+
+**Full Changelog**: https://github.com/RedTeamSubnet/RedTeam/compare/v2.8.2...v2.8.3
+
+## v2.8.2 (2025-10-25)
+
+<!-- Release notes generated using configuration in .github/release.yml at v2.8.2 -->
+
+
+
+**Full Changelog**: https://github.com/RedTeamSubnet/RedTeam/compare/v2.8.1...v2.8.2
+
+## v2.8.1 (2025-10-16)
+
+<!-- Release notes generated using configuration in .github/release.yml at v2.8.1 -->
+
+
+
+**Full Changelog**: https://github.com/RedTeamSubnet/RedTeam/compare/v2.8.0...v2.8.1
+
+## v2.8.0 (2025-10-16)
+
+<!-- Release notes generated using configuration in .github/release.yml at v2.8.0 -->
+
+## What's Changed
+### ✨ Features
+* Auto Browser Sniffer v4 by @aliyuldashev in https://github.com/RedTeamSubnet/RedTeam/pull/83
+
+
+**Full Changelog**: https://github.com/RedTeamSubnet/RedTeam/compare/v2.7.0...v2.8.0
+
+## v2.7.0 (2025-10-09)
+
+<!-- Release notes generated using configuration in .github/release.yml at v2.7.0 -->
+
+
+
+**Full Changelog**: https://github.com/RedTeamSubnet/RedTeam/compare/v2.6.2...v2.7.0
+
+## v2.6.2 (2025-10-06)
+
+<!-- Release notes generated using configuration in .github/release.yml at v2.6.2 -->
+
+## What's Changed
+### ✨ Features
+* Reliable State Syncing & Comparison by @aliyuldashev in https://github.com/RedTeamSubnet/RedTeam/pull/82
+
+
+**Full Changelog**: https://github.com/RedTeamSubnet/RedTeam/compare/v2.6.1...v2.6.2
+
+## v2.6.1 (2025-10-02)
+
+<!-- Release notes generated using configuration in .github/release.yml at v2.6.1 -->
+
+
+
+**Full Changelog**: https://github.com/RedTeamSubnet/RedTeam/compare/v2.6.0...v2.6.1
+
+## v2.6.0 (2025-10-02)
+
+<!-- Release notes generated using configuration in .github/release.yml at v2.6.0 -->
+
+## What's Changed
+### ✨ Features
+* Update the comparison and anonymize the Docker Hub ID. by @aliyuldashev in https://github.com/RedTeamSubnet/RedTeam/pull/81
+
+
+**Full Changelog**: https://github.com/RedTeamSubnet/RedTeam/compare/v2.5.1...v2.6.0
+
+## v2.5.1 (2025-09-24)
+
+<!-- Release notes generated using configuration in .github/release.yml at v2.5.1 -->
+
+## What's Changed
+### ✨ Features
+* Comparison & DFP Documentation by @aliyuldashev in https://github.com/RedTeamSubnet/RedTeam/pull/80
+### 💬 Other
+* New challenge - dev_fingerprinter_v1 (Device Fingerprinting Challenge) by @BaratovSokhibjon in https://github.com/RedTeamSubnet/RedTeam/pull/79
+
+
+**Full Changelog**: https://github.com/RedTeamSubnet/RedTeam/compare/v2.5.0...v2.5.1
+
+## v2.5.0 (2025-09-04)
+
+<!-- Release notes generated using configuration in .github/release.yml at v2.5.0 -->
+
+## What's Changed
+### ✨ Features
+* New challenge & scoring order by @aliyuldashev in https://github.com/RedTeamSubnet/RedTeam/pull/77
+* New challenge & scoring order by @aliyuldashev in https://github.com/RedTeamSubnet/RedTeam/pull/78
+
+
+**Full Changelog**: https://github.com/RedTeamSubnet/RedTeam/compare/v2.4.0...v2.5.0
+
+## v2.4.0 (2025-08-24)
+
+<!-- Release notes generated using configuration in .github/release.yml at v2.4.0 -->
+
+## What's Changed
+### 💥 Breaking Changes
+* Adding auto browser sniffer v3 by @aliyuldashev in https://github.com/RedTeamSubnet/RedTeam/pull/76
+### ✨ Features
+* testing environment for ab_sniffer_v1 and humanize_behaviour_v4 by @BaratovSokhibjon in https://github.com/RedTeamSubnet/RedTeam/pull/72
+* Feat/change logic by @aliyuldashev in https://github.com/RedTeamSubnet/RedTeam/pull/74
+* New Auto-Browser-Sniffer challenge and Core logic update by @aliyuldashev in https://github.com/RedTeamSubnet/RedTeam/pull/75
+
+
+**Full Changelog**: https://github.com/RedTeamSubnet/RedTeam/compare/v2.3.0...v2.4.0
+
+## v2.3.0 (2025-06-11)
+
+<!-- Release notes generated using configuration in .github/release.yml at v2.3.0 -->
+
+## What's Changed
+### ✨ Features
+* :zap: new ab_sniffer_v1 challenge by @BaratovSokhibjon in https://github.com/RedTeamSubnet/RedTeam/pull/69
+### 💬 Other
+* ⚡ new ab_sniffer_v1 challenge by @BaratovSokhibjon in https://github.com/RedTeamSubnet/RedTeam/pull/71
+
+
+**Full Changelog**: https://github.com/RedTeamSubnet/RedTeam/compare/v2.2.0...v2.3.0
+
+## v2.2.0 (2025-06-09)
+
+<!-- Release notes generated using configuration in .github/release.yml at v2.2.0 -->
+
+## What's Changed
+### 💥 Breaking Changes
+* :zap: new hb_v4 challenge by @BaratovSokhibjon in https://github.com/RedTeamSubnet/RedTeam/pull/68
+### ✨ Features
+* ⚡ new hb_v4 challenge by @BaratovSokhibjon in https://github.com/RedTeamSubnet/RedTeam/pull/70
+
+
+**Full Changelog**: https://github.com/RedTeamSubnet/RedTeam/compare/v2.1.0...v2.2.0
+
+## v2.1.0 (2025-06-01)
+
+<!-- Release notes generated using configuration in .github/release.yml at v2.1.0 -->
+
+## What's Changed
+### ✨ Features
+* Feature/json log formatting by @renesweet24 in https://github.com/RedTeamSubnet/RedTeam/pull/65
+* feat(RT-127): Change weight distribution by @aliyuldashev in https://github.com/RedTeamSubnet/RedTeam/pull/66
+* Weighting system change by @aliyuldashev in https://github.com/RedTeamSubnet/RedTeam/pull/67
+
+## New Contributors
+* @renesweet24 made their first contribution in https://github.com/RedTeamSubnet/RedTeam/pull/65
+
+**Full Changelog**: https://github.com/RedTeamSubnet/RedTeam/compare/v2.0.0...v2.1.0
+
+## v2.0.0 (2025-05-25)
+
+<!-- Release notes generated using configuration in .github/release.yml at v2.0.0 -->
+
+## What's Changed
+### 💬 Other
+* Hotfix/commit issues by @haihp02 in https://github.com/RedTeamSubnet/RedTeam/pull/61
+* Add auto-updater functionality for validator. by @ap-choji in https://github.com/RedTeamSubnet/RedTeam/pull/62
+* Migrate to new domain by @aliyuldashev in https://github.com/RedTeamSubnet/RedTeam/pull/63
+
+## New Contributors
+* @ap-choji made their first contribution in https://github.com/RedTeamSubnet/RedTeam/pull/62
+
+**Full Changelog**: https://github.com/RedTeamSubnet/RedTeam/compare/v1.0.2...v2.0.0
+
+## v1.0.2 (2025-05-10)
+
+<!-- Release notes generated using configuration in .github/release.yml at v1.0.2 -->
+
+## What's Changed
+### ✨ Features
+* feat: threading for forward, set_weight for validators, fix hb_v3 batch, update challenges by @aliyuldashev in https://github.com/RedTeamSubnet/RedTeam/pull/60
+
+
+**Full Changelog**: https://github.com/RedTeamSubnet/RedTeam/compare/v1.0.1...v1.0.2
+
+## v1.0.1 (2025-05-07)
+
+<!-- Release notes generated using configuration in .github/release.yml at v1.0.1 -->
+
+## What's Changed
+### ✨ Features
+* 🛠️ Fix: Correct Commit Timestamp Update in Validators by @aliyuldashev in https://github.com/RedTeamSubnet/RedTeam/pull/59
+### 🐛 Fixes
+* Bugfix: Validator error on revealing commits by @haihp02 in https://github.com/RedTeamSubnet/RedTeam/pull/58
+
+
+**Full Changelog**: https://github.com/RedTeamSubnet/RedTeam/compare/v1.0.0...v1.0.1
+
+## v1.0.0 (2025-04-22)
+
+<!-- Release notes generated using configuration in .github/release.yml at v1.0.0 -->
+
+## What's Changed
+### 💥 Breaking Changes
+* Major Update: New Adversarial Challenges, Enhanced Humanize Behavior v2, and Script Uniqueness System by @ohayek in https://github.com/RedTeamSubnet/RedTeam/pull/47
+* Introducing New Challenge & CICD by @aliyuldashev in https://github.com/RedTeamSubnet/RedTeam/pull/57
+### ✨ Features
+* feat: Add new challenge configuration for 'webui_auto' challenge. by @bybatkhuu in https://github.com/RedTeamSubnet/RedTeam/pull/10
+* Score update hotfix by @haihp02 in https://github.com/RedTeamSubnet/RedTeam/pull/52
+### 🐛 Fixes
+* Fix miner's state issue and minor bugs in humanize_behaviour_v1 challenge by @bybatkhuu in https://github.com/RedTeamSubnet/RedTeam/pull/33
+### 📝 Documentation
+* Update GitHub workflows for version bumping and documentation publishing by @bybatkhuu in https://github.com/RedTeamSubnet/RedTeam/pull/44
+### 💬 Other
+* Refactor, add  resource limits, emission pool by @vietbeu in https://github.com/RedTeamSubnet/RedTeam/pull/1
+* Update docs by @vietbeu in https://github.com/RedTeamSubnet/RedTeam/pull/2
+* Prevent miner connect internet by @vietbeu in https://github.com/RedTeamSubnet/RedTeam/pull/4
+* Add challenge: Response Quality Adversarial and Response Quality Ranker by @vietbeu in https://github.com/RedTeamSubnet/RedTeam/pull/5
+* Validator store miner 's commits by @haihp02 in https://github.com/RedTeamSubnet/RedTeam/pull/3
+* Add option to use scoring from centralized server by @vietbeu in https://github.com/RedTeamSubnet/RedTeam/pull/6
+* Refactoring of config by @Michael89 in https://github.com/RedTeamSubnet/RedTeam/pull/9
+* Update centralized scoring by @vietbeu in https://github.com/RedTeamSubnet/RedTeam/pull/12
+* RedTeam v0.0.2 by @vietbeu in https://github.com/RedTeamSubnet/RedTeam/pull/14
+* RedTeam v0.0.2 by @vietbeu in https://github.com/RedTeamSubnet/RedTeam/pull/19
+* hotfix: update condition to check scoring done by @vietbeu in https://github.com/RedTeamSubnet/RedTeam/pull/20
+* Dev hb by @bybatkhuu in https://github.com/RedTeamSubnet/RedTeam/pull/32
+* [BUG FIX] Add more logging and bug fix in storage manager by @haihp02 in https://github.com/RedTeamSubnet/RedTeam/pull/35
+* Merge pull request #35 from RedTeamSubnet/haihp02-bug-fix by @haihp02 in https://github.com/RedTeamSubnet/RedTeam/pull/36
+* Weighting mechanism changes by @haihp02 in https://github.com/RedTeamSubnet/RedTeam/pull/37
+* [BUG FIX] Fix miner manager record finding bug by @haihp02 in https://github.com/RedTeamSubnet/RedTeam/pull/41
+* [UPDATE] HBController baseline_reference_comparison_docker_hub_ids by @haihp02 in https://github.com/RedTeamSubnet/RedTeam/pull/43
+* Refine HB 2 reference_comparisons by @haihp02 in https://github.com/RedTeamSubnet/RedTeam/pull/45
+* Add reference_hotkey to ComparisonLog by @haihp02 in https://github.com/RedTeamSubnet/RedTeam/pull/46
+* Add Loghandler for validator by @haihp02 in https://github.com/RedTeamSubnet/RedTeam/pull/42
+* Add more debug log by @haihp02 in https://github.com/RedTeamSubnet/RedTeam/pull/49
+* Hotfix validator weight setting issue, with better log by @haihp02 in https://github.com/RedTeamSubnet/RedTeam/pull/50
+* Bugfix for comparison issues by @haihp02 in https://github.com/RedTeamSubnet/RedTeam/pull/51
+* Miners 's alpha burn by @haihp02 in https://github.com/RedTeamSubnet/RedTeam/pull/53
+* Update on Scoring by @haihp02 in https://github.com/RedTeamSubnet/RedTeam/pull/56
+
+## New Contributors
+* @Michael89 made their first contribution in https://github.com/RedTeamSubnet/RedTeam/pull/9
+* @ohayek made their first contribution in https://github.com/RedTeamSubnet/RedTeam/pull/47
+
+**Full Changelog**: https://github.com/RedTeamSubnet/RedTeam/commits/v1.0.0

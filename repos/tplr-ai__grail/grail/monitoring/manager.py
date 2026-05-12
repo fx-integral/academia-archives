@@ -1,0 +1,560 @@
+"""
+Monitoring manager and high-level interface.
+
+This module provides the MonitoringManager class which serves as the main
+interface for the monitoring system. It handles buffering, batching, and
+provides a simple API for logging metrics and artifacts.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from collections.abc import Awaitable, Callable
+from contextlib import contextmanager
+from typing import Any
+
+from .backends.null_backend import NullBackend
+from .backends.wandb_backend import WandBBackend
+from .base import MetricData, MetricType, MonitoringBackend
+
+logger = logging.getLogger(__name__)
+
+
+class MonitoringManager:
+    """High-level interface for monitoring operations.
+
+    The MonitoringManager provides a simplified API for logging metrics and
+    artifacts. It handles buffering, batching, error recovery, and provides
+    both sync and async interfaces for different use cases.
+    """
+
+    def __init__(self, backend: MonitoringBackend | None = None):
+        """Initialize the monitoring manager.
+
+        Args:
+            backend: The monitoring backend to use. If None, uses NullBackend.
+        """
+        self.backend = backend or NullBackend()
+        self._metric_buffer: list[MetricData] = []
+        self._buffer_size = 100
+        self._flush_interval = 30.0  # seconds
+        self._flush_task: asyncio.Task | None = None
+        self._shutdown_event: asyncio.Event | None = None
+        self._initialized = False
+        self._config: dict[str, Any] = {}
+        self._current_block: int | None = None
+        self._current_window: int | None = None
+        self._start_time: float | None = None
+
+    def initialize(self, config: dict[str, Any]) -> None:
+        """Initialize the monitoring system synchronously.
+
+        Args:
+            config: Configuration dictionary for the backend
+        """
+        try:
+            # Update configuration
+            self._buffer_size = config.get("buffer_size", 100)
+            self._flush_interval = config.get("flush_interval", 30.0)
+
+            # Initialize backend synchronously
+            self.backend.initialize(config)
+            self._config = config.copy()
+            self._initialized = True
+
+            logger.info("Monitoring manager initialized successfully")
+
+        except Exception as e:
+            logger.warning(f"Failed to initialize monitoring manager: {e}")
+            # Fall back to null backend
+            self.backend = NullBackend()
+            self.backend.initialize({})
+            self._initialized = True
+
+    def _ensure_async_components(self) -> None:
+        """Ensure async components are initialized (lazy initialization)."""
+        if self._shutdown_event is None:
+            self._shutdown_event = asyncio.Event()
+        if self._flush_task is None or self._flush_task.done():
+            self._flush_task = asyncio.create_task(self._periodic_flush())
+
+    def _start_flush_task(self) -> None:
+        """Start the periodic metric flushing task."""
+        if self._flush_task is None or self._flush_task.done():
+            self._flush_task = asyncio.create_task(self._periodic_flush())
+
+    async def _periodic_flush(self) -> None:
+        """Periodically flush buffered metrics."""
+        if self._shutdown_event is None:
+            self._shutdown_event = asyncio.Event()
+
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=self._flush_interval)
+                # If we get here, shutdown was requested
+                break
+            except TimeoutError:
+                # Timeout is expected - time to flush
+                await self.flush_metrics()
+            except Exception as e:
+                logger.warning(f"Error in periodic flush: {e}")
+                await asyncio.sleep(1.0)  # Brief pause before retrying
+
+    def set_block_context(self, block_number: int, window_number: int | None = None) -> None:
+        """Set the current block and window context for metrics.
+
+        Args:
+            block_number: Current block number
+            window_number: Current window number (optional)
+        """
+        self._current_block = block_number
+        self._current_window = window_number
+
+    def _attach_context_tags(self, tags: dict[str, str] | None) -> dict[str, str] | None:
+        """Attach reserved context tags so x-axis is always present per-metric.
+
+        Returns a new dict when additions are needed, otherwise returns the
+        original reference to avoid extra allocations.
+        """
+        # Context tags (block_number, window_number) are now passed directly via
+        # MetricData fields instead of tags to avoid tag processing issues.
+        # They will be added to wandb data via _add_temporal_context().
+        return tags
+
+    async def log_counter(
+        self,
+        name: str,
+        value: int | float = 1,
+        tags: dict[str, str] | None = None,
+    ) -> None:
+        """Log a counter metric.
+
+        Args:
+            name: Name of the counter
+            value: Value to increment by (default 1)
+            tags: Optional tags to attach
+        """
+        if not self._initialized:
+            return
+
+        # Ensure async components are ready
+        self._ensure_async_components()
+
+        metric = MetricData(
+            name,
+            value,
+            MetricType.COUNTER,
+            self._attach_context_tags(tags),
+            block_number=self._current_block,
+            window_number=self._current_window,
+        )
+        self._metric_buffer.append(metric)
+
+        if len(self._metric_buffer) >= self._buffer_size:
+            await self.flush_metrics()
+
+    async def log_gauge(
+        self,
+        name: str,
+        value: int | float,
+        tags: dict[str, str] | None = None,
+    ) -> None:
+        """Log a gauge metric.
+
+        Args:
+            name: Name of the gauge
+            value: Current value
+            tags: Optional tags to attach
+        """
+        if not self._initialized:
+            return
+
+        # Gauges are logged immediately since they represent current state
+        metric = MetricData(
+            name,
+            value,
+            MetricType.GAUGE,
+            self._attach_context_tags(tags),
+            block_number=self._current_block,
+            window_number=self._current_window,
+        )
+        try:
+            await self.backend.log_metric(metric)
+        except Exception as e:
+            logger.warning(f"Failed to log gauge {name}: {e}")
+
+    async def log_histogram(
+        self, name: str, value: Any, tags: dict[str, str] | None = None
+    ) -> None:
+        """Log a histogram metric.
+
+        Args:
+            name: Name of the histogram
+            value: Value to record (number or list/array for distributions)
+            tags: Optional tags to attach
+        """
+        if not self._initialized:
+            return
+
+        metric = MetricData(
+            name,
+            value,
+            MetricType.HISTOGRAM,
+            self._attach_context_tags(tags),
+            block_number=self._current_block,
+            window_number=self._current_window,
+        )
+        self._metric_buffer.append(metric)
+
+        if len(self._metric_buffer) >= self._buffer_size:
+            await self.flush_metrics()
+
+    @contextmanager
+    def timer(self, name: str, tags: dict[str, str] | None = None) -> Any:
+        """Time an operation.
+
+        Args:
+            name: Name of the timer
+            tags: Optional tags to attach
+
+        Example:
+            with manager.timer("operation_duration"):
+                # ... timed operation ...
+        """
+        if not self._initialized:
+            yield
+            return
+
+        start_time = time.time()
+        try:
+            yield
+        finally:
+            duration = time.time() - start_time
+            metric = MetricData(
+                name=f"{name}_duration",
+                value=duration,
+                metric_type=MetricType.TIMER,
+                tags=self._attach_context_tags(tags),
+                block_number=self._current_block,
+                window_number=self._current_window,
+            )
+            # Schedule async logging without blocking the caller
+            try:
+                asyncio.create_task(self.backend.log_metric(metric))
+            except Exception as e:
+                logger.warning(f"Failed to schedule timer metric {name}: {e}")
+
+    async def log_artifact(self, name: str, data: Any, artifact_type: str) -> None:
+        """Log an artifact.
+
+        Args:
+            name: Name/identifier for the artifact
+            data: The artifact data
+            artifact_type: Type of artifact ("model", "plot", "file", etc.)
+        """
+        if not self._initialized:
+            return
+
+        try:
+            await self.backend.log_artifact(name, data, artifact_type)
+        except Exception as e:
+            logger.warning(f"Failed to log artifact {name}: {e}")
+
+    async def flush_metrics(self) -> None:
+        """Flush all buffered metrics to the backend."""
+        if not self._metric_buffer or not self._initialized:
+            return
+
+        try:
+            # Get current buffer and reset
+            metrics_to_flush = self._metric_buffer.copy()
+            self._metric_buffer.clear()
+
+            # Send to backend
+            await self.backend.log_metrics(metrics_to_flush)
+
+        except Exception as e:
+            logger.warning(f"Failed to flush metrics: {e}")
+            # On failure, we lose the metrics but don't crash the application
+
+    async def health_check(self) -> bool:
+        """Check monitoring system health.
+
+        Returns:
+            True if the monitoring system is healthy, False otherwise
+        """
+        if not self._initialized:
+            return False
+
+        try:
+            return await self.backend.health_check()
+        except Exception as e:
+            logger.warning(f"Health check failed: {e}")
+            return False
+
+    async def start_run(self, run_name: str, config: dict[str, Any] | None = None) -> str:
+        """Start a new monitoring run.
+
+        Args:
+            run_name: Name for this run
+            config: Optional additional configuration
+
+        Returns:
+            Run ID for this session
+        """
+        if not self._initialized:
+            return "not_initialized"
+
+        try:
+            return await self.backend.start_run(run_name, config or {})
+        except Exception as e:
+            logger.warning(f"Failed to start run {run_name}: {e}")
+            return "failed_start"
+
+    async def finish_run(self, run_id: str) -> None:
+        """Finish a monitoring run.
+
+        Args:
+            run_id: The run identifier
+        """
+        if not self._initialized:
+            return
+
+        # Flush any remaining metrics before finishing
+        await self.flush_metrics()
+
+        try:
+            await self.backend.finish_run(run_id)
+        except Exception as e:
+            logger.warning(f"Failed to finish run {run_id}: {e}")
+
+    async def shutdown(self) -> None:
+        """Shutdown the monitoring system and cleanup resources."""
+        logger.info("Shutting down monitoring manager...")
+
+        # Signal shutdown to background tasks
+        if self._shutdown_event is not None:
+            self._shutdown_event.set()
+
+        # Cancel flush task
+        if self._flush_task and not self._flush_task.done():
+            self._flush_task.cancel()
+            try:
+                await self._flush_task
+            except asyncio.CancelledError:
+                pass
+
+        # Flush any remaining metrics
+        await self.flush_metrics()
+
+        # Shutdown backend
+        if self._initialized:
+            try:
+                await self.backend.shutdown()
+            except Exception as e:
+                logger.warning(f"Error during backend shutdown: {e}")
+
+        self._initialized = False
+        logger.info("Monitoring manager shutdown completed")
+
+
+# Global monitoring instance
+_monitoring_manager: MonitoringManager | None = None
+
+
+def get_monitoring_manager() -> MonitoringManager:
+    """Get the global monitoring manager instance.
+
+    Returns:
+        The global MonitoringManager instance
+    """
+    global _monitoring_manager
+    if _monitoring_manager is None:
+        _monitoring_manager = MonitoringManager()
+    return _monitoring_manager
+
+
+def initialize_monitoring(backend_type: str = "wandb", **config: Any) -> None:
+    """Initialize monitoring with the specified backend.
+
+    Args:
+        backend_type: Type of backend to use ("wandb", "null")
+        **config: Configuration parameters for the backend
+
+    Raises:
+        ValueError: If backend_type is not supported
+    """
+    global _monitoring_manager
+
+    # Create backend instance
+    if backend_type == "wandb":
+        backend: MonitoringBackend = WandBBackend()
+    elif backend_type == "null":
+        backend = NullBackend()
+    else:
+        raise ValueError(f"Unknown backend type: {backend_type}")
+
+    # Create manager with backend
+    _monitoring_manager = MonitoringManager(backend)
+
+    # Initialize synchronously
+    _monitoring_manager.initialize(config)
+
+    logger.info(f"Monitoring initialized with {backend_type} backend")
+
+
+async def shutdown_monitoring() -> None:
+    """Shutdown the global monitoring system."""
+    global _monitoring_manager
+    if _monitoring_manager:
+        await _monitoring_manager.shutdown()
+        _monitoring_manager = None
+
+
+async def initialize_subprocess_monitoring(
+    monitor_config: dict[str, Any] | None,
+    process_name: str,
+    *,
+    test_connection: bool = True,
+    get_block_context: Callable[[], Awaitable[tuple[int, int]]] | None = None,
+) -> MonitoringManager | None:
+    """Initialize monitoring for a subprocess with robust error handling.
+
+    This is a modular helper for child processes (training, upload worker, etc.)
+    to initialize shared-mode W&B monitoring with consistent behavior.
+
+    Args:
+        monitor_config: Monitoring configuration dict containing:
+            - backend_type: "wandb" or "null" (default: "wandb")
+            - run_name: Name of the run
+            - run_id: W&B run ID for shared-mode attachment
+            - entity: W&B entity
+            - project: W&B project
+            - Other backend-specific config
+        process_name: Name of the subprocess for logging (e.g., "training_process", "upload_worker")
+        test_connection: If True, log a test gauge to verify W&B connection
+        get_block_context: Optional async callable returning (block, window) for context.
+            If provided and test_connection is True, sets block context before test.
+
+    Returns:
+        MonitoringManager if successfully initialized, None otherwise.
+
+    Example:
+        monitor = await initialize_subprocess_monitoring(
+            monitor_config,
+            "upload_worker",
+            test_connection=True,
+        )
+        if monitor:
+            monitor.set_block_context(block, window)
+            await monitor.log_gauge("my_metric", 1.0)
+    """
+    import os
+    import time
+
+    if not monitor_config:
+        logger.info("[%s] No monitoring config provided, skipping monitoring setup", process_name)
+        return None
+
+    # Configure W&B environment for shared-mode
+    os.environ["WANDB_DISABLE_SERVICE"] = "false"
+    os.environ["WANDB_SERVICE"] = ""
+
+    try:
+        backend_type = monitor_config.get("backend_type", "wandb")
+        init_config = {k: v for k, v in monitor_config.items() if k != "backend_type"}
+
+        # Log initialization details
+        logger.debug(
+            "[%s] Initializing monitoring: backend_type=%s run_name=%s run_id=%s entity=%s project=%s mode=%s",
+            process_name,
+            backend_type,
+            init_config.get("run_name"),
+            init_config.get("run_id"),
+            init_config.get("entity"),
+            init_config.get("project"),
+            init_config.get("mode"),
+        )
+
+        # Log resume info if attaching to existing run
+        if "run_id" in init_config:
+            logger.info(
+                "[%s] Attaching to W&B run %s for multi-process logging",
+                process_name,
+                init_config["run_id"],
+            )
+
+        # Validate critical parameters
+        if not init_config.get("entity"):
+            logger.warning("[%s] W&B entity not set - will use default", process_name)
+        if not init_config.get("project"):
+            logger.warning("[%s] W&B project not set - will use default", process_name)
+
+        # Initialize backend and manager
+        initialize_monitoring(backend_type=backend_type, **init_config)
+        monitor = get_monitoring_manager()
+        logger.info("[%s] Monitoring manager initialized", process_name)
+
+        # Start the W&B run (connects to API, resumes existing run)
+        run_name = init_config.get("run_name")
+        if run_name:
+            logger.info("[%s] Starting W&B run: %s", process_name, run_name)
+            start_time = time.time()
+            try:
+                actual_run_id = await monitor.start_run(run_name, init_config)
+                start_duration = time.time() - start_time
+                logger.info(
+                    "[%s] ✅ W&B run started in %.1fs (run_id=%s)",
+                    process_name,
+                    start_duration,
+                    actual_run_id,
+                )
+            except Exception as start_exc:
+                start_duration = time.time() - start_time
+                logger.error(
+                    "[%s] ❌ Failed to start W&B run after %.1fs: %s",
+                    process_name,
+                    start_duration,
+                    start_exc,
+                )
+                logger.info(
+                    "[%s] Hint: Increase WANDB_INIT_TIMEOUT (current: %s) if shared mode workers timeout",
+                    process_name,
+                    init_config.get("init_timeout", "120"),
+                )
+                return None
+
+        # Test connection with a gauge metric
+        if test_connection and run_name:
+            logger.debug("[%s] Testing W&B metric logging...", process_name)
+            test_start = time.time()
+            try:
+                # Set block context if callback provided
+                if get_block_context is not None:
+                    block, window = await get_block_context()
+                    monitor.set_block_context(block, window)
+
+                await monitor.log_gauge(f"{process_name}/connection_test", 1.0)
+                await monitor.flush_metrics()
+                test_duration = time.time() - test_start
+                logger.info(
+                    "[%s] ✅ W&B connection test passed in %.3fs",
+                    process_name,
+                    test_duration,
+                )
+            except Exception as test_exc:
+                test_duration = time.time() - test_start
+                logger.warning(
+                    "[%s] ⚠️ W&B connection test failed after %.3fs: %s (continuing anyway)",
+                    process_name,
+                    test_duration,
+                    test_exc,
+                )
+
+        return monitor
+
+    except Exception as exc:
+        logger.warning("[%s] Failed to initialize monitoring: %s", process_name, exc)
+        return None

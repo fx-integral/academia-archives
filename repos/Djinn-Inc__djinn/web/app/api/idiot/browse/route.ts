@@ -1,0 +1,265 @@
+import { NextRequest, NextResponse } from "next/server";
+import { ethers } from "ethers";
+import { ADDRESSES, SIGNAL_COMMITMENT_ABI } from "@/lib/contracts";
+import { getIp, isRateLimited, rateLimitResponse } from "@/lib/rate-limit";
+import { DEFAULT_BOOTSTRAP } from "@/lib/validatorDiscovery";
+
+/**
+ * GET /api/idiot/browse
+ *
+ * Sprint A Stage A-3: forward-first proxy. When the bootstrap validator
+ * responds 200 on /v1/idiot/browse, pass it through verbatim (tagged
+ * x-djinn-source: validator). The validator computes the same shape
+ * this Next handler produced, so no field mapping is needed.
+ *
+ * Falls back to the local 7-day event scan when the bootstrap is
+ * unreachable, returns non-200, or times out. Static IPFS clients
+ * bypass this route entirely by calling the validator directly.
+ *
+ * Query params:
+ *   sport      - Filter by sport key
+ *   genius     - Filter by genius address
+ *   sort       - Sort: fee, expires_soon (default: expires_soon)
+ *   limit      - Max results (default 20, max 100)
+ *   offset     - Pagination offset
+ *   bust       - Force cache rescan
+ */
+
+const VALIDATOR_FORWARD_TIMEOUT_MS = 15_000;
+
+async function tryValidator(search: string): Promise<Response | null> {
+  try {
+    const resp = await fetch(`${DEFAULT_BOOTSTRAP}/v1/idiot/browse${search}`, {
+      headers: { accept: "application/json" },
+      signal: AbortSignal.timeout(VALIDATOR_FORWARD_TIMEOUT_MS),
+    });
+    if (resp.ok) return resp;
+  } catch {
+    // Fall through to local scan.
+  }
+  return null;
+}
+
+const RPC_URL = process.env.BASE_RPC_URL || process.env.NEXT_PUBLIC_BASE_RPC_URL || "https://sepolia.base.org";
+const MAX_LIMIT = 100;
+const DEPLOY_BLOCK = Number(process.env.NEXT_PUBLIC_DEPLOY_BLOCK ?? "0");
+const CHUNK_SIZE = 9_999; // Max blocks per queryFilter call (RPC provider limit)
+
+// In-memory cache for the browse endpoint to avoid re-scanning on every request.
+// Serverless cold starts will re-populate, but warm instances serve instantly.
+let browseCache: { signals: Record<string, unknown>[]; lastBlock: number; updatedAt: number } | null = null;
+const BROWSE_CACHE_TTL_MS = 30_000; // 30 seconds: balances freshness vs RPC load
+const BROWSE_CACHE_HARD_TTL_MS = 300_000; // 5 minutes: full rescan to catch cancellations
+
+export async function GET(request: NextRequest) {
+  // Cold-path block scans are expensive (1.5M blocks, chunked). Cap per-IP
+  // traffic so an attacker can't force repeated cache misses to burn the
+  // RPC provider's budget.
+  if (isRateLimited("idiot-browse", getIp(request), 30)) {
+    return rateLimitResponse();
+  }
+
+  const url = new URL(request.url);
+  const { searchParams } = url;
+  const sport = searchParams.get("sport");
+  const genius = searchParams.get("genius");
+  const sortBy = searchParams.get("sort") || "expires_soon";
+  const limit = Math.min(parseInt(searchParams.get("limit") || "20", 10), MAX_LIMIT);
+  const offset = parseInt(searchParams.get("offset") || "0", 10);
+
+  if (genius && !ethers.isAddress(genius)) {
+    return NextResponse.json(
+      { error: "invalid_address", message: "genius must be a valid Ethereum address" },
+      { status: 400 },
+    );
+  }
+
+  const forwarded = await tryValidator(url.search);
+  if (forwarded) {
+    const body = await forwarded.text();
+    return new NextResponse(body, {
+      status: 200,
+      headers: {
+        "content-type": "application/json",
+        "cache-control": "public, s-maxage=30, stale-while-revalidate=120",
+        "x-djinn-source": "validator",
+      },
+    });
+  }
+
+  if (ADDRESSES.signalCommitment === "0x0000000000000000000000000000000000000000") {
+    return NextResponse.json({ signals: [], total: 0, offset, limit });
+  }
+
+  try {
+    const provider = new ethers.JsonRpcProvider(RPC_URL);
+    const contract = new ethers.Contract(
+      ADDRESSES.signalCommitment,
+      SIGNAL_COMMITMENT_ABI,
+      provider,
+    );
+
+    // Use cached results if fresh enough (unless bust param forces bypass)
+    const bust = searchParams.has("bust");
+    const now = Math.floor(Date.now() / 1000);
+    if (!bust && browseCache && Date.now() - browseCache.updatedAt < BROWSE_CACHE_TTL_MS) {
+      // Filter cached signals (remove newly expired ones)
+      const signals = browseCache.signals.filter((s) => {
+        if ((s.expires_at_unix as number) < now) return false;
+        if (sport && s.sport !== sport) return false;
+        if (genius && (s.genius as string).toLowerCase() !== ethers.getAddress(genius).toLowerCase()) return false;
+        return true;
+      });
+
+      if (sortBy === "expires_soon") {
+        signals.sort((a, b) => String(a.expires_at).localeCompare(String(b.expires_at)));
+      } else if (sortBy === "fee") {
+        signals.sort((a, b) => (a.fee_bps as number) - (b.fee_bps as number));
+      }
+
+      const paged = signals.slice(offset, offset + limit);
+      return NextResponse.json({ signals: paged, total: signals.length, offset, limit }, {
+        headers: {
+          "Cache-Control": "public, s-maxage=30, stale-while-revalidate=120",
+        },
+      });
+    }
+
+    // If we have a stale cache, do an incremental scan from lastBlock + 1
+    // instead of rescanning the full 7-day range. This makes stale-cache
+    // refreshes nearly instant (only a handful of new blocks to scan).
+    const geniusFilter = genius ? ethers.getAddress(genius) : null;
+    const filter = contract.filters.SignalCommitted(null, geniusFilter);
+    const currentBlock = await provider.getBlockNumber();
+    const SEVEN_DAYS_BLOCKS = 604_800; // ~7 days at 2 blocks/sec
+    const fullScanFrom = Math.max(DEPLOY_BLOCK, currentBlock - SEVEN_DAYS_BLOCKS);
+    // Incremental scan if cache exists and isn't too old; full scan otherwise
+    const cacheIsRecent = browseCache !== null && (Date.now() - browseCache.updatedAt < BROWSE_CACHE_HARD_TTL_MS);
+    const fromBlock = (cacheIsRecent && browseCache) ? browseCache.lastBlock + 1 : fullScanFrom;
+
+    // Build chunk ranges and query with limited concurrency to avoid RPC rate limits
+    const chunkRanges: [number, number][] = [];
+    for (let start = fromBlock; start <= currentBlock; start += CHUNK_SIZE) {
+      chunkRanges.push([start, Math.min(start + CHUNK_SIZE - 1, currentBlock)]);
+    }
+    const events: (ethers.EventLog | ethers.Log)[] = [];
+    const CONCURRENCY = 20;
+    for (let i = 0; i < chunkRanges.length; i += CONCURRENCY) {
+      const batch = chunkRanges.slice(i, i + CONCURRENCY);
+      const results = await Promise.allSettled(
+        batch.map(([start, end]) =>
+          contract.queryFilter(filter, start, end),
+        ),
+      );
+      for (const result of results) {
+        if (result.status === "fulfilled") {
+          events.push(...result.value);
+        }
+      }
+    }
+
+    const signals: Record<string, unknown>[] = [];
+
+    // Pre-filter expired events before enrichment (avoids RPC calls for dead signals)
+    const activeEvents = events.reverse().filter((event) => {
+      const args = (event as ethers.EventLog).args;
+      if (!args) return false;
+      return Number(args.expiresAt) >= now;
+    });
+
+    // Batch isActive checks with controlled concurrency
+    const ENRICH_CONCURRENCY = 15;
+    const enrichmentPromises = activeEvents.map(async (event) => {
+      const args = (event as ethers.EventLog).args;
+      if (!args) return null;
+
+      const signalId = args.signalId;
+      const expiresAt = Number(args.expiresAt);
+
+      // Check if still active on-chain (single RPC call, skip getSignal)
+      try {
+        const isActive = await contract.isActive(signalId);
+        if (!isActive) return null;
+      } catch {
+        return null;
+      }
+
+      // Use minNotional from event args if available, else default
+      const minNotional = args.minNotional?.toString() ?? "0";
+
+      return {
+        signal_id: signalId.toString(),
+        genius: args.genius,
+        sport: args.sport,
+        fee_bps: Number(args.maxPriceBps),
+        sla_multiplier_bps: Number(args.slaMultiplierBps),
+        max_notional: args.maxNotional.toString(),
+        min_notional: minNotional,
+        expires_at_unix: expiresAt,
+        max_notional_usdc: Number(args.maxNotional) / 1e6,
+        expires_at: new Date(expiresAt * 1000).toISOString(),
+      };
+    });
+
+    // Process enrichment in batches to avoid overwhelming RPC
+    const enriched: (Record<string, unknown> | null)[] = [];
+    for (let i = 0; i < enrichmentPromises.length; i += ENRICH_CONCURRENCY) {
+      const batch = enrichmentPromises.slice(i, i + ENRICH_CONCURRENCY);
+      const results = await Promise.all(batch);
+      enriched.push(...results);
+    }
+    for (const s of enriched) {
+      if (s) signals.push(s);
+    }
+
+    // Merge with existing cache (incremental) or replace (full scan)
+    if (cacheIsRecent && browseCache) {
+      // Incremental: keep existing signals, add new ones, prune expired
+      const newIds = new Set(signals.map((s) => s.signal_id as string));
+      const kept = browseCache.signals.filter((s) => {
+        if ((s.expires_at_unix as number) < now) return false;
+        if (newIds.has(s.signal_id as string)) return false; // replaced by fresh version
+        return true;
+      });
+      browseCache = { signals: [...kept, ...signals], lastBlock: currentBlock, updatedAt: Date.now() };
+    } else {
+      browseCache = { signals: [...signals], lastBlock: currentBlock, updatedAt: Date.now() };
+    }
+
+    // Apply filters from the full cache (not just newly scanned signals)
+    const allSignals = browseCache?.signals ?? signals;
+    const filtered = allSignals.filter((s) => {
+      if ((s.expires_at_unix as number) < now) return false;
+      if (sport && s.sport !== sport) return false;
+      if (genius && (s.genius as string).toLowerCase() !== ethers.getAddress(genius).toLowerCase()) return false;
+      return true;
+    });
+
+    // Sort
+    if (sortBy === "expires_soon") {
+      filtered.sort((a, b) => String(a.expires_at).localeCompare(String(b.expires_at)));
+    } else if (sortBy === "fee") {
+      filtered.sort((a, b) => (a.fee_bps as number) - (b.fee_bps as number));
+    }
+
+    const paged = filtered.slice(offset, offset + limit);
+
+    return NextResponse.json({
+      signals: paged,
+      total: filtered.length,
+      offset,
+      limit,
+    }, {
+      headers: {
+        "Cache-Control": "public, s-maxage=30, stale-while-revalidate=120",
+        "x-djinn-source": "vercel-local",
+      },
+    });
+  } catch (error) {
+    console.error("browse_error", error);
+    return NextResponse.json(
+      { error: "internal_error", message: "Failed to fetch signals" },
+      { status: 500, headers: { "x-djinn-source": "vercel-local" } },
+    );
+  }
+}

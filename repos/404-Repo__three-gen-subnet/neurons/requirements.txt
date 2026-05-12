@@ -1,0 +1,9 @@
+bittensor==9.9.0
+bittensor-wallet==4.0.0
+websockets==14.2
+pybase64==1.4.0
+git+https://github.com/404-Repo/spz.git@0.1
+aioquic==1.2.0
+glicko2==2.1.0
+openai==1.97.1
+blake3==1.0.5

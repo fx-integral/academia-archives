@@ -1,0 +1,173 @@
+name: Release CLI
+
+on:
+  push:
+    tags:
+      - "basilica-cli-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g., basilica-cli-v0.1.0)"
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  create-release:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    # Protection chokepoint for the whole CLI release pipeline. Configure
+    # `cli-release` in repo settings > Environments with required reviewers;
+    # nothing else in this workflow runs until approval lands because every
+    # downstream job `needs: create-release`.
+    environment: cli-release
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+      release_id: ${{ steps.create_release.outputs.id }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Extract version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION="${{ github.event.inputs.tag }}"
+            # Validate that the tag starts with basilica-cli-v
+            if [[ ! "$VERSION" =~ ^basilica-cli-v ]]; then
+              echo "Error: Tag must start with 'basilica-cli-v' prefix"
+              echo "Example: basilica-cli-v0.1.0"
+              exit 1
+            fi
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+          # Remove 'basilica-cli-v' prefix to get clean version
+          CLEAN_VERSION="${VERSION#basilica-cli-v}"
+          echo "version=$CLEAN_VERSION" >> $GITHUB_OUTPUT
+          echo "tag=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Basilica CLI ${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: true
+          generate_release_notes: false
+          body: |
+            For installation instructions, please visit [https://basilica.ai/](https://basilica.ai/)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-binaries:
+    needs: create-release
+    environment: auth0-variables
+    strategy:
+      matrix:
+        include:
+          # Linux x86_64 - musl static build on Ubuntu 24.04 LTS
+          - target: x86_64-unknown-linux-musl
+            os: blacksmith-4vcpu-ubuntu-2404
+            suffix: linux-amd64
+          # Linux ARM64 - musl static build on Blacksmith ARM runner
+          - target: aarch64-unknown-linux-musl
+            os: blacksmith-4vcpu-ubuntu-2404-arm
+            suffix: linux-arm64
+          # macOS Intel build (cross-compile from Apple Silicon)
+          - target: x86_64-apple-darwin
+            os: macos-14 # Cross-compile from Apple Silicon (macos-13 retired)
+            suffix: darwin-amd64
+          # macOS Apple Silicon build
+          - target: aarch64-apple-darwin
+            os: macos-14 # Use macos-14 for Apple Silicon (M1) runners
+            suffix: darwin-arm64
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      CARGO_NET_RETRY: 10
+      RUST_BACKTRACE: short
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: rustfmt
+          targets: ${{ matrix.target }}
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: release-cli-${{ matrix.target }}
+
+      # Install dependencies for Linux
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler pkg-config build-essential musl-tools
+
+      # Install dependencies for macOS
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install protobuf pkg-config openssl
+
+      # Build binary
+      - name: Build binary
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "10.15" # Ensure compatibility with older macOS versions
+          BASILICA_AUTH0_CLIENT_ID: ${{ vars.BASILICA_AUTH0_CLIENT_ID }}
+          BASILICA_AUTH0_AUDIENCE: ${{ vars.BASILICA_AUTH0_AUDIENCE }}
+          BASILICA_AUTH0_ISSUER: ${{ vars.BASILICA_AUTH0_ISSUER }}
+          BASILICA_AUTH0_DOMAIN: ${{ vars.BASILICA_AUTH0_DOMAIN }}
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} -p basilica-cli
+
+      # Package binary in self_update compatible format: basilica-<version>-<target>.tar.gz
+      - name: Package binary
+        run: |
+          # Copy binary to working directory
+          cp target/${{ matrix.target }}/release/basilica ./basilica
+          chmod +x ./basilica
+
+          # Strip debug symbols to reduce size
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            strip --strip-all ./basilica
+          else
+            strip ./basilica
+          fi
+
+          # Create tar.gz archive with self_update expected naming: basilica-<version>-<target>.tar.gz
+          ARCHIVE_NAME="basilica-${{ needs.create-release.outputs.version }}-${{ matrix.target }}.tar.gz"
+          tar czf "$ARCHIVE_NAME" basilica
+
+          # Generate checksum
+          if command -v shasum &> /dev/null; then
+            shasum -a 256 "$ARCHIVE_NAME" > "${ARCHIVE_NAME}.sha256"
+          else
+            sha256sum "$ARCHIVE_NAME" > "${ARCHIVE_NAME}.sha256"
+          fi
+
+          # Display file info
+          ls -lh "$ARCHIVE_NAME"
+
+      # Upload binary
+      - name: Upload Release Binary
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ needs.create-release.outputs.tag }}
+          files: |
+            basilica-${{ needs.create-release.outputs.version }}-${{ matrix.target }}.tar.gz
+            basilica-${{ needs.create-release.outputs.version }}-${{ matrix.target }}.tar.gz.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,278 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Live log stream with filtering by level, hotkey, UID, and custom regex.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [
+    {
+      "asDropdown": false,
+      "icon": "apps",
+      "includeVars": false,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "title": "Home",
+      "tooltip": "Monitoring hub",
+      "type": "link",
+      "url": "/d/grail-home"
+    },
+    {
+      "asDropdown": false,
+      "icon": "table",
+      "includeVars": false,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "title": "Leaderboard",
+      "tooltip": "Miner leaderboard",
+      "type": "link",
+      "url": "/d/grail-leaderboard"
+    },
+    {
+      "asDropdown": false,
+      "icon": "dashboard",
+      "includeVars": false,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "title": "Operations",
+      "tooltip": "Operations dashboard",
+      "type": "link",
+      "url": "/d/grail-ops"
+    }
+  ],
+  "liveNow": true,
+  "panels": [
+    {
+      "datasource": { "type": "loki", "uid": "loki" },
+      "description": "Live log stream with advanced filtering capabilities. Use the controls above to filter by level, hotkey, quick search presets, or custom regex patterns.",
+      "gridPos": { "h": 22, "w": 24, "x": 0, "y": 0 },
+      "id": 1,
+      "options": {
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "prettifyLogMessage": false,
+        "showCommonLabels": true,
+        "showLabels": false,
+        "showTime": true,
+        "sortOrder": "Descending",
+        "wrapLogMessage": true
+      },
+      "targets": [
+        {
+          "datasource": { "type": "loki", "uid": "loki" },
+          "expr": "{job=\"grail\", env=~\"$env\", service=~\"$service\", network=~\"$network\", netuid=~\"$netuid\", wallet=~\"$wallet\", hotkey=~\"$hotkey\", level=~\"$severity\"} |~ \"$quick\" |~ \"$miner_uid\" |~ \"$search\"",
+          "refId": "A"
+        }
+      ],
+      "title": "GRAIL Live Logs",
+      "type": "logs"
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["grail", "logs"],
+  "templating": {
+    "list": [
+      {
+        "current": { "selected": true, "text": "prod", "value": "prod" },
+        "datasource": { "type": "loki", "uid": "loki" },
+        "definition": "label_values(env)",
+        "hide": 0,
+        "includeAll": true,
+        "allValue": ".+",
+        "label": "🌎 Env",
+        "multi": false,
+        "name": "env",
+        "options": [],
+        "query": "label_values(env)",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "type": "query"
+      },
+      {
+        "current": { "selected": false, "text": "All", "value": "$__all" },
+        "datasource": { "type": "loki", "uid": "loki" },
+        "definition": "label_values(service)",
+        "hide": 2,
+        "includeAll": true,
+        "allValue": ".+",
+        "label": "🧩 Service",
+        "multi": false,
+        "name": "service",
+        "options": [],
+        "query": "label_values(service)",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "type": "query"
+      },
+      {
+        "current": { "selected": false, "text": "All", "value": "$__all" },
+        "datasource": { "type": "loki", "uid": "loki" },
+        "definition": "label_values(level)",
+        "hide": 0,
+        "includeAll": true,
+        "allValue": ".+",
+        "label": "📊 Level",
+        "multi": true,
+        "name": "severity",
+        "options": [],
+        "query": "label_values(level)",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "type": "query"
+      },
+      {
+        "current": { "selected": false, "text": "All", "value": "$__all" },
+        "datasource": { "type": "loki", "uid": "loki" },
+        "definition": "label_values(network)",
+        "hide": 0,
+        "includeAll": true,
+        "allValue": ".+",
+        "label": "🌐 Network",
+        "multi": false,
+        "name": "network",
+        "options": [],
+        "query": "label_values(network)",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "type": "query"
+      },
+      {
+        "current": { "selected": false, "text": "All", "value": "$__all" },
+        "datasource": { "type": "loki", "uid": "loki" },
+        "definition": "label_values(netuid)",
+        "hide": 0,
+        "includeAll": true,
+        "allValue": ".+",
+        "label": "🔢 NetUID",
+        "multi": false,
+        "name": "netuid",
+        "options": [],
+        "query": "label_values(netuid)",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "type": "query"
+      },
+      {
+        "current": { "selected": false, "text": "All", "value": "$__all" },
+        "datasource": { "type": "loki", "uid": "loki" },
+        "definition": "label_values(wallet)",
+        "hide": 0,
+        "includeAll": true,
+        "allValue": ".+",
+        "label": "💰 Wallet",
+        "multi": false,
+        "name": "wallet",
+        "options": [],
+        "query": "label_values(wallet)",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "type": "query"
+      },
+      {
+        "current": { "selected": false, "text": "All", "value": "$__all" },
+        "datasource": { "type": "loki", "uid": "loki" },
+        "definition": "label_values(hotkey)",
+        "hide": 0,
+        "includeAll": true,
+        "allValue": ".+",
+        "label": "🔑 Hotkey",
+        "multi": false,
+        "name": "hotkey",
+        "options": [],
+        "query": "label_values(hotkey)",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "type": "query"
+      },
+      {
+        "name": "miner_uid",
+        "type": "textbox",
+        "label": "🧑‍🔧 Miner UID",
+        "hide": 0,
+        "query": ".*",
+        "current": { "text": "", "value": ".*" },
+        "description": "Enter UID number (0-999). Only numbers 0-999 accepted.",
+        "skipUrlSync": false,
+        "regex": "^([0-9]|[1-9][0-9]|[1-9][0-9][0-9]|)$"
+      },
+      {
+        "name": "quick",
+        "type": "custom",
+        "label": "🔍 Quick Search",
+        "hide": 2,
+        "query": ".*,(?i)error|\\u274c|exception|fail,(?i)uid\\s*\\d+|miner.*uid=\\d+,(?i)register|registration|pow|nonce|hotkey|coldkey|wallet|subtensor|extrinsic,(?i)weight|set_weights|dendrite|metagraph,(?i)axon|serve|bind|port|socket|listen,(?i)rpc|websocket|ws|block|finality|nonce|fee|extrinsic|inclusion|reorg|era,(?i)metagraph|sync|catch.*up|stale|lag,(?i)peer|libp2p|kademlia|bootstrap|discovery|dial|connection|reset|timeout,(?i)oom|out.*of.*memory|cuda|gpu|vram|cpu|disk|rate.?limit|throttle|429|500|timeout",
+        "options": [
+          {"text": "🔍 All", "value": ".*", "selected": true},
+          {"text": "❌ Errors", "value": "(?i)error|\\u274c|exception|fail", "selected": false},
+          {"text": "🆔 UID Patterns", "value": "(?i)uid\\s*\\d+|miner.*uid=\\d+", "selected": false},
+          {"text": "🕸 Registration", "value": "(?i)register|registration|pow|nonce|hotkey|coldkey|wallet|subtensor|extrinsic", "selected": false},
+          {"text": "⚖️ Weights", "value": "(?i)weight|set_weights|dendrite|metagraph", "selected": false},
+          {"text": "👾 Axon", "value": "(?i)axon|serve|bind|port|socket|listen", "selected": false},
+          {"text": "🔧 Chain/RPC", "value": "(?i)rpc|websocket|ws|block|finality|nonce|fee|extrinsic|inclusion|reorg|era", "selected": false},
+          {"text": "🔄 Sync/Metagraph", "value": "(?i)metagraph|sync|catch.*up|stale|lag", "selected": false},
+          {"text": "🌐 Networking", "value": "(?i)peer|libp2p|kademlia|bootstrap|discovery|dial|connection|reset|timeout", "selected": false},
+          {"text": "🏋️ Performance", "value": "(?i)oom|out.*of.*memory|cuda|gpu|vram|cpu|disk|rate.?limit|throttle|429|500|timeout", "selected": false}
+        ],
+        "current": {"text": "🔍 All", "value": ".*", "selected": true},
+        "skipUrlSync": false
+      },
+      {
+        "name": "search",
+        "type": "textbox",
+        "label": "🔎 Custom Search (regex)",
+        "hide": 0,
+        "query": ".*",
+        "current": {"text": ".*", "value": ".*"},
+        "skipUrlSync": false
+      },
+      {
+        "name": "filters",
+        "type": "adhoc",
+        "datasource": { "type": "loki", "uid": "loki" },
+        "hide": 2,
+        "label": "🏷️ Advanced Filters"
+      }
+    ]
+  },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {
+    "refresh_intervals": ["5s", "10s", "30s", "1m", "5m", "15m", "30m", "1h", "2h", "1d"],
+    "time_options": ["5m", "15m", "1h", "6h", "12h", "24h", "2d", "7d", "30d"]
+  },
+  "timezone": "utc",
+  "title": "GRAIL Log Explorer",
+  "uid": "grail-log-explorer",
+  "version": 5,
+  "weekStart": ""
+}

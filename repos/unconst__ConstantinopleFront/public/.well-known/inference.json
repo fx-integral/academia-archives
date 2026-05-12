@@ -1,0 +1,35 @@
+{
+  "name": "Constantinople",
+  "description": "Decentralized LLM inference on Bittensor Subnet 97. Hidden state verification. OpenAI-compatible API.",
+  "network": "bittensor",
+  "subnet": 97,
+  "api_base": "https://api.constantinople.cloud",
+  "models": [
+    {
+      "name": "Qwen/Qwen2.5-7B-Instruct",
+      "capabilities": ["chat", "completions", "stream", "embeddings"],
+      "verification": "hidden_state_cosine_similarity_0.995"
+    }
+  ],
+  "auth": {
+    "type": "bearer",
+    "prefix": "cst-",
+    "signup": "https://www.constantinople.cloud/#api"
+  },
+  "endpoints": {
+    "chat": "/v1/chat/completions",
+    "completions": "/v1/completions",
+    "embeddings": "/v1/embeddings",
+    "models": "/v1/models",
+    "balance": "/v1/user/balance",
+    "pricing": "/v1/pricing",
+    "health": "/health"
+  },
+  "pricing": {
+    "input_per_1m": 0.50,
+    "output_per_1m": 1.50,
+    "currency": "USD",
+    "free_tier": "1.0 credits on signup"
+  },
+  "docs": "/SKILL.md"
+}

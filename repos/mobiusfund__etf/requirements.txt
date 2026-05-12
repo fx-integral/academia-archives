@@ -1,0 +1,4 @@
+setuptools>=70
+requests>=2
+bittensor>=9.11
+pandas==2.2.3

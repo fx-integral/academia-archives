@@ -1,0 +1,49 @@
+name: Local Testnet Smoke
+
+# Manual-trigger only. The full local-testnet suite expects:
+#   - The `contracts/` tree (lives in subnet112/minotaur_contracts now)
+#   - An ALCHEMY_API_KEY repo secret for the mainnet/base fork RPCs
+#   - A multi-service docker-compose stack (anvil + subtensor + api +
+#     validators + relayer) that's better exercised in a dev rig than a
+#     hosted GitHub runner.
+#
+# Run on demand from the Actions tab when you want a full-stack smoke
+# check; the daily schedule was removed so a missing ALCHEMY_API_KEY
+# secret stops generating red checkmarks on the repo home.
+on:
+  workflow_dispatch:
+
+jobs:
+  local_testnet-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Create virtualenv and install dependencies
+        run: |
+          python -m venv .venv
+          ./.venv/bin/pip install --upgrade pip
+          ./.venv/bin/pip install -r requirements.txt
+
+      - name: Prepare local testnet RPC config
+        run: |
+          cat > platform/local_testnet/.env <<EOF
+          ALCHEMY_RPC_URL=https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}
+          BASE_ALCHEMY_RPC_URL=https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}
+          EOF
+        env:
+          ALCHEMY_API_KEY: ${{ secrets.ALCHEMY_API_KEY }}
+
+      - name: Run local testnet smoke suite
+        run: make test-testnet
+
+      - name: Tear down local testnet
+        if: always()
+        run: make testnet-down

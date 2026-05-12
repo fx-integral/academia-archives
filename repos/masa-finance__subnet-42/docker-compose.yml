@@ -1,0 +1,77 @@
+services:
+  neuron:
+    profiles:
+      ["miner", "miner-tee", "validator", "validator-tee"]
+    image: masaengineering/subnet-42:latest
+    pull_policy: always
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: Dockerfile
+      x-bake:
+        when:
+          variable: BUILD_LOCAL
+          value: "true"
+    volumes:
+      - ${WALLET_PATH:-~/.bittensor}:/root/.bittensor
+    deploy:
+      resources:
+        limits:
+          memory: ${NEURON_MEMORY_LIMIT:-0}
+          cpus: ${NEURON_CPU_LIMIT:-0}
+        reservations:
+          memory: ${NEURON_MEMORY_RESERVATION:-0}
+          cpus: ${NEURON_CPU_RESERVATION:-0}
+    ports:
+      - "${VALIDATOR_PORT:-8090}:${VALIDATOR_PORT:-8090}"
+      - "${MINER_PORT:-8091}:${MINER_PORT:-8091}"
+    env_file: .env
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+        compress: "true"
+        mode: "non-blocking"
+        max-buffer-size: "4m"
+
+  worker:
+    profiles: ["tee", "miner-tee", "validator-tee"]
+    image: masaengineering/tee-worker:latest
+    pull_policy: always
+    restart: unless-stopped
+    ports:
+      - "${TEE_PORT:-8080}:${TEE_PORT:-8080}"
+    env_file: .env
+    deploy:
+      resources:
+        limits:
+          memory: ${WORKER_MEMORY_LIMIT:-0}
+          cpus: ${WORKER_CPU_LIMIT:-0}
+        reservations:
+          memory: ${WORKER_MEMORY_RESERVATION:-0}
+          cpus: ${WORKER_CPU_RESERVATION:-0}
+    devices:
+      - /dev/sgx_enclave
+      - /dev/sgx_provision
+    network_mode: host
+    volumes:
+      - ./.env:/home/masa/.env
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+        compress: "true"
+        mode: "non-blocking"
+        max-buffer-size: "4m"
+
+  watchtower:
+    profiles:
+      ["miner", "miner-tee", "validator", "validator-tee"]
+    image: containrrr/watchtower:latest
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+    command: --interval 7200 --cleanup
+

@@ -1,0 +1,22 @@
+{
+  "name": "djinn-subgraph",
+  "version": "1.0.0",
+  "description": "The Graph subgraph for the Djinn Protocol on Base",
+  "license": "MIT",
+  "scripts": {
+    "codegen": "graph codegen",
+    "build": "graph build",
+    "deploy": "graph deploy djinn --node https://api.studio.thegraph.com/deploy/",
+    "create-local": "graph create --node http://localhost:8020/ djinn",
+    "remove-local": "graph remove --node http://localhost:8020/ djinn",
+    "deploy-local": "graph deploy --node http://localhost:8020/ --ipfs http://localhost:5001 djinn",
+    "test": "graph test"
+  },
+  "dependencies": {
+    "@graphprotocol/graph-cli": "^0.71.2",
+    "@graphprotocol/graph-ts": "^0.35.0"
+  },
+  "devDependencies": {
+    "matchstick-as": "^0.6.0"
+  }
+}

@@ -1,0 +1,39 @@
+# Virtual environment
+.venv/
+
+# Reports and cache
+.reports/
+**/__pycache__/
+*.pyc
+
+# Environment variables
+.env
+*.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+
+# Distribution
+dist/
+build/
+*.egg-info/
+*404-weights-service.config.js
+*404-weights-setter.config.js

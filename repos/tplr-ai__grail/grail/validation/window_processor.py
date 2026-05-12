@@ -1,0 +1,380 @@
+"""Window processing orchestrator for GRAIL validation.
+
+Coordinates miner validation, copycat detection, and result aggregation for a
+single window.
+"""
+
+from __future__ import annotations
+
+import gc
+import json
+import logging
+import time
+from collections import Counter
+from typing import Any
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from ..infrastructure.chain import GrailChainManager
+from ..logging_utils import miner_log_context
+from .copycat_service import CopycatService, MinerCopycatSubmission
+from .miner_validator import (
+    FAILURE_FLAG_KEY,
+    MinerValidator,
+    WindowEnvConfig,
+)
+from .types import MinerResults, WindowResults
+
+logger = logging.getLogger(__name__)
+verdict_logger = logging.getLogger("grail.validator.verdict")
+
+
+class WindowProcessor:
+    """Orchestrates validation for a single window.
+
+    Responsibilities:
+    1. Validate each selected miner's submissions
+    2. Aggregate metrics across miners
+    3. Detect copycat cheaters
+    4. Apply gating to cheaters
+    5. Return structured results
+
+    Design:
+    - Delegates miner validation to MinerValidator
+    - Delegates copycat detection to CopycatService
+    - Coordinates timing and aggregation
+    - Returns structured WindowResults
+    """
+
+    def __init__(
+        self,
+        miner_validator: MinerValidator,
+        copycat_service: CopycatService,
+    ):
+        """Initialize window processor.
+
+        Args:
+            miner_validator: Validator for individual miner submissions
+            copycat_service: Service for copycat detection and gating
+        """
+        self._miner_validator = miner_validator
+        self._copycat_service = copycat_service
+
+    async def resolve_window_env_config(self, model: AutoModelForCausalLM) -> WindowEnvConfig:
+        """Public delegate to ``MinerValidator.resolve_window_env_config``.
+
+        Exposed so that ``ValidationService._process_window`` can resolve the
+        per-window protocol config BEFORE it touches any rolling history,
+        without having to reach into ``WindowProcessor``'s internals.
+        """
+        return await self._miner_validator.resolve_window_env_config(model)
+
+    async def process_window(
+        self,
+        window: int,
+        window_hash: str,
+        window_rand: str,
+        miners_to_check: list[str],
+        validator_wallet: Any,  # bt.wallet
+        model: AutoModelForCausalLM,
+        tokenizer: AutoTokenizer,
+        credentials: Any,
+        chain_manager: GrailChainManager,
+        monitor: Any | None,
+        uid_by_hotkey: dict[str, int],
+        subtensor: Any,  # bt.subtensor
+        env_config: WindowEnvConfig,
+        heartbeat_callback: Any = None,
+        deadline_ts: float | None = None,
+        uploads_by_hotkey: dict[str, float | None] | None = None,
+    ) -> WindowResults:
+        """Process a complete validation window.
+
+        Args:
+            window: Window start block number
+            window_hash: Block hash at window start
+            window_rand: Combined randomness for the window
+            miners_to_check: List of miner hotkeys to validate
+            validator_wallet: Validator's wallet
+            model: Language model for validation
+            tokenizer: Tokenizer for decoding
+            credentials: Default R2 credentials
+            chain_manager: Chain manager for miner buckets
+            monitor: Optional monitoring client
+            uid_by_hotkey: Mapping of hotkey to UID
+            subtensor: Subtensor instance for block queries
+            env_config: Per-window protocol config resolved by
+                ``ValidationService._process_window`` BEFORE any rolling-history
+                mutation. Carries the trainer-published env_id, env_params,
+                generation_params, and thinking_mode. If the resolve failed,
+                the service aborts the window and never reaches this method.
+            heartbeat_callback: Optional watchdog heartbeat callback
+            deadline_ts: Upload deadline timestamp (unix seconds)
+            uploads_by_hotkey: Per-hotkey S3 LastModified timestamps from
+                ``MinerSampler.discover_active_miners``. Used by
+                ``CopycatService.detect_cheaters`` for directional
+                attribution: the later uploader of a violating pair is the
+                copier; the earlier uploader is the victim and is not gated.
+                When omitted, the copycat detector abstains from gating.
+
+        Returns:
+            WindowResults with all aggregated metrics and rollouts
+        """
+        # Window timing
+        window_t0 = time.monotonic()
+        try:
+            block_beg = await subtensor.get_current_block()
+        except Exception:
+            block_beg = None
+
+        # Initialize aggregation structures
+        window_metrics: dict[str, dict[str, int]] = {}
+        # Raw per-miner copycat inputs collected during the validation loop.
+        # Upload-time (from S3 LastModified, forwarded from the sampler) is
+        # joined in at the end to produce MinerCopycatSubmission objects
+        # handed to the copycat detector. Keeping this as an intermediate
+        # dict (rather than constructing submissions piecemeal) keeps the
+        # per-miner error path at line ~248 focused on metrics and avoids
+        # exposing upload-time to the validator loop.
+        miner_digest_counters: dict[str, tuple[Counter[str], int]] = {}
+        text_logs_emitted: dict[str, int] = {}
+
+        # Aggregated counters
+        total_rollouts_processed = 0
+        invalid_signatures = 0
+        invalid_proofs = 0
+        processing_errors = 0
+        files_found = 0
+
+        # Per-miner timing lists
+        miner_seconds_list: list[float] = []
+        miner_blocks_list: list[int] = []
+        download_times: list[float] = []
+
+        # Process each miner
+        for miner_hotkey in miners_to_check:
+            # Update heartbeat
+            if heartbeat_callback:
+                try:
+                    heartbeat_callback()
+                except Exception:
+                    pass
+
+            # Per-miner timing
+            t0 = time.monotonic()
+            try:
+                b0 = await subtensor.get_current_block()
+            except Exception:
+                b0 = None
+
+            # Get UID before try block so it's available in except handler
+            uid = uid_by_hotkey.get(miner_hotkey, miner_hotkey)
+            try:
+                with miner_log_context(uid, window):
+                    result: MinerResults = await self._miner_validator.validate_miner(
+                        miner_hotkey=miner_hotkey,
+                        window=window,
+                        window_hash=window_hash,
+                        window_rand=window_rand,
+                        validator_wallet=validator_wallet,
+                        model=model,
+                        tokenizer=tokenizer,
+                        credentials=credentials,
+                        chain_manager=chain_manager,
+                        monitor=monitor,
+                        uid_by_hotkey=uid_by_hotkey,
+                        text_logs_emitted=text_logs_emitted,
+                        env_config=env_config,
+                        heartbeat_callback=heartbeat_callback,
+                        deadline_ts=deadline_ts,
+                        download_times=download_times,
+                    )
+
+                # Record timing
+                t1 = time.monotonic()
+                try:
+                    b1 = await subtensor.get_current_block()
+                except Exception:
+                    b1 = None
+
+                sec = t1 - t0
+                blk = (b1 - b0) if (b0 is not None and b1 is not None) else 0
+                miner_seconds_list.append(float(sec))
+                miner_blocks_list.append(int(blk))
+
+                # Aggregate results
+                if result.found_file:
+                    files_found += 1
+
+                if result.metrics is not None:
+                    window_metrics[miner_hotkey] = result.metrics
+
+                # No longer aggregate rollouts for upload
+
+                if result.digest_counter is not None:
+                    miner_digest_counters[miner_hotkey] = (
+                        result.digest_counter,
+                        result.total_inferences_in_file,
+                    )
+
+                # Aggregate processing counts
+                (
+                    pr_total,
+                    pr_invalid_sig,
+                    pr_invalid_proof,
+                    pr_processing_err,
+                ) = result.processed_counts
+                total_rollouts_processed += pr_total
+                invalid_signatures += pr_invalid_sig
+                invalid_proofs += pr_invalid_proof
+                processing_errors += pr_processing_err
+
+                # Emit structured verdict log
+                try:
+                    m = result.metrics or {}
+                    total_inf = int(m.get("total", 0))
+                    est_succ = int(m.get("estimated_successful", 0))
+                    verdict_entry = {
+                        "event": "verdict",
+                        "window": int(window),
+                        "uid": int(result.uid) if result.uid is not None else -1,
+                        "hotkey_short": miner_hotkey[:8],
+                        "found_file": bool(result.found_file),
+                        "valid_count": int(m.get("valid", 0)),
+                        "checked_count": int(m.get("checked", 0)),
+                        "total_inferences": total_inf,
+                        "estimated_unique": int(m.get("estimated_unique", 0)),
+                        "estimated_successful": est_succ,
+                        "success_rate": round(float(est_succ / total_inf * 100), 1)
+                        if total_inf
+                        else 0.0,
+                        "failure_flag": int(m.get(FAILURE_FLAG_KEY, 0)),
+                        "failure_reason": result.failure_reason or "",
+                        "prompt_mismatch_count": int(m.get("prompt_mismatch", 0)),
+                        "validation_sec": round(float(sec), 1),
+                        "validation_blocks": int(blk),
+                    }
+                    verdict_logger.info(json.dumps(verdict_entry))
+                except Exception:
+                    logger.debug("Failed to emit verdict log", exc_info=True)
+
+            except Exception as e:
+                # Log the error with miner context (uid already set above)
+                with miner_log_context(uid, window):
+                    logger.warning(f"Error processing miner: {e}")
+                continue
+            finally:
+                # Free GPU tensors (cached hidden states) between miners.
+                # Without this, tensors from miner N linger until gc runs,
+                # reducing available memory for miner N+1's batched forward.
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        # Compute total valid rollouts
+        total_valid_rollouts = sum(
+            metrics.get("estimated_valid", 0) for metrics in window_metrics.values()
+        )
+
+        # Build per-miner submission objects for copycat detection. This is
+        # the single place where the per-miner digest counters meet the
+        # per-miner upload timestamps propagated from the sampler: building
+        # MinerCopycatSubmission here is what lets ``detect_cheaters``
+        # receive everything it needs in one argument, rather than
+        # threading ``uploads_by_hotkey`` through every downstream method.
+        upload_times = uploads_by_hotkey or {}
+        submissions: dict[str, MinerCopycatSubmission] = {
+            hotkey: MinerCopycatSubmission(
+                digest_counter=counter,
+                total_rollouts=total,
+                upload_time=upload_times.get(hotkey),
+            )
+            for hotkey, (counter, total) in miner_digest_counters.items()
+        }
+
+        # Copycat detection and gating
+        (
+            window_cheaters,
+            interval_cheaters,
+            violations,
+        ) = await self._copycat_service.detect_cheaters(
+            window=window,
+            submissions=submissions,
+            uid_by_hotkey=uid_by_hotkey,
+            monitor=monitor,
+        )
+
+        # Combine cheater sets
+        cheaters_detected = window_cheaters.union(interval_cheaters)
+
+        # Apply gating to cheaters
+        self._copycat_service.apply_gating(
+            cheaters=cheaters_detected,
+            violations=violations,
+            window_metrics=window_metrics,
+            uid_by_hotkey=uid_by_hotkey,
+            window=window,
+        )
+
+        # No rollout filtering/upload; only metrics and gating are applied
+
+        # Recompute total_valid_rollouts after gating
+        total_valid_rollouts = sum(
+            metrics.get("estimated_valid", 0) for metrics in window_metrics.values()
+        )
+
+        # Window timing end
+        window_t1 = time.monotonic()
+        try:
+            block_end = await subtensor.get_current_block()
+        except Exception:
+            block_end = None
+
+        window_seconds = window_t1 - window_t0
+        window_blocks = (
+            (block_end - block_beg) if (block_beg is not None and block_end is not None) else 0
+        )
+
+        # Log window summary
+        logger.info(
+            f"Window {window}: {total_valid_rollouts} valid rollouts, "
+            f"{files_found}/{len(miners_to_check)} files found, "
+            f"{len(cheaters_detected)} cheaters gated, "
+            f"{window_seconds:.1f}s ({window_blocks} blocks)"
+        )
+
+        # Log timing stats if available
+        if miner_seconds_list:
+            avg_sec = sum(miner_seconds_list) / len(miner_seconds_list)
+            logger.info(f"Avg miner processing: {avg_sec:.2f}s")
+
+        # Log average download time to wandb
+        if download_times and monitor:
+            avg_download = sum(download_times) / len(download_times)
+            try:
+                await monitor.log_gauge("profiling/avg_rollout_download_seconds", avg_download)
+            except Exception:
+                pass
+
+        # Return structured results
+        return WindowResults(
+            window_start=window,
+            window_block_hash=window_hash,
+            window_randomness=window_rand,
+            miner_results={},  # Not needed in current implementation
+            total_valid_rollouts=total_valid_rollouts,
+            total_rollouts_processed=total_rollouts_processed,
+            invalid_signatures=invalid_signatures,
+            invalid_proofs=invalid_proofs,
+            processing_errors=processing_errors,
+            files_found=files_found,
+            window_cheaters=window_cheaters,
+            interval_cheaters=interval_cheaters,
+            violation_details=violations,
+            window_metrics=window_metrics,
+            window_timing_seconds=window_seconds,
+            window_timing_blocks=window_blocks,
+            miner_timing_seconds=miner_seconds_list,
+            miner_timing_blocks=miner_blocks_list,
+        )

@@ -1,0 +1,549 @@
+"""
+Core performance ledger tests.
+
+This file contains the essential tests for performance ledger functionality:
+- Basic ledger operations
+- Position tracking and calculations
+- Return and fee calculations
+- Multi-trade pair scenarios
+
+Uses the newest client/server RPC architecture demonstrated in test_elimination_core.py.
+"""
+
+import math
+from shared_objects.rpc.server_orchestrator import ServerOrchestrator, ServerMode
+from tests.vali_tests.base_objects.test_base import TestBase
+from time_util.time_util import TimeUtil, MS_IN_24_HOURS
+from vali_objects.enums.order_type_enum import OrderType
+from vali_objects.vali_dataclasses.position import Position
+from vali_objects.utils.vali_utils import ValiUtils
+from vali_objects.vali_config import TradePair
+from vali_objects.vali_dataclasses.order import Order
+from vali_objects.vali_dataclasses.ledger.perf.perf_ledger import (
+    PerfCheckpoint
+)
+
+
+class TestPerfLedgerCore(TestBase):
+    """
+    Core performance ledger functionality tests using ServerOrchestrator.
+
+    Servers start once (via singleton orchestrator) and are shared across:
+    - All test methods in this class
+    - All test classes that use ServerOrchestrator
+
+    This eliminates redundant server spawning and dramatically reduces test startup time.
+    Per-test isolation is achieved by clearing data state (not restarting servers).
+    """
+
+    # Class-level references (set in setUpClass via ServerOrchestrator)
+    orchestrator = None
+    live_price_fetcher_client = None
+    metagraph_client = None
+    position_client = None
+    perf_ledger_client = None
+    elimination_client = None
+    challenge_period_client = None
+
+    # Test miner constant
+    TEST_HOTKEY = "test_miner_core"
+    DEFAULT_ACCOUNT_SIZE = 100_000
+    now_ms = TimeUtil.now_in_millis()
+    @classmethod
+    def setUpClass(cls):
+        """One-time setup: Start all servers using ServerOrchestrator (shared across all test classes)."""
+        # Get the singleton orchestrator and start all required servers
+        cls.orchestrator = ServerOrchestrator.get_instance()
+
+        # Start all servers in TESTING mode (idempotent - safe if already started by another test class)
+        secrets = ValiUtils.get_secrets(running_unit_tests=True)
+        cls.orchestrator.start_all_servers(
+            mode=ServerMode.TESTING,
+            secrets=secrets
+        )
+
+        # Get clients from orchestrator (servers guaranteed ready, no connection delays)
+        cls.live_price_fetcher_client = cls.orchestrator.get_client('live_price_fetcher')
+        cls.metagraph_client = cls.orchestrator.get_client('metagraph')
+        cls.perf_ledger_client = cls.orchestrator.get_client('perf_ledger')
+        cls.challenge_period_client = cls.orchestrator.get_client('challenge_period')
+        cls.elimination_client = cls.orchestrator.get_client('elimination')
+        cls.position_client = cls.orchestrator.get_client('position_manager')
+
+    @classmethod
+    def tearDownClass(cls):
+        """
+        One-time teardown: No action needed.
+
+        Note: Servers and clients are managed by ServerOrchestrator singleton and shared
+        across all test classes. They will be shut down automatically at process exit.
+        """
+        pass
+
+    def setUp(self):
+        """Per-test setup: Reset data state (fast - no server restarts)."""
+        # Clear all data for test isolation (both memory and disk)
+        self.orchestrator.clear_all_test_data()
+
+        # Set up metagraph with test miner
+        self.metagraph_client.set_hotkeys([self.TEST_HOTKEY])
+
+        # Instance variables
+        self.now_ms = TimeUtil.now_in_millis()
+
+    def tearDown(self):
+        """Per-test teardown: Clear data for next test."""
+        self.orchestrator.clear_all_test_data()
+
+    def validate_perf_ledger(self, ledger, expected_init_time: int = None):
+        """Validate performance ledger structure and attributes."""
+        # Basic structure validation
+        self.assertIsInstance(ledger.cps, list)
+        self.assertIsInstance(ledger.initialization_time_ms, int)
+        self.assertIsInstance(ledger.max_return, float)
+
+        # Time validation
+        if expected_init_time:
+            self.assertEqual(ledger.initialization_time_ms, expected_init_time)
+
+        # Checkpoint sequence validation
+        prev_time = 0
+        for i, cp in enumerate(ledger.cps):
+            self.validate_checkpoint(cp, f"Checkpoint {i}")
+            self.assertGreaterEqual(cp.last_update_ms, prev_time,
+                                   f"Checkpoint {i} time should be >= previous")
+            prev_time = cp.last_update_ms
+
+    def validate_checkpoint(self, cp: PerfCheckpoint, context: str = ""):
+        """Validate checkpoint structure and attributes."""
+        # Basic type validation
+        self.assertIsInstance(cp.last_update_ms, int, f"{context}: last_update_ms should be int")
+        self.assertIsInstance(cp.gain, float, f"{context}: gain should be float")
+        self.assertIsInstance(cp.loss, float, f"{context}: loss should be float")
+        self.assertIsInstance(cp.n_updates, int, f"{context}: n_updates should be int")
+
+        # Portfolio value validation
+        self.assertIsInstance(cp.prev_portfolio_ret, float, f"{context}: prev_portfolio_ret should be float")
+
+        # Risk metrics validation
+        self.assertIsInstance(cp.mdd, float, f"{context}: mdd should be float")
+        self.assertIsInstance(cp.mpv, float, f"{context}: mpv should be float")
+
+        # Logical constraints
+        self.assertGreaterEqual(cp.n_updates, 0, f"{context}: n_updates should be >= 0")
+        self.assertGreaterEqual(cp.gain, 0.0, f"{context}: gain should be >= 0")
+        self.assertLessEqual(cp.loss, 0.0, f"{context}: loss should be <= 0")
+
+        # Portfolio values should be reasonable
+        self.assertGreater(cp.prev_portfolio_ret, 0.0, f"{context}: portfolio return should be positive")
+
+        # Risk metrics should be reasonable
+        self.assertGreater(cp.mdd, 0.0, f"{context}: MDD should be positive")
+        self.assertGreater(cp.mpv, 0.0, f"{context}: MPV should be positive")
+
+
+    def test_basic_position_tracking(self):
+        """Test basic position tracking and checkpoint creation."""
+        base_time = self.now_ms - (10 * MS_IN_24_HOURS)
+
+        # Create a simple position
+        position = self._create_position(
+            "basic_pos", TradePair.BTCUSD,
+            base_time, base_time + MS_IN_24_HOURS,
+            50000.0, 51000.0,  # 2% gain
+            OrderType.LONG
+        )
+        self.position_client.save_miner_position(position)
+
+        # Debug: Check positions are saved
+        debug_positions = self.position_client.get_positions_for_one_hotkey(self.TEST_HOTKEY)
+        print(f"\nDEBUG: Saved {len(debug_positions)} positions for {self.TEST_HOTKEY}")
+
+        # Debug: Check all hotkeys
+        debug_all_hotkeys = self.position_client.get_all_hotkeys()
+        print(f"DEBUG: All hotkeys with positions: {debug_all_hotkeys}")
+
+        # Debug: Check positions for all miners
+        debug_all_positions = self.position_client.get_positions_for_all_miners(filter_eliminations=True)
+        print(f"DEBUG: get_positions_for_all_miners returned {len(debug_all_positions)} hotkeys: {list(debug_all_positions.keys())}")
+
+        # Update ledger via client
+        self.perf_ledger_client.update(t_ms=base_time + (2 * MS_IN_24_HOURS))
+
+        # Verify via client
+        bundles = self.perf_ledger_client.get_perf_ledgers()
+        print(f"DEBUG: get_perf_ledgers returned {len(bundles)} bundles: {list(bundles.keys())}")
+        self.assertIn(self.TEST_HOTKEY, bundles)
+
+        bundle = bundles[self.TEST_HOTKEY]
+        self.assertIsNotNone(bundle)
+
+        # Validate the portfolio ledger thoroughly
+        ledger = bundle
+        self.validate_perf_ledger(ledger, base_time)
+
+        # Check checkpoints exist
+        self.assertGreater(len(ledger.cps), 0, "Portfolio ledger should have checkpoints")
+
+        # For a 2-day period with 12-hour checkpoints, expect 4 checkpoints minimum
+        # The exact count depends on alignment and timing, but should be reasonable
+        min_expected_checkpoints = 3  # At least 3 checkpoints for 2-day period
+        max_expected_checkpoints = 6  # At most 6 for boundary cases
+        self.assertGreaterEqual(len(ledger.cps), min_expected_checkpoints,
+                               f"Expected at least {min_expected_checkpoints} checkpoints, got {len(ledger.cps)}")
+        self.assertLessEqual(len(ledger.cps), max_expected_checkpoints,
+                            f"Expected at most {max_expected_checkpoints} checkpoints, got {len(ledger.cps)}")
+
+        # Validate that at least one checkpoint has trading activity
+        # We created a position, so there must be activity recorded
+        has_activity = any(cp.n_updates > 0 for cp in ledger.cps)
+        self.assertTrue(has_activity, "Portfolio ledger must reflect BTC trading activity")
+
+    def test_return_calculation_accuracy(self):
+        """Test accurate return calculations for various scenarios."""
+        base_time = self.now_ms - (20 * MS_IN_24_HOURS)
+
+        test_cases = [
+            # (name, open_price, close_price, order_type, expected_return_sign)
+            ("10% gain long", 50000.0, 55000.0, OrderType.LONG, 1),  # positive
+            ("10% loss long", 50000.0, 45000.0, OrderType.LONG, -1),  # negative
+            ("10% gain short", 50000.0, 45000.0, OrderType.SHORT, 1),  # positive (price fell)
+            ("10% loss short", 50000.0, 55000.0, OrderType.SHORT, -1),  # negative (price rose)
+            ("no change", 50000.0, 50000.0, OrderType.LONG, 0),  # zero
+        ]
+
+        for i, (name, open_price, close_price, order_type, expected_sign) in enumerate(test_cases):
+            position = self._create_position(
+                f"pos_{i}", TradePair.BTCUSD,
+                base_time + (i * 2 * MS_IN_24_HOURS),
+                base_time + (i * 2 * MS_IN_24_HOURS) + MS_IN_24_HOURS,
+                open_price, close_price, order_type
+            )
+            self.position_client.save_miner_position(position)
+
+        # Update after all positions via client
+        self.perf_ledger_client.update(t_ms=base_time + (15 * MS_IN_24_HOURS))
+
+        # Verify returns via client
+        bundles = self.perf_ledger_client.get_perf_ledgers()
+        bundle = bundles[self.TEST_HOTKEY]
+
+        # Validate the portfolio ledger
+        ledger = bundle
+        self.validate_perf_ledger(ledger, base_time)
+
+        # Check that we have checkpoints with varied return characteristics
+        gains_found = 0
+        losses_found = 0
+
+        for cp in ledger.cps:
+            if cp.gain > 0:
+                gains_found += 1
+            elif cp.loss < 0:
+                losses_found += 1
+
+        # Should have variety in returns across all positions
+        self.assertGreater(gains_found, 0, "Portfolio ledger should have some gaining checkpoints")
+        self.assertGreater(losses_found, 0, "Portfolio ledger should have some losing checkpoints")
+
+    def test_multi_trade_pair_aggregation(self):
+        """Test portfolio aggregation across multiple trade pairs."""
+        base_time = self.now_ms - (10 * MS_IN_24_HOURS)
+
+        # Create positions in different trade pairs
+        positions = [
+            ("btc", TradePair.BTCUSD, 50000.0, 52000.0),  # 4% gain
+            ("eth", TradePair.ETHUSD, 3000.0, 2850.0),    # 5% loss
+            ("eur", TradePair.EURUSD, 1.10, 1.12),        # ~1.8% gain
+        ]
+
+        for name, tp, open_price, close_price in positions:
+            position = self._create_position(
+                name, tp,
+                base_time, base_time + MS_IN_24_HOURS,
+                open_price, close_price, OrderType.LONG
+            )
+            self.position_client.save_miner_position(position)
+
+        # Update via client
+        self.perf_ledger_client.update(t_ms=base_time + (2 * MS_IN_24_HOURS))
+
+        # Verify all trade pairs are tracked via client
+        bundles = self.perf_ledger_client.get_perf_ledgers()
+        bundle = bundles[self.TEST_HOTKEY]
+
+        # Portfolio should aggregate all positions
+        self.assertIsNotNone(bundle, "Portfolio ledger should exist")
+        portfolio_ledger = bundle
+        self.validate_perf_ledger(portfolio_ledger, base_time)
+
+        # Portfolio should have checkpoints reflecting activity from all trade pairs
+        self.assertGreater(len(portfolio_ledger.cps), 0, "Portfolio should have checkpoints")
+
+    def test_fee_calculations(self):
+        """Test carry fee and spread fee calculations."""
+        base_time = self.now_ms - (10 * MS_IN_24_HOURS)
+
+        # Create position held for multiple days (accumulates carry fees)
+        position = self._create_position(
+            "fee_test", TradePair.BTCUSD,
+            base_time, base_time + (5 * MS_IN_24_HOURS),  # 5-day position
+            50000.0, 50000.0,  # No price change
+            OrderType.LONG
+        )
+        self.position_client.save_miner_position(position)
+
+        # Update via client
+        self.perf_ledger_client.update(t_ms=base_time + (6 * MS_IN_24_HOURS))
+
+        # Check fees via client (portfolio-level ledger)
+        bundles = self.perf_ledger_client.get_perf_ledgers()
+        btc_ledger = bundles[self.TEST_HOTKEY]
+
+        # Validate the ledger structure first
+        self.validate_perf_ledger(btc_ledger, base_time)
+
+        # Find checkpoint with position and validate fee behavior
+        position_checkpoint_found = False
+        for i, cp in enumerate(btc_ledger.cps):
+            if cp.n_updates > 0 and i != 0:  # Skip initial checkpoint which has an update due to initial spread fee
+                position_checkpoint_found = True
+
+                # Validate checkpoint structure
+                self.validate_checkpoint(cp, "Fee calculation checkpoint")
+
+                break
+
+        self.assertTrue(position_checkpoint_found, "Should find at least one checkpoint with position data")
+
+    def test_checkpoint_time_alignment(self):
+        """Test that checkpoints align to expected time boundaries."""
+        # Align to checkpoint boundary
+        checkpoint_duration = 12 * 60 * 60 * 1000  # 12 hours
+        base_time = (self.now_ms // checkpoint_duration) * checkpoint_duration
+        base_time -= (5 * MS_IN_24_HOURS)
+
+        # Create position
+        position = self._create_position(
+            "aligned", TradePair.BTCUSD,
+            base_time, base_time + MS_IN_24_HOURS,
+            50000.0, 50000.0, OrderType.LONG
+        )
+        self.position_client.save_miner_position(position)
+
+        # Update via client
+        self.perf_ledger_client.update(t_ms=base_time + (2 * MS_IN_24_HOURS))
+
+        # Verify checkpoint alignment via client (portfolio-level ledger)
+        bundles = self.perf_ledger_client.get_perf_ledgers()
+        btc_ledger = bundles[self.TEST_HOTKEY]
+
+        # Validate ledger structure
+        self.validate_perf_ledger(btc_ledger, base_time)
+
+        # Verify checkpoint alignment and structure
+        for i, cp in enumerate(btc_ledger.cps):
+            # Validate each checkpoint
+            self.validate_checkpoint(cp, f"Alignment checkpoint {i}")
+
+            # All checkpoints should be aligned to 12-hour boundaries
+            self.assertEqual(cp.last_update_ms % checkpoint_duration, 0,
+                           f"Checkpoint {i} at {cp.last_update_ms} not aligned to 12-hour boundary")
+
+            # Checkpoint time should be reasonable
+            self.assertGreaterEqual(cp.last_update_ms, base_time,
+                                   f"Checkpoint {i} time should be >= base_time")
+            self.assertLessEqual(cp.last_update_ms, base_time + (3 * MS_IN_24_HOURS),
+                                f"Checkpoint {i} time should be reasonable")
+
+    def _create_position(self, position_id: str, trade_pair: TradePair,
+                        open_ms: int, close_ms: int, open_price: float, 
+                        close_price: float, order_type: OrderType,
+                        leverage: float = 1.0) -> Position:
+        """Helper to create a position with specified parameters."""
+        open_order = Order(
+            price=open_price,
+            processed_ms=open_ms,
+            order_uuid=f"{position_id}_open",
+            trade_pair=trade_pair,
+            order_type=order_type,
+            leverage=leverage if order_type == OrderType.LONG else -leverage,
+        )
+        
+        close_order = Order(
+            price=close_price,
+            processed_ms=close_ms,
+            order_uuid=f"{position_id}_close",
+            trade_pair=trade_pair,
+            order_type=OrderType.FLAT,
+            leverage=0.0,
+        )
+        
+        position = Position(
+            miner_hotkey=self.TEST_HOTKEY,
+            position_uuid=position_id,
+            open_ms=open_ms,
+            close_ms=close_ms,
+            trade_pair=trade_pair,
+            orders=[open_order, close_order],
+            position_type=OrderType.FLAT,
+            is_closed_position=True,
+            account_size=self.DEFAULT_ACCOUNT_SIZE,
+        )
+
+        position.rebuild_position_with_updated_orders(self.live_price_fetcher_client)
+        return position
+
+
+
+    def test_single_checkpoint_open_ms_tracking(self):
+        """
+        Test that a perf ledger with only one checkpoint properly tracks
+        the open_ms to match when the position was actually open.
+        """
+        # Align to checkpoint boundaries for predictable behavior
+        checkpoint_duration = 12 * 60 * 60 * 1000  # 12 hours
+        base_time = (self.now_ms // checkpoint_duration) * checkpoint_duration - (5 * MS_IN_24_HOURS)
+
+        # Create a position that opens at a specific time and stays open for 3 hours
+        position_open_time = base_time + (2 * 60 * 60 * 1000)  # 2 hours after base
+        position_close_time = position_open_time + (3 * 60 * 60 * 1000)  # 3 hours later
+
+        # Create the position using the helper method
+        position = self._create_position(
+            "single_checkpoint_pos", TradePair.BTCUSD,
+            position_open_time, position_close_time,
+            50000.0, 51000.0, OrderType.LONG
+        )
+
+        # Save the position
+        self.position_client.save_miner_position(position)
+
+        # Update the perf ledger at a time after the position closed
+        # but within the same checkpoint period
+        update_time = position_close_time + (1 * 60 * 60 * 1000)  # 1 hour after close
+        self.perf_ledger_client.update(t_ms=update_time)
+
+        # Get the perf ledgers via client
+        bundles = self.perf_ledger_client.get_perf_ledgers()
+        self.assertIn(self.TEST_HOTKEY, bundles, "Should have bundle for test hotkey")
+
+        # Get portfolio ledger (single PerfLedger per miner)
+        btc_ledger = bundles[self.TEST_HOTKEY]
+
+        # Verify we have exactly one checkpoint
+        self.assertEqual(len(btc_ledger.cps), 1, "Should have exactly one checkpoint")
+
+        checkpoint = btc_ledger.cps[0]
+
+        # Verify the checkpoint properties
+        print(f"\n=== Single Checkpoint Test Results ===")
+        print(f"Position open time: {position_open_time} ({TimeUtil.millis_to_formatted_date_str(position_open_time)})")
+        print(f"Position close time: {position_close_time} ({TimeUtil.millis_to_formatted_date_str(position_close_time)})")
+        print(f"Update time: {update_time} ({TimeUtil.millis_to_formatted_date_str(update_time)})")
+        print(f"Checkpoint last_update_ms: {checkpoint.last_update_ms} ({TimeUtil.millis_to_formatted_date_str(checkpoint.last_update_ms)})")
+        print(f"Checkpoint accum_ms: {checkpoint.accum_ms} ({checkpoint.accum_ms / (60 * 60 * 1000):.2f} hours)")
+        print(f"Checkpoint open_ms: {checkpoint.open_ms} ({checkpoint.open_ms / (60 * 60 * 1000):.2f} hours)")
+        print(f"Position was open for: {(position_close_time - position_open_time) / (60 * 60 * 1000):.2f} hours")
+
+        # The open_ms should match the duration the position was actually open
+        expected_open_duration_ms = position_close_time - position_open_time
+        self.assertEqual(
+            checkpoint.open_ms,
+            expected_open_duration_ms,
+            f"Checkpoint open_ms should match position open duration. "
+            f"Expected {expected_open_duration_ms}ms ({expected_open_duration_ms/(60*60*1000):.2f}h), "
+            f"got {checkpoint.open_ms}ms ({checkpoint.open_ms/(60*60*1000):.2f}h)"
+        )
+
+        # Verify the checkpoint reflects the position's return (accounting for fees)
+        # The checkpoint return will be less than or equal to the raw position return due to fees
+        self.assertLessEqual(
+            checkpoint.prev_portfolio_ret,
+            position.return_at_close,
+            msg="Checkpoint return should be less than or equal to position return due to fees"
+        )
+        self.assertGreater(
+            checkpoint.prev_portfolio_ret,
+            1.0,
+            msg="Checkpoint return should still be profitable"
+        )
+
+        # Check portfolio ledger
+        self.assertIsNotNone(btc_ledger, "Should have portfolio ledger")
+        portfolio_ledger = btc_ledger
+        self.assertEqual(len(portfolio_ledger.cps), 1, "Portfolio should have one checkpoint")
+
+        portfolio_checkpoint = portfolio_ledger.cps[0]
+        self.assertEqual(
+            portfolio_checkpoint.open_ms,
+            expected_open_duration_ms,
+            "Portfolio checkpoint should also track correct open duration"
+        )
+
+    def test_single_checkpoint_multiple_positions_sequential(self):
+        """
+        Test single checkpoint with multiple positions that open and close sequentially.
+        The open_ms should be the sum of all position open durations.
+        """
+        # Align to checkpoint boundaries
+        checkpoint_duration = 12 * 60 * 60 * 1000  # 12 hours
+        base_time = (self.now_ms // checkpoint_duration) * checkpoint_duration - (5 * MS_IN_24_HOURS)
+
+        # Create two positions that don't overlap
+        # Position 1: 2-4 hours after base (2 hours duration)
+        pos1_open = base_time + (2 * 60 * 60 * 1000)
+        pos1_close = base_time + (4 * 60 * 60 * 1000)
+
+        position1 = self._create_position(
+            "pos1", TradePair.BTCUSD,
+            pos1_open, pos1_close,
+            50000.0, 51000.0, OrderType.LONG
+        )
+        self.position_client.save_miner_position(position1)
+
+        # Position 2: 5-7 hours after base (2 hours duration)
+        pos2_open = base_time + (5 * 60 * 60 * 1000)
+        pos2_close = base_time + (7 * 60 * 60 * 1000)
+
+        position2 = self._create_position(
+            "pos2", TradePair.BTCUSD,
+            pos2_open, pos2_close,
+            51000.0, 52000.0, OrderType.LONG
+        )
+        self.position_client.save_miner_position(position2)
+
+        # Update after both positions are closed via client
+        update_time = base_time + (8 * 60 * 60 * 1000)
+        self.perf_ledger_client.update(t_ms=update_time)
+
+        # Get the ledgers via client (portfolio-level)
+        bundles = self.perf_ledger_client.get_perf_ledgers()
+        btc_ledger = bundles[self.TEST_HOTKEY]
+
+        # Should have single checkpoint
+        self.assertEqual(len(btc_ledger.cps), 1, "Should have exactly one checkpoint")
+
+        checkpoint = btc_ledger.cps[0]
+
+        # Total open duration should be sum of both positions
+        expected_total_open_ms = (pos1_close - pos1_open) + (pos2_close - pos2_open)
+        expected_total_hours = expected_total_open_ms / (60 * 60 * 1000)
+
+        print(f"\n=== Sequential Positions Test ===")
+        print(f"Position 1 open duration: {(pos1_close - pos1_open)/(60*60*1000):.2f} hours")
+        print(f"Position 2 open duration: {(pos2_close - pos2_open)/(60*60*1000):.2f} hours")
+        print(f"Expected total open_ms: {expected_total_hours:.2f} hours")
+        print(f"Actual checkpoint open_ms: {checkpoint.open_ms/(60*60*1000):.2f} hours")
+
+        self.assertEqual(
+            checkpoint.open_ms,
+            expected_total_open_ms,
+            f"Checkpoint open_ms should be sum of position durations. "
+            f"Expected {expected_total_hours:.2f}h, got {checkpoint.open_ms/(60*60*1000):.2f}h"
+        )
+
+
+if __name__ == '__main__':
+    import unittest
+    unittest.main()

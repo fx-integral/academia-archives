@@ -1,0 +1,15 @@
+bittensor==9.12.2
+substrate-interface
+async-substrate-interface>=1.5.6,<2
+wandb
+
+pandas
+matplotlib
+tabulate
+requests
+
+cvxpy
+ecos
+
+py_clob_client_v2
+dotenv

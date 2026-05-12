@@ -1,0 +1,26 @@
+# Validator dependencies — core loop + image pipeline, no DL
+# Usage:  pip install -r requirements.validator.txt
+# Docker: pip install -r requirements.validator.txt
+
+# Core
+bittensor>=9.9.0,<10.0.0
+bittensor-cli>=9.18.0,<10.0.0
+httpx>=0.28.0
+pillow>=10.4.0
+loguru>=0.7.2
+h11>=0.16.0
+cryptography>=46.0.3
+pyyaml>=6.0
+numpy>=2.0.1,<3.0.0
+async-substrate-interface>=1.5.6,<2.0.0 # If not pinned here, Bittensor lossely defines this, causing conflict. 
+
+# Validator core
+wandb>=0.19.0
+joblib>=1.4.2
+tensorboardx>=2.6.2.2
+
+# Image pipeline: HuggingFace cache download + augmentation
+datasets>=3.1.0
+opencv-python>=4.10.0.84
+scikit-image>=0.24.0
+scikit-learn>=1.5.2

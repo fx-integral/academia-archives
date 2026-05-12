@@ -1,0 +1,361 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:8.2-alpine
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: redis-cli ping
+    volumes:
+      - redis:/data
+    logging: &logging
+      driver: journald
+      options:
+        tag: '{{.Name}}'
+
+  db:
+    image: postgres:14.0-alpine
+    healthcheck:
+      test: pg_isready -U postgres || exit 1
+    environment:
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB:postgres
+    volumes:
+      - db:/var/lib/postgresql/data
+    logging:
+      <<: *logging
+
+  pylon:
+    image: docker.io/backenddevelopersltd/bittensor-pylon:1.1.2
+    init: true
+    restart: unless-stopped
+    env_file: ./.env
+    environment:
+      - BITTENSOR_WALLET_PATH=/root/.bittensor/wallets
+      - PYLON_IDENTITIES=["validator"]
+      - PYLON_ID_VALIDATOR_WALLET_NAME=${BITTENSOR_WALLET_NAME}
+      - PYLON_ID_VALIDATOR_HOTKEY_NAME=${BITTENSOR_WALLET_HOTKEY_NAME}
+      - PYLON_ID_VALIDATOR_NETUID=${BITTENSOR_NETUID:-12}
+      - PYLON_ID_VALIDATOR_TOKEN=${PYLON_IDENTITY_TOKEN:-validator_token}
+      - PYLON_METRICS_TOKEN=${PYLON_METRICS_TOKEN:-validator_metrics_token}
+    volumes:
+      - ${HOST_WALLET_DIR}:/root/.bittensor/wallets
+    logging:
+      <<: *logging
+
+  app:
+    image: backenddevelopersltd/${VALIDATOR_IMAGE_REPO}:v0-latest
+    pull_policy: ${PULL_POLICY:-always}
+    healthcheck:
+      test: wget -q --spider 127.0.0.1:8000/admin/login/ || exit 1
+    init: true
+    restart: unless-stopped
+    env_file: ./.env
+    environment:
+      - PROMETHEUS_MULTIPROC_DIR=/prometheus-multiproc-dir
+    volumes:
+      - static:/root/src/static
+      # Add this mount to each container that should dump Prometheus metrics.
+      - ${HOST_PROMETHEUS_METRICS_DIR:-./prometheus-metrics}:/prometheus-multiproc-dir
+      - ${HOST_WALLET_DIR}:/root/.bittensor/wallets
+    depends_on:
+      - redis
+      - db
+    logging:
+      <<: *logging
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  celery-worker: &celery-worker
+    image: backenddevelopersltd/${VALIDATOR_IMAGE_REPO}:v0-latest
+    pull_policy: ${PULL_POLICY:-always}
+    init: true
+    restart: unless-stopped
+    env_file: ./.env
+    environment:
+      - DEBUG=off
+      - PROMETHEUS_MULTIPROC_DIR=/prometheus-multiproc-dir/celery-worker
+      - WORKER_HEALTHCHECK_FILE_PATH=/tmp/worker-healthcheck
+      - WORKER_HEALTHCHECK_TIMEOUT=30
+    command: ./celery-entrypoint.sh -Q default
+    volumes:
+      - ./prometheus-metrics:/prometheus-multiproc-dir
+      - ${HOST_WALLET_DIR}:/root/.bittensor/wallets
+    tmpfs: /run
+    depends_on:
+      - redis
+      - pylon
+    links:
+      - redis
+      - db
+      - pylon
+    logging:
+      <<: *logging
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+      - "autoheal=true"
+    healthcheck:
+      test: ["CMD", "./celery-worker-healthcheck.sh"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 2m
+
+  celery-worker-weights:
+    <<: *celery-worker
+    environment:
+      - DEBUG=off
+      - PROMETHEUS_MULTIPROC_DIR=/prometheus-multiproc-dir/celery-worker-weights
+      - WORKER_HEALTHCHECK_FILE_PATH=/tmp/worker-healthcheck
+      - WORKER_HEALTHCHECK_TIMEOUT=30
+    command: ./celery-entrypoint.sh -Q weights
+
+  celery-worker-jobs:
+    <<: *celery-worker
+    environment:
+      - DEBUG=off
+      - PROMETHEUS_MULTIPROC_DIR=/prometheus-multiproc-dir/celery-worker-jobs
+      - WORKER_HEALTHCHECK_FILE_PATH=/tmp/worker-healthcheck
+      - WORKER_HEALTHCHECK_TIMEOUT=30
+    command: ./celery-entrypoint.sh -Q jobs
+
+  celery-worker-llm:
+    <<: *celery-worker
+    environment:
+      - DEBUG=off
+      - PROMETHEUS_MULTIPROC_DIR=/prometheus-multiproc-dir/celery-worker-llm
+      - WORKER_HEALTHCHECK_FILE_PATH=/tmp/worker-healthcheck
+      - WORKER_HEALTHCHECK_TIMEOUT=30
+    command: ./celery-entrypoint.sh -Q llm
+
+  celery-worker-metagraph:
+    <<: *celery-worker
+    environment:
+      - DEBUG=off
+      - PROMETHEUS_MULTIPROC_DIR=/prometheus-multiproc-dir/celery-worker-metagraph
+      - WORKER_HEALTHCHECK_FILE_PATH=/tmp/worker-healthcheck
+      - WORKER_HEALTHCHECK_TIMEOUT=30
+      - CELERY_MAX_TASKS_PER_CHILD=30
+    command: ./celery-entrypoint.sh -Q metagraph
+
+  celery-worker-organic-jobs:
+    <<: *celery-worker
+    environment:
+      - DEBUG=off
+      - PROMETHEUS_MULTIPROC_DIR=/prometheus-multiproc-dir/celery-worker-organic-jobs
+      - WORKER_HEALTHCHECK_FILE_PATH=/tmp/worker-healthcheck
+      - WORKER_HEALTHCHECK_TIMEOUT=30
+      - CELERY_CONCURRENCY_MAX=30
+      - CELERY_MAX_TASKS_PER_CHILD=5
+    command: ./celery-entrypoint.sh -Q organic_jobs
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.40.0
+    devices:
+      - /dev/kmsg:/dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /cgroup:/cgroup:ro
+    restart: unless-stopped
+    logging:
+      <<: *logging
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    restart: unless-stopped
+    network_mode: host
+    pid: host
+    volumes:
+      - /:/host:ro,rslave
+    command:
+      - '--path.rootfs=/host'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc|run|boot|var/.+)($$|/)'
+      - '--collector.tcpstat'
+    logging:
+      <<: *logging
+
+  prometheus:
+    image: backenddevelopersltd/bittensor_prometheus:latest
+    restart: unless-stopped
+    depends_on:
+      - cadvisor
+      - app
+      - prometheus-proxy
+      - celery-flower
+    links:
+      - cadvisor
+      - app
+      - prometheus-proxy
+      - celery-flower
+    env_file: ./.env
+    volumes:
+      - ${HOST_WALLET_DIR}:/wallets
+    # the "bittensor_network" label below is extremely important, it allows us to separate various environments in
+    # a single prometheus instance. Make sure it has the right value when doing changes to the env_file conventions etc.
+    entrypoint: |
+      /bin/sh -c 'cat <<EOF > /etc/prometheus/prometheus.yml.template 
+      global:
+        scrape_interval: 30s
+      scrape_configs:
+        - job_name: 'validator'
+          static_configs:
+            - targets: ['cadvisor:8080', 'host.docker.internal:9100', 'app:8000', 'celery-flower:5555', 'prometheus-proxy:8000']
+              labels:
+                hotkey: '{hotkey}'
+                bittensor_network: $${BITTENSOR_NETWORK:-finney}
+        - job_name: 'pylon'
+          static_configs:
+            - targets: ['pylon:8000']
+              labels:
+                hotkey: '{hotkey}'
+                bittensor_network: $${BITTENSOR_NETWORK:-finney}
+          authorization:
+            type: Bearer
+            credentials: $${PYLON_METRICS_TOKEN:-validator_metrics_token}
+      remote_write:
+        - url: "http://prometheus-proxy:8000/prometheus_outbound_proxy/"
+      EOF
+      exec /entrypoint.sh --log.level=debug --storage.tsdb.retention.size=1GB'
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  prometheus-proxy:
+    image: backenddevelopersltd/bittensor-prometheus-proxy:latest
+    restart: unless-stopped
+    environment:
+      - CENTRAL_PROMETHEUS_PROXY_URL=https://prometheus.bactensor.io
+      - ENV=prometheus-proxy-prod
+      - SECRET_KEY=${SECRET_KEY}
+      - BITTENSOR_WALLET_NAME=${BITTENSOR_WALLET_NAME}
+      - BITTENSOR_WALLET_HOTKEY_NAME=${BITTENSOR_WALLET_HOTKEY_NAME}
+      - SENTRY_DSN=${SENTRY_DSN}
+      - PROMETHEUS_MULTIPROC_DIR=/prometheus-multiproc-dir/prometheus-proxy
+    volumes:
+      - ${HOST_WALLET_DIR}:/root/.bittensor/wallets
+      - ./prometheus-proxy-metrics:/prometheus-multiproc-dir
+
+  celery-flower:
+    image: backenddevelopersltd/${VALIDATOR_IMAGE_REPO}:v0-latest
+    healthcheck:
+      test: wget -qO- 127.0.0.1:5555 > /dev/null || exit 1
+    init: true
+    restart: unless-stopped
+    env_file: ./.env
+    environment:
+      - DEBUG=off
+      - FLOWER_TASK_RUNTIME_METRIC_BUCKETS=1,2,3,5,10,20,30,45,60,120,180,240,300,600,inf
+    command: celery --app=compute_horde_validator --broker="redis://redis:6379/0" flower
+    depends_on:
+      - redis
+    links:
+      - redis
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    logging:
+      <<: *logging
+
+  celery-beat:
+    image: backenddevelopersltd/${VALIDATOR_IMAGE_REPO}:v0-latest
+    pull_policy: ${PULL_POLICY:-always}
+    init: true
+    restart: unless-stopped
+    env_file: ./.env
+    volumes:
+      - ${HOST_WALLET_DIR}:/root/.bittensor/wallets
+    command: ./celery-beat-entrypoint.sh
+    depends_on:
+      - redis
+      - db
+    links:
+      - redis
+    logging:
+      <<: *logging
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+      - "autoheal=true"
+    healthcheck:
+      test: [ "CMD", "python", "celery_beat_healthcheck.py" ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 2m
+
+  connect-facilitator:
+    image: backenddevelopersltd/${VALIDATOR_IMAGE_REPO}:v0-latest
+    pull_policy: ${PULL_POLICY:-always}
+    init: true
+    restart: unless-stopped
+    env_file: ./.env
+    environment:
+      - VALIDATOR_RUNNER_VERSION=${VALIDATOR_RUNNER_VERSION}
+      - DEBUG=off
+    volumes:
+      - ${HOST_WALLET_DIR}:/root/.bittensor/wallets
+    command: python manage.py connect_facilitator
+    depends_on:
+      - redis
+      - db
+    logging:
+      <<: *logging
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  transfer-receipts:
+    image: backenddevelopersltd/${VALIDATOR_IMAGE_REPO}:v0-latest
+    pull_policy: ${PULL_POLICY:-always}
+    init: true
+    restart: unless-stopped
+    env_file: ./.env
+    environment:
+      - PROMETHEUS_MULTIPROC_DIR=/prometheus-multiproc-dir/transfer-receipts
+    volumes:
+      - ${HOST_WALLET_DIR}:/root/.bittensor/wallets
+      - ./prometheus-metrics:/prometheus-multiproc-dir
+    command: ./transfer-receipts-entrypoint.sh --daemon
+    depends_on:
+      - redis
+      - db
+    logging:
+      <<: *logging
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  nginx:
+    image: backenddevelopersltd/compute-horde-validator-nginx:v0-latest
+    restart: unless-stopped
+    healthcheck:
+      test: wget -q --spider 0.0.0.0:80/admin/login/ || exit 1
+    env_file: ./.env
+    volumes:
+      - static:/srv/static:ro
+    depends_on:
+      - app
+    command: nginx -g 'daemon off;'
+    ports:
+      - 127.0.0.1:${HTTP_PORT:-80}:80
+    logging:
+      <<: *logging
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  # Auto restart unhealthy containers with label autoheal=true.
+  # Warning! This container has access to the Docker socket.
+  # See https://github.com/willfarrell/docker-autoheal
+  autoheal:
+    # Pinned SHA for security, see above.
+    image: willfarrell/autoheal@sha256:794dfad2bd562984a6baaa7e4baa3ba1d211fc452f036dc2079a801a9a71a053
+    restart: unless-stopped
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: autoheal
+    network_mode: none
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  redis:
+  db:
+  static:

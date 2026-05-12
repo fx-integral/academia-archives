@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rich-kids-of-tao"
+version = "1.0.0"
+description = "Rich Kids of TAO - Next-level of Miner Appreciation"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [
+    {name = "Rich Kids of TAO"}
+]
+dependencies = [
+    "bittensor==9.9.0",
+    "numpy",
+    "requests",
+]
+
+[tool.setuptools]
+packages = ["rich_kids_of_tao"]

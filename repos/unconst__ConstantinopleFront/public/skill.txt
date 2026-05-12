@@ -1,0 +1,100 @@
+Constantinople — Decentralized LLM Inference
+=============================================
+
+The true opposite of a closed AI company is one where every query is made
+available to the public. We are building a network of intelligence where
+inference is cheaper, faster, and more accessible than ever before — where
+any computer in the world can compete to run your inference, the best are
+rewarded, and the entire process is transparent and verifiable.
+
+QUICK START (pick one):
+
+── Option A: Email signup (instant, $1 free credit) ──
+
+  curl -s -X POST https://api.constantinople.cloud/v1/quickstart \
+    -H "Content-Type: application/json" \
+    -d '{"email":"you@example.com","password":"pick-a-password"}'
+
+  Returns your API key (cst-...) and ready-to-paste examples.
+
+── Option B: Bittensor wallet signup (more credits) ──
+
+  If you have Bittensor wallets in ~/.bittensor/wallets/, you can sign
+  a message with a coldkey that has TAO balance and get $1 per TAO in
+  credits. Hotkeys registered on any subnet get $100 free.
+
+  Step 1 — Get a nonce:
+    curl -s -X POST https://api.constantinople.cloud/v1/auth/bittensor/nonce \
+      -H "Content-Type: application/json" \
+      -d '{"ss58_address":"YOUR_SS58_ADDRESS"}'
+
+  Step 2 — Sign and authenticate:
+    # Python:
+    import bittensor, requests, time
+    wallet = bittensor.wallet(name="default", hotkey="default")
+    kp = wallet.coldkey  # or wallet.hotkey for hotkey auth
+    addr = kp.ss58_address
+    nonce = requests.post("https://api.constantinople.cloud/v1/auth/bittensor/nonce",
+        json={"ss58_address": addr}).json()
+    msg = nonce["message"]
+    sig = kp.sign(msg.encode()).hex()
+    result = requests.post("https://api.constantinople.cloud/v1/auth/bittensor",
+        json={"ss58_address": addr, "signature": sig, "message": msg}).json()
+    print(result["api_key"])  # Your API key
+
+  Coldkeys: $1 credit per TAO balance (checked on-chain)
+  Hotkeys on any subnet: $100 free credit
+
+── QUERY (same for both signup methods) ──
+
+  curl -s https://api.constantinople.cloud/v1/chat/completions \
+    -H "Authorization: Bearer cst-YOUR-KEY" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"Qwen/Qwen2.5-7B-Instruct","messages":[{"role":"user","content":"Hello!"}]}'
+
+  OpenAI-compatible drop-in replacement:
+    from openai import OpenAI
+    client = OpenAI(base_url="https://api.constantinople.cloud/v1", api_key="cst-YOUR-KEY")
+    r = client.chat.completions.create(
+        model="Qwen/Qwen2.5-7B-Instruct",
+        messages=[{"role": "user", "content": "Hello!"}]
+    )
+    print(r.choices[0].message.content)
+
+── ADD FUNDS ──
+
+  Check balance:
+    curl -s https://api.constantinople.cloud/v1/user/balance \
+      -H "Authorization: Bearer cst-YOUR-KEY"
+
+  Pay with TAO:
+    curl -s https://api.constantinople.cloud/v1/user/deposit-address \
+      -H "Authorization: Bearer cst-YOUR-KEY"
+    Send TAO on Bittensor (finney) to that address.
+    Auto-converted to credits at market rate.
+
+  Pay with ETH or USDC (Base network):
+    curl -s https://api.constantinople.cloud/v1/billing/crypto-info
+
+ENDPOINTS
+  POST /v1/quickstart                Email signup (instant)
+  POST /v1/auth/bittensor/nonce      Get signing nonce (wallet auth)
+  POST /v1/auth/bittensor            Wallet auth (sign + submit)
+  POST /v1/chat/completions          Chat (OpenAI-compatible, streaming)
+  POST /v1/completions               Text completions
+  POST /v1/embeddings                Embeddings
+  GET  /v1/models                    List models
+  GET  /v1/user/balance              Check balance
+  GET  /v1/user/usage                Usage stats
+  GET  /v1/user/deposit-address      Get TAO deposit address
+  GET  /v1/billing/crypto-info       ETH/USDC deposit info (Base)
+  POST /v1/billing/topup             Top up with ETH or USDC
+  GET  /v1/pricing                   Pricing info
+  GET  /health                       Health check
+
+PRICING
+  Input:  $0.50 / 1M tokens
+  Output: $1.50 / 1M tokens
+
+Docs: https://api.constantinople.cloud/docs
+Site: https://www.constantinople.cloud

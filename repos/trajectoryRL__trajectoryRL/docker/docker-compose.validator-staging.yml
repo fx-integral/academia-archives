@@ -1,0 +1,57 @@
+# TrajectoryRL Validator — Staging Compose
+#
+# Pulls the staging image from GHCR (built from the staging branch).
+# Use this to test validator changes before promoting to prod.
+#
+# Setup:
+#   1. Create .env.validator (same as production)
+#   2. docker compose -f docker/docker-compose.validator-staging.yml --env-file .env.validator up -d
+#   3. docker compose -f docker/docker-compose.validator-staging.yml logs -f validator
+
+services:
+  validator:
+    image: ghcr.io/trajectoryrl/trajectoryrl:staging
+    container_name: trajectoryrl_validator_staging
+    restart: unless-stopped
+    env_file:
+      - ../.env.validator
+    environment:
+      # Pin sandbox-agent / scenario images to the ``latest`` channel.
+      # The bench publishes a single rolling :latest tag (no separate
+      # :staging) — pinning to :staging here would 404 every scenario
+      # fetch. The validator-side staging signal is the validator
+      # image itself (ghcr.io/trajectoryrl/trajectoryrl:staging set
+      # via the ``image:`` line above), not the bench tag.
+      - IMAGE_CHANNEL=latest
+    volumes:
+      - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
+      - trajectoryrl_data_staging:/var/lib/trajectoryrl
+      - /var/run/docker.sock:/var/run/docker.sock
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: trajectoryrl_watchtower_staging
+    restart: unless-stopped
+    environment:
+      - DOCKER_API_VERSION=1.44
+      - WATCHTOWER_LABEL_ENABLE=true
+      - WATCHTOWER_POLL_INTERVAL=300
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_INCLUDE_STOPPED=true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+volumes:
+  trajectoryrl_data_staging:

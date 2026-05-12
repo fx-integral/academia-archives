@@ -1,0 +1,141 @@
+"""Base node with common functionality for validators."""
+
+import asyncio
+import logging
+import signal
+from abc import ABC, abstractmethod
+
+import bittensor as bt
+
+from crusades.chain.manager import ChainManager
+from crusades.config import get_config, get_hparams
+
+logger = logging.getLogger(__name__)
+
+
+class BaseNode(ABC):
+    """Base class for crusades nodes (validators).
+
+    Provides:
+    - Signal handling for graceful shutdown
+    - Metagraph sync
+    """
+
+    def __init__(
+        self,
+        wallet: bt.wallet | None = None,
+        skip_blockchain_check: bool = False,
+    ):
+        self.config = get_config()
+        self.hparams = get_hparams()
+        self.skip_blockchain_check = skip_blockchain_check
+
+        # Initialize wallet
+        if wallet is None:
+            self.wallet = bt.wallet(
+                name=self.config.wallet_name,
+                hotkey=self.config.wallet_hotkey,
+            )
+        else:
+            self.wallet = wallet
+
+        # Initialize chain manager (skip if in test mode)
+        if not skip_blockchain_check:
+            self.chain = ChainManager(wallet=self.wallet)
+        else:
+            self.chain = None
+
+        # State
+        self.running: bool = False
+
+        # Events
+        self.stop_event = asyncio.Event()
+        self._signal_loop: asyncio.AbstractEventLoop | None = None
+
+    def setup_signal_handlers(self) -> None:
+        """Setup signal handlers for graceful shutdown.
+
+        Must be called from within a running event loop (e.g. in initialize()).
+        Uses loop.add_signal_handler for proper async-context signal handling.
+        Falls back to signal.signal on platforms that don't support it (Windows).
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            self._signal_loop = loop
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, self._signal_handler_async)
+        except (RuntimeError, NotImplementedError):
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                signal.signal(sig, self._signal_handler)
+
+    def _signal_handler_async(self) -> None:
+        """Handle shutdown signals (async-safe version for loop.add_signal_handler)."""
+        logger.info("Received shutdown signal, initiating shutdown...")
+        self.stop_event.set()
+
+    def _signal_handler(self, signum: int, frame) -> None:
+        """Handle shutdown signals (fallback for non-async context)."""
+        logger.info(f"Received signal {signum}, initiating shutdown...")
+        if self._signal_loop is not None and not self._signal_loop.is_closed():
+            self._signal_loop.call_soon_threadsafe(self.stop_event.set)
+        else:
+            self.stop_event.set()
+
+    @property
+    def hotkey(self) -> str:
+        """Get the node's hotkey address."""
+        return self.wallet.hotkey.ss58_address
+
+    @property
+    def uid(self) -> int | None:
+        """Get the node's UID on the subnet."""
+        if self.chain is None:
+            return 1  # Mock UID for test mode
+        return self.chain.get_uid_for_hotkey(self.hotkey)
+
+    async def sync(self) -> None:
+        """Sync metagraph."""
+        if self.chain is None:
+            logger.debug("Skipping metagraph sync (test mode)")
+            return
+        await self.chain.sync_metagraph()
+        logger.debug("Metagraph synced")
+
+    @abstractmethod
+    async def run_step(self) -> None:
+        """Run one iteration of the node's main loop."""
+        pass
+
+    async def start(self) -> None:
+        """Start the node."""
+        logger.info(f"Starting {self.__class__.__name__}...")
+        logger.info(f"Hotkey: {self.hotkey}")
+
+        # Initial sync
+        # Skip blockchain checks if in test mode
+        if not self.skip_blockchain_check:
+            await self.sync()
+
+            if self.uid is None:
+                logger.error(f"Hotkey {self.hotkey} not registered on subnet {self.hparams.netuid}")
+                return
+
+            logger.info(f"UID: {self.uid}")
+        else:
+            logger.warning("Skipping blockchain registration check (test mode)")
+
+        self.running = True
+
+        try:
+            while not self.stop_event.is_set():
+                await self.run_step()
+        except Exception as e:
+            logger.exception(f"Error in main loop: {e}")
+            raise
+        finally:
+            self.running = False
+            await self.cleanup()
+
+    async def cleanup(self) -> None:
+        """Cleanup resources on shutdown."""
+        logger.info("Cleaning up...")

@@ -1,0 +1,17 @@
+# Extra dependencies for MIID miners (Phase 4 image generation).
+# Validators do NOT need these packages.
+#
+# Install after the base packages:
+#   pip install -e .
+#   pip install -r requirements-miner.txt
+
+diffusers>=0.30.0
+transformers>=4.40.0
+accelerate>=0.30.0
+opencv-python>=4.8.0
+safetensors
+gdown
+
+# Drand timelock encryption (required so generated images are encrypted by default
+# before upload to S3 and only become decryptable after the target drand round).
+timelock==1.2.0

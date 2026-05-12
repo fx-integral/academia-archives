@@ -1,0 +1,58 @@
+version: '1.0'
+
+compute_spec:
+  miner:
+    cpu:
+      min_cores: 4  # Minimum number of CPU cores
+      min_speed: 2.0GHz  # Minimum speed per core
+      architecture: x86_64  # Architecture type (e.g., x86_64, arm64)
+
+    gpu:
+      required: false
+
+    memory:
+      min_ram: 8GB
+
+    storage:
+      min_space: 40GB
+      type: SSD
+
+    os:
+      name: Ubuntu/Debian
+      version: ">=22.04/>=12.0"  # Version of the preferred operating system(s)
+
+    python:
+      version: 3.10+
+
+    network:
+      bandwidth:
+        download: ">=10Mbps"  # Minimum download bandwidth
+        upload: ">=10Mbps"  # Minimum upload bandwidth
+
+  validator:
+    cpu:
+      min_cores: 4  # Minimum number of CPU cores
+      min_speed: 2.0GHz  # Minimum speed per core
+      architecture: x86_64  # Architecture type (e.g., x86_64, arm64)
+
+    gpu:
+      required: false
+
+    memory:
+      min_ram: 8GB
+
+    storage:
+      min_space: 40GB
+      type: SSD
+
+    os:
+      name: Ubuntu/Debian
+      version: ">=22.04/>=12.0"  # Version of the preferred operating system(s)
+
+    python:
+      version: 3.10+
+
+    network:
+      bandwidth:
+        download: ">=10Mbps"  # Minimum download bandwidth
+        upload: ">=10Mbps"  # Minimum upload bandwidth

@@ -1,0 +1,213 @@
+[workspace]
+members = [
+  "crates/basilica-common",
+  "crates/basilica-protocol",
+  "crates/basilica-miner",
+  "crates/basilica-validator",
+  "crates/basilica-cli",
+  "crates/basilica-sdk",
+  "crates/basilica-sdk-python",
+]
+resolver = "2"
+
+# Workspace-wide dependencies that all crates can use
+[workspace.dependencies]
+# Alloy
+# MUSL COMPATIBILITY: alloy-provider defaults to reqwest-default-tls (native-tls)
+# We explicitly use reqwest-rustls-tls instead
+alloy = { version = "1.0.23", features = ["sol-types"] }
+alloy-sol-types = { version = "1.0.23" }
+alloy-network = { version = "1.0.23" }
+alloy-primitives = { version = "1.0.23" }
+alloy-provider = { version = "1.0.23", default-features = false, features = [
+  "reqwest",
+  "reqwest-rustls-tls",
+] }
+alloy-contract = { version = "1.0.23" }
+
+# Async runtime and utilities
+tokio = { version = "1.0", features = ["full"] }
+tokio-util = "0.7"
+async-trait = "0.1"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_with = "3.4"
+toml = "0.8"
+hex = "0.4"
+md5 = "0.7"
+bigdecimal = "0.3"
+# Logging and metrics
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-journald = "0.3"
+metrics = "0.22"
+# MUSL COMPATIBILITY: Disable default features and enable only http-listener
+# (default features include push-gateway which pulls in hyper-tls with native-tls)
+metrics-exporter-prometheus = { version = "0.13", default-features = false, features = [
+  "http-listener",
+] }
+
+# Configuration
+figment = { version = "0.10", features = ["toml", "env", "json"] }
+
+# Database
+sqlx = { version = "0.7", features = [
+  "runtime-tokio-rustls",
+  "sqlite",
+  "postgres",
+  "uuid",
+  "chrono",
+  "json",
+  "time",
+  "bigdecimal",
+  "rust_decimal",
+  "migrate",
+] }
+
+# gRPC and networking
+tonic = { version = "0.10", features = ["tls", "tls-roots"] }
+tonic-build = "0.10"
+prost = "0.12"
+prost-types = "0.12"
+
+# Crypto and security
+blake3 = "1.5"
+aes-gcm = "0.10"
+rand = "0.8"
+base64 = "0.21"
+
+# Utilities
+uuid = { version = "1.0", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.0", features = ["derive", "env"] }
+clap-verbosity-flag = "2.2"
+futures = "0.3"
+futures-util = "0.3"
+# MUSL COMPATIBILITY: Disable default features (includes native-tls) and use rustls-tls only
+reqwest = { version = "0.11", default-features = false, features = [
+  "json",
+  "rustls-tls",
+  "stream",
+] }
+regex = "1.10"
+url = "2.5"
+once_cell = "1.19"
+libc = "0.2"
+semver = "1.0"
+parking_lot = "0.12"
+
+# Additional crypto dependencies
+sp-core = "34.0.0"
+ed25519-dalek = { version = "2.1", features = ["rand_core", "pem"] }
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
+pbkdf2 = { version = "0.12", features = ["hmac"] }
+argon2 = "0.5"
+scrypt = { version = "0.11", features = ["simple"] }
+password-hash = "0.5"
+ssh-key = { version = "0.6", features = ["ed25519", "rand_core", "std"] }
+async-ssh2-tokio = "0.12"
+zeroize = { version = "1.7", features = ["derive"] }
+data-encoding = "2"
+sha2 = "0.10"
+
+# Dev/test dependencies
+tempfile = "3.8"
+
+# Build dependencies
+dotenvy = "0.15"
+
+# Node-specific dependencies
+tokio-stream = { version = "0.1", features = ["net"] }
+nvml-wrapper = "0.9"
+num_cpus = "1.16"
+
+# Miner-specific dependencies
+tonic-health = "0.10.2"
+governor = "0.6"
+jsonwebtoken = "9.2"
+async-stream = "0.3"
+lru = "0.12"
+eventsource-stream = "0.2"
+fastrand = "2.0"
+aws-config = { version = "1.0", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1.119"
+aws-sdk-secretsmanager = "1.0"
+rust_decimal = { version = "1.33", features = ["serde"] }
+urlencoding = "2.1"
+
+# Payments dependencies
+time = "0.3"
+
+# Bittensor dependencies
+home = "0.5"
+parity-scale-codec = "3.6"
+moka = { version = "0.12", features = ["future"] }
+dashmap = "5.5"
+wiremock = "0.6"
+
+# CLI-specific dependencies
+dialoguer = "0.11"
+indicatif = "0.17"
+console = "0.15"
+tabled = { version = "0.15", default-features = true, features = ["ansi"] }
+clap_complete = { version = "4.5", features = ["unstable-dynamic"] }
+shellexpand = "3.1"
+etcetera = "0.8"
+color-eyre = "0.6"
+oauth2 = "4.4"
+webbrowser = "0.8"
+
+# Python bindings
+# abi3-py310 = stable ABI for Python 3.10+, works with 3.10, 3.11, 3.12, etc.
+# Build the Python SDK with: maturin build (handles Python env detection)
+pyo3 = { version = "0.26", features = ["abi3-py310"] }
+pyo3-stub-gen = { version = "0.13.1" }
+pyo3-stub-gen-derive = { version = "0.13.1" }
+pythonize = "0.26"
+
+# Self-update (MUSL compatible - use rustls instead of native-tls)
+self_update = { version = "0.41", default-features = false, features = [
+  "rustls",
+  "archive-tar",
+  "compression-flate2",
+] }
+
+# Subxt (must match bittensor-rs version)
+subxt = { version = "0.44" }
+subxt-signer = "0.44"
+subxt-codegen = { version = "0.44" }
+subxt-metadata = { version = "0.44" }
+subxt-utils-fetchmetadata = { version = "0.44", features = ["url"] }
+
+# System information
+sysinfo = "0.30"
+
+# Docker integration
+bollard = "0.15"
+
+# OCI client for Docker image validation
+# MUSL COMPATIBILITY: Use rustls-tls instead of native-tls
+oci-client = { version = "0.13", default-features = false, features = [
+  "rustls-tls",
+] }
+
+# HTTP server (for validator API)
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+# Bittensor integration via crabtensor (patched fork for metadata compatibility)
+crabtensor = { git = "https://github.com/one-covenant/crabtensor", branch = "main" }
+
+# Bittensor SDK
+bittensor = { git = "https://github.com/one-covenant/bittensor-rs", rev = "bd344ba62fbedc686e3814096bbf93cf9d34f7c9", package = "bittensor-rs" }
+
+[workspace.metadata]
+# Workspace metadata for tooling
+rust-version = "1.80"

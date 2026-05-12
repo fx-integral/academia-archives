@@ -1,0 +1,188 @@
+- name: Update apt cache with retry
+  become: true
+  apt:
+    update_cache: yes
+  retries: 3
+  delay: 10
+
+- name: Install critical packages first
+  become: true
+  apt:
+    update_cache: no
+    name:
+      - build-essential
+      - make
+      - git
+      - curl
+      - libssl-dev
+      - libudev-dev
+      - pkg-config
+      - python3-pip
+      - rsync
+      - jq
+    state: present
+  retries: 3
+  delay: 10
+  tags: common
+
+- name: Install system packages that may have dependency issues
+  become: true
+  apt:
+    update_cache: no
+    name:
+      - clang
+      - llvm
+      - protobuf-compiler
+    state: present
+  retries: 3
+  delay: 10
+  ignore_errors: true
+  tags: common
+
+- name: Install Node.js and npm
+  become: true
+  apt:
+    update_cache: no
+    name:
+      - nodejs
+      - npm
+    state: present
+  retries: 3
+  delay: 10
+  tags: common
+
+- name: Install extra apt packages (if any)
+  become: true
+  apt:
+    name: "{{ extra_packages }}"
+    state: present
+  when: extra_packages is defined and extra_packages|length > 0
+  tags: common
+
+- name: Install Rust toolchain (rustup)
+  shell: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+  args:
+    creates: "{{ ansible_env.HOME }}/.cargo/bin/cargo"
+    executable: /bin/bash
+  changed_when: false
+  tags: common
+
+- name: Add Cargo to the PATH in .bashrc
+  lineinfile:
+    path: "{{ ansible_env.HOME }}/.bashrc"
+    line: 'export PATH="{{ ansible_env.HOME }}/.cargo/bin:$PATH"'
+    state: present
+  tags: common
+
+- name: Source cargo env
+  shell: source "{{ ansible_env.HOME }}/.cargo/env"
+  args:
+    executable: /bin/bash
+  changed_when: false
+  tags: common
+
+- name: Check if cargo is accessible
+  shell: command -v cargo || echo "not found"
+  register: cargo_check
+  changed_when: false
+  tags: common
+
+- name: Display cargo location
+  debug:
+    var: cargo_check.stdout
+  tags: common
+
+- name: Install PM2 (Node process manager)
+  become: true
+  npm:
+    name: pm2
+    global: yes
+    state: present
+    version: 6.0.5
+  tags: common
+
+- name: Check pip version
+  command: python3 -m pip --version
+  register: pip_version_output
+  changed_when: false
+  tags: common
+
+- name: Extract pip version
+  set_fact:
+    pip_version: "{{ pip_version_output.stdout | regex_search('([0-9]+\\.[0-9]+\\.[0-9]+)', '\\1') | first }}"
+  tags: common
+
+- name: Debug pip version
+  debug:
+    msg: "Detected pip version: {{ pip_version }}"
+  tags: common
+
+- name: Install Bittensor CLI and Python dependencies for pip >= 23.0
+  become: true
+  pip:
+    name:
+      - bittensor-cli
+      - bt-decode
+      - torch
+      - boto3
+      - einops
+      - aiofiles==24.1.0
+      - aioboto3==13.2.0
+      - transformers
+      - wandb
+      - python-dotenv
+      - zstandard
+      - s3fs
+      - pyarrow
+      - scipy
+      - "rich>=13.0.0"
+    state: present
+    extra_args: --no-cache-dir --break-system-packages --ignore-installed
+  when: (pip_version is version('23.0', '>='))
+  tags: common
+
+- name: Install Bittensor CLI and Python dependencies for pip < 23.0
+  become: true
+  pip:
+    name:
+      - bittensor-cli
+      - bt-decode
+      - torch
+      - boto3
+      - einops
+      - aiofiles==24.1.0
+      - aioboto3==13.2.0
+      - transformers
+      - wandb
+      - python-dotenv
+      - zstandard
+      - s3fs
+      - pyarrow
+      - scipy
+      - "rich>=13.0.0"
+    state: present
+    extra_args: --no-cache-dir --ignore-installed
+  when: (pip_version is version('23.0', '<'))
+  tags: common
+
+- name: Install uv package installer
+  become: true
+  shell: |
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    PATH=$PATH:$HOME/.cargo/bin:$HOME/.local/bin
+    cp $(which uv 2>/dev/null || echo "/root/.cargo/bin/uv") /usr/local/bin/uv || true
+    chmod +x /usr/local/bin/uv
+  args:
+    executable: /bin/bash
+  tags: common
+
+- name: Verify uv installation
+  shell: which uv
+  register: uv_which
+  changed_when: false
+  tags: common
+
+- name: Show uv location
+  debug:
+    var: uv_which.stdout
+  tags: common

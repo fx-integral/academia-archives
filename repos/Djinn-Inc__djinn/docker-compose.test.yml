@@ -1,0 +1,61 @@
+# Docker Compose override for integration testing.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.test.yml up -d
+#   python tests/integration/test_docker_e2e.py
+#   docker compose -f docker-compose.yml -f docker-compose.test.yml down -v
+#
+# Differences from production compose:
+#   - No web service (tests use HTTP clients directly)
+#   - BT_NETWORK=local (no real Bittensor connection needed)
+#   - Reduced healthcheck intervals for faster startup
+
+services:
+  anvil:
+    healthcheck:
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  validator:
+    # Detach from the prod ~/.bittensor/wallets read-only mount. When
+    # the host has no wallets dir (CI runners don't), docker synthesizes
+    # an empty root-owned mount inside .bittensor/, which refuses the
+    # bittensor SDK's mkdir of the sibling miners/ subdir under appuser.
+    # An empty named volume is owned by appuser at first write, so the
+    # SDK can populate it freely.
+    volumes:
+      - validator-bittensor:/home/appuser/.bittensor
+    environment:
+      - BT_NETWORK=local
+      - API_HOST=0.0.0.0
+      - API_PORT=8421
+      - BASE_RPC_URL=http://anvil:8545
+      - LOG_FORMAT=json
+    healthcheck:
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  miner:
+    volumes:
+      - miner-bittensor:/home/appuser/.bittensor
+    environment:
+      - BT_NETWORK=local
+      - API_HOST=0.0.0.0
+      - API_PORT=8422
+      - LOG_FORMAT=json
+    healthcheck:
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  web:
+    # Disable web service for integration tests
+    profiles: ["full"]
+
+volumes:
+  validator-bittensor:
+  miner-bittensor:

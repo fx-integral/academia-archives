@@ -1,0 +1,110 @@
+# Copyright © Mobius Fund
+
+import os, math
+import requests
+import contextlib
+import pandas as pd
+from .const import *
+from .simst import SimSt, asset
+
+def update():
+    init = 'Investing/__init__.py'
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+    lv = open(f'{root}/{init}').read()
+    rv = requests.get(f'{RAWGIT_ROOT}/refs/heads/main/{init}').text
+    lv, rv = [eval(v.split('\n')[0].split('=')[1]) for v in [lv, rv]]
+    ln, rn = [sum(int(n) * 100 ** i for i, n in enumerate(v.split('.')[::-1])) for v in [lv, rv]]
+    if ln >= rn: return
+    print(f'Updating... {lv} -> {rv}')
+    cmd = f'cd {root}; git pull && pip install -e .'
+    err = os.system(cmd)
+    if err: print(f'Update failed. Please manually update using command:\n{cmd}')
+    else: print('Update succeeded')
+    return err
+
+def isnew(ss58):
+    cd = os.path.dirname(os.path.realpath(__file__))
+    last, strat = f'{cd}/../strat/.last-update', f'{cd}/../strat/{ss58}'
+    for f in strat, last: ... if os.path.exists(f) else open(f, 'a').close()
+    return os.path.getsize(strat) and os.path.getmtime(strat) > os.path.getmtime(last)
+
+def dist(st, nn):
+    def fn(x):
+        x = [x[k] if k and k in x else 0 for k in nn[asset(x)]]
+        s = sum([abs(a) for a in x])
+        return [a / s for a in x] if s > 1e-6 else []
+    ab = [[] for i in range(len(nn) + 1)]
+    for i in range(len(ab) - 1):
+        df = st[st['strat'].map(eval).map(asset) == i].copy()
+        df['alloc'] = df['strat'].map(eval).map(fn)
+        for j, di in df.reset_index().iterrows():
+            kk, a, b = di[['uid', 'hotkey']], di['alloc'], di['block']
+            ab[i].append([*kk, *df['alloc'].map(lambda x: math.dist(a, x) if a and x else 1)])
+            ab[i].append([*kk, *df['block'].map(lambda x: b - x)])
+            ab[i][-2][j+2] = 0
+    for i in [0, 1]: ab[-1].append([])
+    ab[-1].append(0)
+    return ab
+
+def dedupe(ab):
+    dd_trigger = ab[-1][-1] or DD_TRIGGER
+    bb = [7200] + [86400] * (len(ab) - 2)
+    dd = pd.DataFrame([], pd.Index([], name='uid'), ['dedupe'])
+    for i in range(len(ab) - 1):
+        if not ab[i]: continue
+        da = pd.DataFrame(ab[i][0::2], columns=['uid', '', *[*zip(*ab[i])][0][0::2]]).set_index('uid').iloc[:,1:]
+        db = pd.DataFrame(ab[i][1::2], columns=['uid', '', *[*zip(*ab[i])][0][1::2]]).set_index('uid').iloc[:,1:]
+        print(da.map('{:.4f}'.format).reset_index().to_string(index=False))
+        print(db.reset_index().to_string(index=False))
+        for uid, di in da.iterrows():
+            du = db.loc[uid, di[(di.index != uid) & (di < dd_trigger)].index]
+            dd.loc[uid] = min((du[du >= 0].min() / bb[i] / DAYS_FINAL) ** DD_POWER, 1)
+    for i in [0, 1]:
+        print(f"{['black', 'white'][i]}list: {ab[-1][i]}")
+        dd.loc[dd.index.isin(ab[-1][i])] = i
+    print(f'threshold: {dd_trigger}')
+    print(dd.dropna().reset_index().to_string(index=False))
+    return dd
+
+def score(pl, ab, da, ra, n=256):
+    sim = SimSt()
+    sim.pl = pl
+    sim.pl2sc()
+    sc = sim.sc
+
+    oc = pd.DataFrame(columns=['uid', 'c'])
+    for uid, dd in pl.groupby(pl.columns[0]):
+        oc.loc[len(oc)] = uid, int(dd['swap_close'].iat[-1] >= dd['swap_open'].iat[0])
+    sc = sc.join(oc.set_index('uid'), 'uid')
+    sc['score'] *= sc['c']
+    sc.insert(7, 'c', sc.pop('c'))
+
+    with contextlib.redirect_stdout(None):
+        sc = sc.join(dedupe(ab), 'uid')
+    sc.loc[~sc['dedupe'].isna(), 'score'] *= sc['dedupe']
+    sc.insert(8, 'dedupe', sc.pop('dedupe').round(4))
+
+    sc = sc.join(da.set_index('uid')['last'], 'uid')
+    dec1 = (sc['last'] / DEC1_CLIFF) ** DEC1_DECAY
+    sc.loc[~sc['last'].isna() & (sc['days'] > DEC1_START), 'score'] *= 1 - dec1.clip(0, 1)
+    sc.insert(5, 'last', sc.pop('last'))
+
+    sc = sc.join(da.set_index('uid')['cash'], 'uid')
+    sc['score'] *= ((1 - sc['cash']) ** CASH_DECAY).clip(CASH_RESIDUE, 1)
+    sc.insert(6, 'cash', sc.pop('cash').round(4))
+
+    scz = sc['score'].sum()
+    for a in range(len(ra)):
+        sca = sc[sc['a'] == a]['score'].sum()
+        if sca: sc.loc[sc['a'] == a, 'score'] *= ra[a] * scz / sca
+
+    score = [sc[sc['uid'] == i]['score'].iat[0] if i in sc['uid'].values else 0 for i in range(n)]
+    dec = (sc['last'].sum() / (sc['days'] + 1).sum()) ** DEC_DECAY
+    if dec > DEC_CUTOFF: score[DEC_UID] = sum(score) * dec / (1 - dec)
+    if not any(score): score[DEC_UID] = 1
+
+    sc['hotkey'] = sc['hotkey'].map(lambda x: f'{x[:6]}...{x[-6:]}')
+    sim.sc = sc[sc['uid'] < n].sort_values(['score', 'return%'])[::-1]
+    print(sim.sc2pct().to_string(index=False).replace(' swap', ' clip'))
+
+    return score, DEC_UID, dec

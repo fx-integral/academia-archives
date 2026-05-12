@@ -1,0 +1,823 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import asyncio
+import math
+import os
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Any
+
+from bittensor import AsyncSubtensor  # type: ignore
+from rich import box  # type: ignore
+from rich.console import Console  # type: ignore
+from rich.table import Table  # type: ignore
+
+from autoppia_web_agents_subnet.utils.commitments import read_all_plain_commitments
+from autoppia_web_agents_subnet.utils.ipfs_client import IPFSError, aget_json
+from autoppia_web_agents_subnet.validator.config import (
+    IPFS_API_URL,
+    IPFS_GATEWAYS,
+    MIN_VALIDATOR_STAKE_FOR_CONSENSUS_TAO,
+    MINIMUM_START_BLOCK,
+    ROUND_SIZE_EPOCHS,
+)
+from autoppia_web_agents_subnet.validator.round_manager import RoundManager
+
+DEFAULT_NETUID = int(os.getenv("NETUID", "36"))
+DEFAULT_NETWORK = os.getenv("SUBTENSOR_NETWORK", "finney")
+
+ROUND_MANAGER = RoundManager(
+    round_size_epochs=ROUND_SIZE_EPOCHS,
+    minimum_start_block=MINIMUM_START_BLOCK,
+)
+BLOCKS_PER_EPOCH = RoundManager.BLOCKS_PER_EPOCH
+ROUND_BLOCK_LENGTH = ROUND_MANAGER.ROUND_BLOCK_LENGTH
+BASE_START_BLOCK = MINIMUM_START_BLOCK if MINIMUM_START_BLOCK is not None else 0
+SECONDS_PER_BLOCK = RoundManager.SECONDS_PER_BLOCK
+
+
+@dataclass
+class ValidatorCommitment:
+    hotkey: str
+    uid: int | None
+    stake_tao: float
+    cid: str | None
+    round_number: int | None
+    epoch: int | None
+    target_epoch: int | None
+    payload: dict[str, Any] | None = None
+    payload_hash: str | None = None
+    payload_error: str | None = None
+
+
+def _stake_to_float(value: Any) -> float:
+    if value is None:
+        return 0.0
+    try:
+        from bittensor.utils.balance import Balance  # type: ignore
+
+        if isinstance(value, Balance):
+            return float(value.tao)
+    except Exception:
+        pass
+
+    for accessor in ("item",):
+        if hasattr(value, accessor):
+            try:
+                return float(getattr(value, accessor)())
+            except Exception:
+                continue
+
+    try:
+        return float(value)
+    except Exception:
+        return 0.0
+
+
+def _hotkey_to_uid_map(hotkeys: Sequence[str]) -> dict[str, int]:
+    mapping: dict[str, int] = {}
+    for idx, hk in enumerate(hotkeys or []):
+        if hk and hk not in mapping:
+            mapping[hk] = idx
+    return mapping
+
+
+def _compute_round_number(start_block: int) -> int | None:
+    if ROUND_BLOCK_LENGTH <= 0:
+        return None
+    try:
+        offset = max(start_block - BASE_START_BLOCK, 0)
+        return int(offset // ROUND_BLOCK_LENGTH) + 1
+    except Exception:
+        return None
+
+
+def _format_minutes(block_delta: int) -> str:
+    if block_delta <= 0:
+        return "0m"
+    minutes = (block_delta * SECONDS_PER_BLOCK) / 60.0
+    if minutes >= 60.0:
+        hours = minutes / 60.0
+        return f"{hours:.1f}h"
+    return f"{minutes:.1f}m"
+
+
+async def _create_subtensor(network: str | None) -> AsyncSubtensor:
+    st = AsyncSubtensor(network=network) if network else AsyncSubtensor()  # type: ignore[arg-type,call-arg]
+    init = getattr(st, "initialize", None)
+    if callable(init):
+        await init()
+    return st
+
+
+async def _fetch_payload(
+    cid: str,
+    *,
+    api_url: str | None,
+    gateways: Sequence[str] | None,
+) -> tuple[dict[str, Any] | None, str | None, str | None]:
+    try:
+        payload, _, sha_hex = await aget_json(cid, api_url=api_url, gateways=gateways)
+        if isinstance(payload, dict):
+            return payload, sha_hex, None
+        return None, None, "payload is not a dict"
+    except IPFSError as exc:
+        return None, None, f"IPFS error: {exc}"
+    except Exception as exc:
+        return None, None, f"{type(exc).__name__}: {exc}"
+
+
+def _chunked(seq: Sequence[Any], n: int) -> list[list[Any]]:
+    if n <= 0:
+        n = 1
+    return [list(seq[i : i + n]) for i in range(0, len(seq), n)]
+
+
+def _print_scores_rich(
+    items: list[tuple[str, list[tuple[int, float]]]],
+    *,
+    cols: int = 4,
+) -> None:
+    if not items:
+        return
+    console = Console()
+    for label, parsed_scores in items:
+        cells = [f"{uid}: {score:.4f}" for uid, score in parsed_scores]
+        table = Table(
+            title=f"{label} miner scores ({len(parsed_scores)})",
+            show_header=False,
+            box=box.SIMPLE_HEAVY,
+            pad_edge=False,
+        )
+        for _ in range(max(1, cols)):
+            table.add_column(justify="left", style="cyan")
+        for row in _chunked(cells, max(1, cols)):
+            # pad row if short
+            if len(row) < cols:
+                row = row + [""] * (cols - len(row))
+            table.add_row(*row)
+        console.print(table)
+
+
+def _select_recent_rounds(
+    commits: dict[str, Any],
+) -> dict[int, list[tuple[str, dict[str, Any]]]]:
+    grouped: dict[int, list[tuple[str, dict[str, Any]]]] = {}
+    for hotkey, entry in (commits or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        try:
+            target_epoch = int(entry.get("pe"))
+        except Exception:
+            continue
+        grouped.setdefault(target_epoch, []).append((hotkey, entry))
+    return grouped
+
+
+def _round_label(round_number: int | None, target_epoch: int | None) -> str:
+    if round_number is not None and target_epoch is not None:
+        return f"round #{round_number} (target_epoch={target_epoch})"
+    if target_epoch is not None:
+        return f"target_epoch={target_epoch}"
+    if round_number is not None:
+        return f"round #{round_number}"
+    return "unknown round"
+
+
+def _score_summary(
+    payload: dict[str, Any],
+    limit: int = 3,
+) -> tuple[int, str, list[tuple[int, float]]]:
+    scores = payload.get("scores")
+    if not isinstance(scores, dict):
+        return 0, "scores unavailable", []
+
+    parsed: list[tuple[int, float]] = []
+    for uid_str, score_val in scores.items():
+        try:
+            parsed.append((int(uid_str), float(score_val)))
+        except Exception:
+            continue
+
+    # sort descending by score
+    parsed.sort(key=lambda item: item[1], reverse=True)
+
+    count = len(parsed)
+    if count == 0:
+        return 0, "scores empty", []
+
+    if limit and limit > 0:
+        top = parsed[:limit]
+        top_str = ", ".join(f"{uid}:{score:.4f}" for uid, score in top)
+        return count, f"top {top_str}", parsed
+    else:
+        return count, f"all {count} scores listed", parsed
+
+
+def _score_stats(
+    scores: Any,
+) -> tuple[int, float | None, float | None, float | None]:
+    if not isinstance(scores, dict):
+        return 0, None, None, None
+
+    values: list[float] = []
+    for value in scores.values():
+        try:
+            values.append(float(value))
+        except Exception:
+            continue
+
+    count = len(values)
+    if count == 0:
+        return 0, None, None, None
+
+    mean = sum(values) / count
+    variance = sum((val - mean) ** 2 for val in values) / count
+    stddev = math.sqrt(variance)
+    return count, mean, stddev, variance
+
+
+def _render_validator_table(
+    validators: list[ValidatorCommitment],
+    *,
+    total_weight: float,
+    scores_limit: int = 3,
+    scores_cols: int = 4,
+) -> tuple[str, list[str], list[tuple[str, list[tuple[int, float]]]]]:
+    headers = [
+        "validator",
+        "uid",
+        "round",
+        "stake_tau",
+        "weight_pct",
+        "scores",
+        "mean",
+        "std",
+        "var",
+        "tasks",
+        "agents",
+        "sha12",
+        "cid",
+    ]
+
+    rows: list[list[str]] = []
+    extra: list[str] = []
+    scores_tables: list[tuple[str, list[tuple[int, float]]]] = []
+
+    for item in validators:
+        weight_pct = (item.stake_tao / total_weight) * 100.0 if total_weight else 0.0
+        round_text = str(item.round_number) if item.round_number is not None else "-"
+        stake_text = f"{item.stake_tao:,.2f}"
+        weight_text = f"{weight_pct:5.2f}"
+
+        cid_text = "-"
+        if item.cid:
+            cid_text = item.cid[:18] + "…" if len(item.cid) > 18 else item.cid
+
+        sha_text = "-"
+        if item.payload_hash:
+            sha_text = item.payload_hash[:12] + "…" if len(item.payload_hash) > 12 else item.payload_hash
+
+        scores_count = 0
+        mean = stddev = variance = None
+        tasks = "-"
+        agents = "-"
+        top_line: str | None = None
+        parsed_scores: list[tuple[int, float]] = []
+
+        if item.payload_error:
+            extra.append(f"      {item.hotkey[:10]}… payload error: {item.payload_error}")
+        elif item.payload is None:
+            extra.append(f"      {item.hotkey[:10]}… payload missing")
+        else:
+            payload = item.payload
+            scores_count, top_line, parsed_scores = _score_summary(payload, limit=scores_limit)
+            count_stats, mean, stddev, variance = _score_stats(payload.get("scores"))
+            scores_count = count_stats
+            tasks_val = payload.get("tasks_completed") or payload.get("n")
+            if tasks_val is not None:
+                tasks = str(tasks_val)
+            agents_val = payload.get("agents")
+            if agents_val is not None:
+                agents = str(agents_val)
+            if top_line:
+                extra.append(f"      {item.hotkey[:10]}… {top_line}")
+            # When scores_limit <= 0, collect full miner scores for Rich table rendering
+            if parsed_scores and scores_limit <= 0:
+                scores_tables.append((f"{item.hotkey[:10]}…", parsed_scores))
+
+        mean_text = f"{mean:.4f}" if mean is not None else "-"
+        std_text = f"{stddev:.4f}" if stddev is not None else "-"
+        var_text = f"{variance:.4f}" if variance is not None else "-"
+        scores_text = str(scores_count) if scores_count else "-"
+
+        if item.cid:
+            extra.append(f"      {item.hotkey[:10]}… cid={item.cid}")
+        if item.payload_hash:
+            extra.append(f"      {item.hotkey[:10]}… payload_sha256={item.payload_hash}")
+
+        rows.append(
+            [
+                f"{item.hotkey[:10]}…",
+                str(item.uid) if item.uid is not None else "?",
+                round_text,
+                stake_text,
+                weight_text,
+                scores_text,
+                mean_text,
+                std_text,
+                var_text,
+                tasks,
+                agents,
+                sha_text,
+                cid_text,
+            ]
+        )
+
+    if not rows:
+        return "", extra, scores_tables
+
+    col_widths = [len(header) for header in headers]
+    for row in rows:
+        for idx, cell in enumerate(row):
+            col_widths[idx] = max(col_widths[idx], len(cell))
+
+    def _fmt_row(row: list[str]) -> str:
+        cells = [cell.ljust(col_widths[idx]) for idx, cell in enumerate(row)]
+        return "    | " + " | ".join(cells) + " |"
+
+    divider = "    +" + "+".join("-" * (w + 2) for w in col_widths) + "+"
+    table_lines = [divider, _fmt_row(headers), divider]
+    for row in rows:
+        table_lines.append(_fmt_row(row))
+    table_lines.append(divider)
+
+    return "\n".join(table_lines), extra, scores_tables
+
+
+def _decode_weight_payload(raw: Any) -> dict[int, int]:
+    mapping: dict[int, int] = {}
+    if raw is None:
+        return mapping
+
+    if isinstance(raw, dict):
+        if "uids" in raw and "weights" in raw:
+            uids = raw.get("uids") or []
+            weights = raw.get("weights") or []
+            for uid, weight in zip(uids, weights, strict=False):
+                try:
+                    mapping[int(uid)] = int(weight)
+                except Exception:
+                    continue
+        elif "destinations" in raw and "values" in raw:
+            uids = raw.get("destinations") or []
+            weights = raw.get("values") or []
+            for uid, weight in zip(uids, weights, strict=False):
+                try:
+                    mapping[int(uid)] = int(weight)
+                except Exception:
+                    continue
+        else:
+            for key, value in raw.items():
+                try:
+                    mapping[int(key)] = int(value)
+                except Exception:
+                    continue
+        return mapping
+
+    if isinstance(raw, list | tuple):
+        for entry in raw:
+            if isinstance(entry, dict):
+                uid = entry.get("uid") if "uid" in entry else entry.get("key")
+                weight = entry.get("weight")
+                if weight is None:
+                    weight = entry.get("value")
+                try:
+                    mapping[int(uid)] = int(weight)
+                except Exception:
+                    continue
+            elif isinstance(entry, list | tuple) and len(entry) >= 2:
+                uid, weight = entry[0], entry[1]
+                try:
+                    mapping[int(uid)] = int(weight)
+                except Exception:
+                    continue
+    return mapping
+
+
+def _normalize_weights(raw_weights: dict[int, int]) -> dict[int, float]:
+    if not raw_weights:
+        return {}
+    filtered = {uid: max(int(weight), 0) for uid, weight in raw_weights.items()}
+    total = sum(filtered.values())
+    if total <= 0:
+        return {uid: 0.0 for uid in filtered}
+    return {uid: weight / total for uid, weight in filtered.items()}
+
+
+async def _load_weight_snapshot(
+    st: AsyncSubtensor,
+    *,
+    netuid: int,
+    block_candidates: Sequence[int],
+) -> tuple[dict[int, dict[int, float]], int | None, str | None]:
+    last_error: str | None = None
+    fallback_snapshot: dict[int, dict[int, float]] = {}
+    fallback_block: int | None = None
+
+    for block in block_candidates:
+        if block is None or block <= 0:
+            continue
+        try:
+            entries = await st.weights(netuid=netuid, block=block)
+        except Exception as exc:
+            last_error = str(exc)
+            continue
+
+        snapshot: dict[int, dict[int, float]] = {}
+        for validator_uid, raw in entries:
+            try:
+                v_uid = int(validator_uid)
+            except Exception:
+                continue
+            raw_map = _decode_weight_payload(raw)
+            snapshot[v_uid] = _normalize_weights(raw_map)
+
+        if snapshot:
+            return snapshot, block, None
+
+        if fallback_block is None:
+            fallback_snapshot = snapshot
+            fallback_block = block
+        last_error = "no weights recorded"
+
+    if fallback_block is not None:
+        return fallback_snapshot, fallback_block, last_error
+
+    return {}, None, last_error
+
+
+def _format_weight_lines(
+    *,
+    validator_uid: int,
+    normalized: dict[int, float],
+    block: int,
+    limit: int = 5,
+) -> list[str]:
+    if not normalized:
+        return [
+            f"  • weights uid {validator_uid} @block {block}: no weights recorded",
+        ]
+
+    sorted_weights = sorted(
+        normalized.items(),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    shown = min(limit, len(sorted_weights))
+    header = f"  • weights uid {validator_uid} @block {block} (top {shown}/{len(sorted_weights)})"
+    lines = [header]
+    for dest_uid, value in sorted_weights[:shown]:
+        lines.append(f"      - dest {dest_uid}: {value:.4f} ({value * 100:.2f}%)")
+    remaining = len(sorted_weights) - shown
+    if remaining > 0:
+        lines.append(f"      … {remaining} additional destinations")
+    return lines
+
+
+async def inspect_rounds(
+    *,
+    rounds: int,
+    netuid: int,
+    network: str | None,
+    min_stake: float,
+    include_below: bool,
+    ipfs_api: str | None,
+    gateways: Sequence[str] | None,
+    scores_limit: int,
+    scores_cols: int,
+) -> None:
+    if rounds <= 0:
+        rounds = 1
+
+    async with await _create_subtensor(network) as st:
+        current_block = await st.get_current_block()
+        current_epoch = current_block / BLOCKS_PER_EPOCH
+        current_bounds = ROUND_MANAGER.get_round_boundaries(current_block)
+        cur_start_block = int(current_bounds["round_start_block"])
+        cur_target_block = int(current_bounds["target_block"])
+        cur_start_epoch = float(current_bounds["round_start_epoch"])
+        cur_target_epoch = float(current_bounds["target_epoch"])
+        cur_round = _compute_round_number(cur_start_block)
+        cur_progress = ROUND_MANAGER.fraction_elapsed(current_block) * 100.0
+
+        print("Current settlement window")
+        print(f"  • current_block={current_block:,} (epoch={current_epoch:.2f})")
+        print(f"  • window_epochs={cur_start_epoch:.2f}→{cur_target_epoch:.2f}")
+        print(f"  • window_blocks={cur_start_block:,}→{cur_target_block:,} (len={ROUND_BLOCK_LENGTH:,})")
+        if cur_round is not None:
+            print(f"  • round_index≈{cur_round}")
+        print(f"  • progress≈{cur_progress:.1f}% of window")
+
+        commits = await read_all_plain_commitments(st, netuid=netuid, block=None)
+        if not commits:
+            print("No commitments found on-chain.")
+            return
+
+        metagraph = await st.metagraph(netuid)
+
+        raw_hotkeys = getattr(metagraph, "hotkeys", None)
+        hotkeys: list[str] = list(raw_hotkeys) if raw_hotkeys is not None else []
+
+        raw_stakes = getattr(metagraph, "stake", None)
+        if raw_stakes is None:
+            stakes_raw: list[Any] = []
+        elif hasattr(raw_stakes, "tolist"):
+            stakes_raw = list(raw_stakes.tolist())
+        else:
+            try:
+                stakes_raw = list(raw_stakes)
+            except TypeError:
+                stakes_raw = [raw_stakes]
+
+        hk_to_uid = _hotkey_to_uid_map(hotkeys)
+
+        def stake_for_hotkey(hotkey: str) -> tuple[int | None, float]:
+            uid = hk_to_uid.get(hotkey)
+            if uid is None:
+                return None, 0.0
+            try:
+                stake_val = stakes_raw[uid]
+            except Exception:
+                stake_val = None
+            return uid, _stake_to_float(stake_val)
+
+        grouped = _select_recent_rounds(commits)
+        if not grouped:
+            print("No structured commitments (v4) detected.")
+            return
+
+        sorted_targets = sorted(grouped.keys(), reverse=True)
+        selected_targets = sorted_targets[:rounds]
+
+        for idx, target_epoch in enumerate(selected_targets, start=1):
+            entries = grouped.get(target_epoch, [])
+            if not entries:
+                continue
+
+            validators: list[ValidatorCommitment] = []
+            below_min_validators: list[ValidatorCommitment] = []
+            reported_rounds: list[int] = []
+            base_epochs: list[int] = []
+
+            for hotkey, entry in entries:
+                raw_epoch = entry.get("e")
+                try:
+                    epoch_val = int(raw_epoch) if raw_epoch is not None else None
+                except Exception:
+                    epoch_val = None
+
+                raw_round = entry.get("r")
+                round_int = raw_round if isinstance(raw_round, int) else None
+
+                raw_cid = entry.get("c")
+                cid_text = str(raw_cid) if raw_cid else None
+
+                uid, stake_tao = stake_for_hotkey(hotkey)
+
+                record = ValidatorCommitment(
+                    hotkey=hotkey,
+                    uid=uid,
+                    stake_tao=stake_tao,
+                    cid=cid_text,
+                    round_number=round_int,
+                    epoch=epoch_val,
+                    target_epoch=target_epoch,
+                )
+
+                if not include_below and stake_tao < min_stake:
+                    below_min_validators.append(record)
+                    continue
+
+                validators.append(record)
+                if round_int is not None:
+                    reported_rounds.append(round_int)
+                if epoch_val is not None:
+                    base_epochs.append(epoch_val)
+
+            start_block = int(target_epoch * BLOCKS_PER_EPOCH - ROUND_BLOCK_LENGTH)
+            target_block = int(target_epoch * BLOCKS_PER_EPOCH)
+            start_epoch = start_block / BLOCKS_PER_EPOCH
+            derived_round = _compute_round_number(start_block)
+            label_round = reported_rounds[0] if reported_rounds else derived_round
+            label = _round_label(label_round, target_epoch)
+
+            if current_block < target_block:
+                status = "active: " + _format_minutes(target_block - current_block) + " remaining"
+            else:
+                status = "settled: finished " + _format_minutes(current_block - target_block) + " ago"
+
+            print(f"\n[{idx}] {label}")
+            print(f"  • window_epochs={start_epoch:.2f}→{float(target_epoch):.2f}")
+            print(f"  • window_blocks={start_block:,}→{target_block:,} (len={ROUND_BLOCK_LENGTH:,})")
+            print(f"  • status={status}")
+            if base_epochs:
+                base_mode = max(set(base_epochs), key=base_epochs.count)
+                print(f"  • commitment_e≈{base_mode}")
+            if derived_round is not None and (not reported_rounds or label_round != derived_round):
+                print(f"  • derived_round_index≈{derived_round}")
+
+            combined_commitments = validators + below_min_validators
+
+            payload_tasks: list[tuple[ValidatorCommitment, asyncio.Task]] = []
+            for item in combined_commitments:
+                if not item.cid:
+                    continue
+                task = asyncio.create_task(_fetch_payload(item.cid, api_url=ipfs_api, gateways=gateways))
+                payload_tasks.append((item, task))
+
+            for item, task in payload_tasks:
+                payload, sha_hex, error = await task
+                item.payload = payload
+                item.payload_hash = sha_hex
+                item.payload_error = error
+
+            validators.sort(key=lambda v: v.stake_tao, reverse=True)
+            total_weight = sum(filter(None, (v.stake_tao for v in validators)))
+
+            if not validators:
+                print(f"  • No validators meet stake ≥ {min_stake:.2f} τ for this window")
+            else:
+                table_text, extra_lines, scores_tables = _render_validator_table(
+                    validators,
+                    total_weight=total_weight,
+                    scores_limit=scores_limit,
+                    scores_cols=scores_cols,
+                )
+                print(f"  • validators_considered={len(validators)} (stake ≥ {min_stake:.2f} τ)")
+                if total_weight > 0:
+                    print(f"  • total_stake={total_weight:,.2f} τ")
+                if table_text:
+                    print(table_text)
+                for line in extra_lines:
+                    print(line)
+                # When showing all miner scores, render them as Rich tables
+                if scores_tables:
+                    _print_scores_rich(scores_tables, cols=scores_cols)
+
+            if below_min_validators:
+                below_min_validators.sort(key=lambda v: v.stake_tao, reverse=True)
+                below_total = sum(filter(None, (v.stake_tao for v in below_min_validators)))
+                print(f"  • validators_below_min_stake={len(below_min_validators)} (stake < {min_stake:.2f} τ)")
+                if below_total > 0:
+                    print(f"  • total_stake_below={below_total:,.2f} τ")
+                table_text, extra_lines, scores_tables = _render_validator_table(
+                    below_min_validators,
+                    total_weight=below_total,
+                    scores_limit=scores_limit,
+                    scores_cols=scores_cols,
+                )
+                if table_text:
+                    print(table_text)
+                for line in extra_lines:
+                    print(line)
+                if scores_tables:
+                    _print_scores_rich(scores_tables, cols=scores_cols)
+
+            if target_block > current_block:
+                print("  • weights unavailable (round still active)")
+                continue
+
+            candidates = [target_block]
+            for offset in (12, 60, 120):
+                candidate = target_block + offset
+                if candidate <= current_block:
+                    candidates.append(candidate)
+            candidates.append(current_block)
+
+            seen = set()
+            block_candidates: list[int] = []
+            for blk in candidates:
+                if blk not in seen:
+                    seen.add(blk)
+                    block_candidates.append(blk)
+
+            weights_map, weight_block, weight_error = await _load_weight_snapshot(
+                st,
+                netuid=netuid,
+                block_candidates=block_candidates,
+            )
+
+            if weight_block is None:
+                reason = weight_error or "unavailable"
+                print(f"  • weights unavailable ({reason})")
+                continue
+
+            validator_uids = sorted({v.uid for v in validators if v.uid is not None})
+            if not validator_uids:
+                print(f"  • weights @block {weight_block}: no validator UIDs")
+                continue
+
+            for v_uid in validator_uids:
+                normalized = weights_map.get(v_uid, {})
+                lines = _format_weight_lines(
+                    validator_uid=v_uid,
+                    normalized=normalized,
+                    block=weight_block,
+                    limit=5,
+                )
+                for line in lines:
+                    print(line)
+            if weight_error and weights_map:
+                print(f"  • weights note: {weight_error}")
+
+
+def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=("Inspect recent validator settlement commitments and shared scores."),
+    )
+    parser.add_argument(
+        "-N",
+        "--rounds",
+        type=int,
+        default=1,
+        help="Number of recent settlement windows to display (default: 1).",
+    )
+    parser.add_argument(
+        "--netuid",
+        type=int,
+        default=DEFAULT_NETUID,
+        help=f"Subnet netuid (default: {DEFAULT_NETUID}).",
+    )
+    parser.add_argument(
+        "--network",
+        type=str,
+        default=DEFAULT_NETWORK,
+        help=f"Bittensor network to query (default: {DEFAULT_NETWORK}).",
+    )
+    parser.add_argument(
+        "--min-stake",
+        type=float,
+        default=MIN_VALIDATOR_STAKE_FOR_CONSENSUS_TAO,
+        help=(f"Minimum validator stake (τ) required to include a commitment. Defaults to configured threshold ({MIN_VALIDATOR_STAKE_FOR_CONSENSUS_TAO})."),
+    )
+    parser.add_argument(
+        "--include-below",
+        action="store_true",
+        help="Show validators even if below the minimum stake threshold.",
+    )
+    parser.add_argument(
+        "--ipfs-api",
+        type=str,
+        default=IPFS_API_URL,
+        help="IPFS HTTP API base URL override.",
+    )
+    parser.add_argument(
+        "--ipfs-gateways",
+        type=str,
+        default=None,
+        help="Comma-separated list of IPFS gateways to try when fetching payloads.",
+    )
+    parser.add_argument(
+        "--scores-limit",
+        type=int,
+        default=0,
+        help=("Number of top miner scores to show per validator (default: all). Use 0 for all, or a positive N for top-N."),
+    )
+    parser.add_argument(
+        "--scores-cols",
+        type=int,
+        default=4,
+        help=("Number of columns to use when printing full miner scores (default: 4)."),
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    args = parse_args(argv)
+    gateways = [gw.strip() for gw in args.ipfs_gateways.split(",") if gw.strip()] if args.ipfs_gateways else IPFS_GATEWAYS
+
+    try:
+        asyncio.run(
+            inspect_rounds(
+                rounds=args.rounds,
+                netuid=args.netuid,
+                network=args.network,
+                min_stake=args.min_stake,
+                include_below=args.include_below,
+                ipfs_api=args.ipfs_api,
+                gateways=gateways,
+                scores_limit=args.scores_limit,
+                scores_cols=args.scores_cols,
+            )
+        )
+    except KeyboardInterrupt:  # pragma: no cover - user abort
+        pass
+    except Exception as exc:
+        print(f"error: {exc}")
+
+
+if __name__ == "__main__":
+    main()

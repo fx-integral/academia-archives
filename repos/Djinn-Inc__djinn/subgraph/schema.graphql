@@ -1,0 +1,359 @@
+# =============================================================================
+# Djinn Protocol Subgraph Schema
+# =============================================================================
+# Indexes all on-chain events from the Djinn smart contracts on Base.
+# Provides the entity layer for the web client's GraphQL queries.
+# =============================================================================
+
+# --- Enums matching Solidity enums ---
+
+enum SignalStatus {
+  Active
+  Cancelled
+  Settled
+}
+
+enum Outcome {
+  Pending
+  Favorable
+  Unfavorable
+  Void
+}
+
+# --- Core Entities ---
+
+"""
+A committed encrypted signal from a Genius.
+Created on SignalCommitted, updated on SignalStatusUpdated / SignalCancelled.
+"""
+type Signal @entity {
+  "signalId from the contract"
+  id: ID!
+  "The Genius who committed this signal"
+  genius: Genius!
+  "Sport category (e.g. NBA, NFL, MLB)"
+  sport: String!
+  "Maximum price in basis points the Genius charges"
+  maxPriceBps: BigInt!
+  "SLA multiplier in basis points for collateral lock"
+  slaMultiplierBps: BigInt!
+  "Maximum notional per purchase (USDC, 6 decimals). 0 means no per-signal cap."
+  maxNotional: BigInt!
+  "Minimum notional per purchase (USDC, 6 decimals). 0 means no minimum."
+  minNotional: BigInt!
+  "Unix timestamp after which the signal expires"
+  expiresAt: BigInt!
+  "Current status of the signal"
+  status: SignalStatus!
+  "Block timestamp when the signal was committed"
+  createdAt: BigInt!
+  "Block number when the signal was committed"
+  createdAtBlock: BigInt!
+  "Transaction hash of the commit"
+  createdAtTx: Bytes!
+  "Keccak256 hash of off-chain decoy lines (v2 signals only)"
+  linesHash: Bytes
+  "Number of decoy lines stored off-chain (v2 signals only)"
+  lineCount: Int
+  "Whether this signal uses Best Price Available mode (v2 signals only)"
+  bpaMode: Boolean
+  "Purchases of this signal"
+  purchases: [Purchase!]! @derivedFrom(field: "signal")
+}
+
+"""
+A signal purchase by an Idiot (buyer).
+Created on SignalPurchased, outcome updated on OutcomeUpdated.
+"""
+type Purchase @entity {
+  "On-chain purchaseId from the Escrow contract"
+  id: ID!
+  "The signal that was purchased"
+  signal: Signal!
+  "The buyer (Idiot)"
+  idiot: Idiot!
+  "On-chain auto-incremented purchase ID"
+  onChainPurchaseId: BigInt!
+  "Reference amount in USDC (6 decimals)"
+  notional: BigInt!
+  "Total fee (credit + USDC)"
+  feePaid: BigInt!
+  "Portion of fee paid with Djinn Credits"
+  creditUsed: BigInt!
+  "Portion of fee paid with escrowed USDC"
+  usdcPaid: BigInt!
+  "Current outcome of the signal"
+  outcome: Outcome!
+  "Block timestamp of the purchase"
+  purchasedAt: BigInt!
+  "Block number of the purchase"
+  purchasedAtBlock: BigInt!
+  "Transaction hash of the purchase"
+  purchasedAtTx: Bytes!
+  "The Genius who created the signal (denormalized for efficient queries)"
+  genius: Genius!
+}
+
+"""
+A Genius (signal seller) profile with aggregate stats.
+Created on first SignalCommitted event for an address.
+"""
+type Genius @entity {
+  "Genius wallet address"
+  id: ID!
+  "Total signals committed by this Genius"
+  totalSignals: BigInt!
+  "Total active (non-cancelled, non-settled) signals"
+  activeSignals: BigInt!
+  "Total purchases across all signals"
+  totalPurchases: BigInt!
+  "Total USDC volume (sum of notional across purchases)"
+  totalVolume: BigInt!
+  "Total USDC fees earned (accumulated at purchase time)"
+  totalFeesEarned: BigInt!
+  "Total USDC fees claimed (withdrawn) by this Genius"
+  totalFeesClaimed: BigInt!
+  "Aggregate Quality Score across all audits"
+  aggregateQualityScore: BigInt!
+  "Number of audits settled"
+  totalAudits: BigInt!
+  "Collateral deposited (USDC, 6 decimals)"
+  collateralDeposited: BigInt!
+  "Collateral currently locked"
+  collateralLocked: BigInt!
+  "Total collateral slashed"
+  totalSlashed: BigInt!
+  "Block timestamp of first activity"
+  createdAt: BigInt!
+  "All signals committed by this Genius"
+  signals: [Signal!]! @derivedFrom(field: "genius")
+  "All purchases for this Genius's signals"
+  purchases: [Purchase!]! @derivedFrom(field: "genius")
+  "All accounts (Genius-Idiot pairs) for this Genius"
+  accounts: [Account!]! @derivedFrom(field: "genius")
+  "All audit results for this Genius"
+  auditResults: [AuditResult!]! @derivedFrom(field: "genius")
+  "Total favorable outcomes across all purchases"
+  totalFavorable: BigInt!
+  "Total unfavorable outcomes across all purchases"
+  totalUnfavorable: BigInt!
+  "Total void outcomes across all purchases"
+  totalVoid: BigInt!
+}
+
+"""
+An Idiot (signal buyer) profile.
+Created on first Deposited or SignalPurchased event for an address.
+"""
+type Idiot @entity {
+  "Idiot wallet address"
+  id: ID!
+  "Total signals purchased"
+  totalPurchases: BigInt!
+  "Total USDC deposited into escrow"
+  totalDeposited: BigInt!
+  "Total USDC withdrawn from escrow"
+  totalWithdrawn: BigInt!
+  "Current escrowed USDC balance"
+  escrowBalance: BigInt!
+  "Total USDC spent on fees"
+  totalFeesPaid: BigInt!
+  "Total credits used on purchases"
+  totalCreditsUsed: BigInt!
+  "Current credit balance"
+  creditBalance: BigInt!
+  "Block timestamp of first activity"
+  createdAt: BigInt!
+  "All purchases by this Idiot"
+  purchases: [Purchase!]! @derivedFrom(field: "idiot")
+  "All accounts (Genius-Idiot pairs) for this Idiot"
+  accounts: [Account!]! @derivedFrom(field: "idiot")
+}
+
+"""
+A Genius-Idiot pair account tracking cycles and outcomes.
+Created on first PurchaseRecorded for a pair.
+"""
+type Account @entity {
+  "keccak256(genius, idiot) as hex string"
+  id: ID!
+  "The Genius in this pair"
+  genius: Genius!
+  "The Idiot in this pair"
+  idiot: Idiot!
+  "Current audit cycle number"
+  currentCycle: BigInt!
+  "Number of signals in the current cycle"
+  signalCount: BigInt!
+  """
+  Quality score for the current cycle.
+  Maps to the contract's outcomeBalance struct field (renamed in DEV-026),
+  but uses the event parameter name qualityScore for ABI compatibility.
+  """
+  qualityScore: BigInt!
+  "Whether the current cycle has been settled"
+  settled: Boolean!
+  "Block timestamp of first interaction"
+  createdAt: BigInt!
+  "Audit results for this pair"
+  auditResults: [AuditResult!]! @derivedFrom(field: "account")
+}
+
+"""
+Result of an audit settlement between a Genius-Idiot pair.
+Created on AuditSettled or EarlyExitSettled.
+"""
+type AuditResult @entity {
+  "genius-idiot-cycle composite key"
+  id: ID!
+  "The Genius in the audit"
+  genius: Genius!
+  "The Idiot in the audit"
+  idiot: Idiot!
+  "The Account (pair) for this audit"
+  account: Account!
+  "Audit cycle number"
+  cycle: BigInt!
+  """
+  Quality Score computed for this cycle.
+  Maps to the contract's outcomeBalance struct field (renamed in DEV-026),
+  but uses the event parameter name qualityScore for ABI compatibility.
+  """
+  qualityScore: BigInt!
+  "Tranche A: USDC refunded to Idiot"
+  trancheA: BigInt!
+  "Tranche B: Credits minted to Idiot"
+  trancheB: BigInt!
+  "Protocol fee collected (0.5% of notional)"
+  protocolFee: BigInt!
+  "Whether this was an early exit"
+  isEarlyExit: Boolean!
+  "Block timestamp of the settlement"
+  settledAt: BigInt!
+  "Block number of the settlement"
+  settledAtBlock: BigInt!
+  "Transaction hash of the settlement"
+  settledAtTx: Bytes!
+}
+
+"""
+Per-genius collateral position tracking deposits, locks, and slashes.
+One entity per Genius address.
+"""
+type CollateralPosition @entity {
+  "Genius wallet address"
+  id: ID!
+  "Genius entity reference"
+  genius: Genius!
+  "Total USDC deposited as collateral"
+  deposited: BigInt!
+  "Total USDC currently locked"
+  locked: BigInt!
+  "Available (deposited - locked)"
+  available: BigInt!
+  "Total amount slashed"
+  totalSlashed: BigInt!
+  "Last update block timestamp"
+  lastUpdatedAt: BigInt!
+}
+
+"""
+Credit ledger balance per address.
+Created on first CreditsMinted event.
+"""
+type CreditBalance @entity {
+  "Wallet address"
+  id: ID!
+  "Current credit balance"
+  balance: BigInt!
+  "Total credits ever minted to this address"
+  totalMinted: BigInt!
+  "Total credits ever burned from this address"
+  totalBurned: BigInt!
+  "Last update block timestamp"
+  lastUpdatedAt: BigInt!
+}
+
+"""
+v1747: a canonical line resolved on-chain by LineOutcomeRegistry.
+
+One row per (chain_id, registry, canonical-line-string) lineHash.
+100 signals containing the same line share this single row — the
+verifiability promise is that anyone can query by lineHash and get
+the same answer the protocol settled against.
+"""
+type Line @entity {
+  "Hex-encoded 32-byte lineHash (matches LineOutcomeRegistry.lineHash)"
+  id: ID!
+  "Final canonical outcome (Pending until 4-of-5 attestations land)"
+  outcome: Outcome!
+  "Block timestamp when LineFinalized was emitted (null while Pending)"
+  finalizedAt: BigInt
+  "Block number of finalization"
+  finalizedAtBlock: BigInt
+  "Tx hash of the finalizing submit"
+  finalizedAtTx: Bytes
+  "Whether this line was force-voided by the timelock owner"
+  forceVoided: Boolean!
+  "Operator-supplied reason if forceVoided"
+  voidReason: String
+  "All attestations submitted for this line"
+  attestations: [LineAttestation!]! @derivedFrom(field: "line")
+}
+
+"""
+v1747: one validator's attestation for a line outcome.
+Created on LineAttested events.
+"""
+type LineAttestation @entity {
+  "lineHash-attestor composite key (hex-hex)"
+  id: ID!
+  "The line being attested"
+  line: Line!
+  "Validator EOA that signed the attestation (must be in OV signer set at submit time)"
+  attestor: Bytes!
+  "Outcome value the attestor signed"
+  outcome: Outcome!
+  "Block timestamp of the attestation"
+  block: BigInt!
+  "Block number of the attestation"
+  blockNumber: BigInt!
+  "Transaction hash of the submit that included this attestation"
+  tx: Bytes!
+}
+
+"""
+Global protocol statistics. Singleton entity with id '1'.
+"""
+type ProtocolStats @entity {
+  "Always '1' (singleton)"
+  id: ID!
+  "Total signals committed across all Geniuses"
+  totalSignals: BigInt!
+  "Total purchases across all signals"
+  totalPurchases: BigInt!
+  "Total USDC volume (sum of notional)"
+  totalVolume: BigInt!
+  "Total USDC fees collected"
+  totalFees: BigInt!
+  "Total credits minted"
+  totalCreditsMinted: BigInt!
+  "Total credits burned"
+  totalCreditsBurned: BigInt!
+  "Total audits settled"
+  totalAudits: BigInt!
+  "Total early exits"
+  totalEarlyExits: BigInt!
+  "Total protocol fees collected"
+  totalProtocolFees: BigInt!
+  "Total collateral deposited"
+  totalCollateralDeposited: BigInt!
+  "Total collateral slashed"
+  totalCollateralSlashed: BigInt!
+  "Total USDC refunded"
+  totalRefunds: BigInt!
+  "Number of unique Geniuses"
+  uniqueGeniuses: BigInt!
+  "Number of unique Idiots"
+  uniqueIdiots: BigInt!
+}

@@ -1,0 +1,46 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.so
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environments
+.venv/
+.env
+.envrc
+
+# Editor/OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Build output
+build/
+dist/
+*.egg-info/
+
+# uv / poetry
+.uv/
+.python-version
+
+# Validator
+validator_logs/
+
+# Lock files
+uv.lock
+*.lock
+
+# Backup files
+*.backup
+*.bak
+
+# PM2 ecosystem config (contains validator-specific settings)
+# Use ecosystem.config.example.js as template
+scripts/ecosystem.config.js
+scripts/ecosystem.config.js.backup
+scripts/.ecosystem.config.js.local

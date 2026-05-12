@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling<1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "djinn-tunnel-shield"
+version = "0.2.0"
+description = "Zero-config DDoS protection for Bittensor miners via Cloudflare Tunnel"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "structlog>=23.0",
+]
+
+[project.optional-dependencies]
+bittensor = ["bittensor>=7.0"]
+dev = ["pytest>=7.0", "pytest-asyncio>=0.21"]

@@ -1,0 +1,223 @@
+#https://docs.github.com/en/actions/use-cases-and-examples/publishing-packages/publishing-docker-images#publishing-images-to-github-packages
+name: Create and publish a Docker image
+
+on:
+  push:
+    branches:
+      - testnet
+  pull_request:
+    types: [labeled, synchronize]
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/subnet-2
+
+jobs:
+  build-dev:
+    if: github.event_name != 'workflow_run' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-build'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+      security-events: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Build and push Docker image
+        id: push-testnet
+        uses: ./.github/actions/docker-publish
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          target: dev
+          pull: "true"
+          push: ${{ github.event_name != 'pull_request' }}
+          build-args: |
+            SN2_VERSION=
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev-${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan container image
+        if: github.event_name == 'push'
+        uses: ./.github/actions/trivy-sarif
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev-${{ github.sha }}
+          category: trivy-image-testnet
+
+      - name: Generate container SBOM
+        if: github.event_name == 'push'
+        uses: anchore/sbom-action@57aae528053a48a3f6235f2d9461b05fbcb7366d # v0.23.1
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev-${{ github.sha }}
+          format: cyclonedx-json
+          output-file: sbom-dev.cdx.json
+          artifact-name: sbom-container-dev
+
+      - name: Generate artifact attestation
+        if: github.event_name == 'push'
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME}}
+          subject-digest: ${{ steps.push-testnet.outputs.digest }}
+          push-to-registry: true
+
+  build-release:
+    if: >-
+      github.event_name == 'workflow_run'
+      && github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.event == 'push'
+      && github.event.workflow_run.head_branch != 'testnet'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+      security-events: write
+
+    env:
+      RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
+
+    steps:
+      - name: Validate release ref
+        run: |
+          if ! echo "$RELEASE_TAG" | grep -qE '^v?[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Unexpected head_branch: $RELEASE_TAG"
+            exit 1
+          fi
+
+      - name: Resolve tag SHA
+        id: resolve-tag
+        run: |
+          REF_DATA=$(gh api "repos/${{ github.repository }}/git/ref/tags/$RELEASE_TAG")
+          OBJ_TYPE=$(echo "$REF_DATA" | jq -r '.object.type')
+          OBJ_SHA=$(echo "$REF_DATA" | jq -r '.object.sha')
+          if [ "$OBJ_TYPE" = "tag" ]; then
+            TAG_SHA=$(gh api "repos/${{ github.repository }}/git/tags/$OBJ_SHA" --jq '.object.sha')
+          else
+            TAG_SHA="$OBJ_SHA"
+          fi
+          RUN_SHA="${{ github.event.workflow_run.head_sha }}"
+          if [ "$TAG_SHA" != "$RUN_SHA" ]; then
+            echo "::error::Tag $RELEASE_TAG points to $TAG_SHA but workflow_run reported $RUN_SHA"
+            exit 1
+          fi
+          echo "tag_sha=$TAG_SHA" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ steps.resolve-tag.outputs.tag_sha }}
+          persist-credentials: false
+
+      - name: Download release binaries
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if gh release download "$RELEASE_TAG" \
+              --pattern 'sn2-validator-linux-x86_64' \
+              --pattern 'sn2-miner-linux-x86_64' \
+              --dir .; then
+              exit 0
+            fi
+            echo "Attempt $attempt failed, retrying in $((attempt * 10))s..."
+            sleep $((attempt * 10))
+          done
+          echo "Failed to download release assets after 5 attempts"
+          exit 1
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify binary attestations
+        run: |
+          gh attestation verify sn2-validator-linux-x86_64 --repo "${{ github.repository }}"
+          gh attestation verify sn2-miner-linux-x86_64 --repo "${{ github.repository }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare binaries for Docker context
+        run: |
+          mv sn2-validator-linux-x86_64 sn2-validator
+          mv sn2-miner-linux-x86_64 sn2-miner
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Log in to container registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: release-meta
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+
+      - name: Build and push Docker image
+        id: push-release
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: ./Dockerfile
+          target: release
+          push: true
+          pull: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.RELEASE_TAG }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          labels: ${{ steps.release-meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Trivy scan
+        id: trivy-release
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.RELEASE_TAG }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: "true"
+
+      - name: Upload SARIF to GitHub Security tab
+        if: steps.trivy-release.conclusion == 'success'
+        uses: github/codeql-action/upload-sarif@68bde559dea0fdcac2102bfdf6230c5f70eb485e # v4.35.4
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-image-release
+
+      - name: Generate container SBOM
+        uses: anchore/sbom-action@57aae528053a48a3f6235f2d9461b05fbcb7366d # v0.23.1
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.RELEASE_TAG }}
+          format: cyclonedx-json
+          output-file: sbom-release.cdx.json
+          artifact-name: sbom-container-release
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME}}
+          subject-digest: ${{ steps.push-release.outputs.digest }}
+          push-to-registry: true

@@ -1,0 +1,63 @@
+# Ansible Vault Example Configuration (do not store real secrets here)
+remote_mode: false
+
+# Wallet configuration
+# This prefix will be used for all wallet names, e.g. "owner", "owner_validator_1", etc.
+cold_wallet_name: "owner"
+
+# Hotkey names and role identifiers
+# Passwordless wallets will be created on the target machine
+# Only the owner wallet is funded from the faucet, then wallets are registered to the subnet
+# Validators receive stake directly during the staking step
+owner_hotkey: "default"                # Hotkey name for the owner wallet (used for subnet creation)
+validator_hotkeys: ["validator_1"]     # List of validator identifiers (these are NOT actual hotkeys but identifiers)
+miner_hotkeys: ["miner_1", "miner_2"]  # List of miner identifiers (these are NOT actual hotkeys but identifiers)
+aggregator_hotkeys: ["aggregator_1"]   # List of aggregator identifiers (optional)
+
+# Network configuration
+network: "local"
+netuid: 2
+
+# Version override for development
+templar_version: "0.2.52dev"           # Version string to use (typically a non-production version for testing)
+
+# Staking amount (in TAO) to add to each validator
+stake_amount: 1000
+
+# Extra apt packages to install (if any)
+extra_packages: []
+
+# Secrets for telemetry/monitoring
+WANDB_API_KEY: "YOUR_WANDB_API_KEY_HERE"
+INFLUXDB_URL: "http://localhost:8086"
+INFLUXDB_ORG: "YOUR_INFLUX_ORG"
+INFLUXDB_BUCKET: "YOUR_INFLUX_BUCKET"
+INFLUXDB_TOKEN: "YOUR_INFLUXDB_TOKEN"
+
+# R2 Cloud Storage secrets
+R2_ACCOUNT_ID: "YOUR_R2_ACCOUNT_ID"
+R2_GRADIENTS_ACCOUNT_ID: "YOUR_R2_GRADIENTS_ACCOUNT_ID"
+R2_GRADIENTS_BUCKET_NAME: "YOUR_R2_GRADIENTS_BUCKET_NAME"
+R2_READ_ACCESS_KEY_ID: "YOUR_R2_READ_ACCESS_KEY_ID"
+R2_READ_SECRET_ACCESS_KEY: "YOUR_R2_READ_SECRET_ACCESS_KEY"
+R2_GRADIENTS_READ_ACCESS_KEY_ID: "YOUR_R2_GRADIENTS_READ_ACCESS_KEY_ID"
+R2_GRADIENTS_READ_SECRET_ACCESS_KEY: "YOUR_R2_GRADIENTS_READ_SECRET_ACCESS_KEY"
+R2_WRITE_ACCESS_KEY_ID: "YOUR_R2_WRITE_ACCESS_KEY_ID"
+R2_WRITE_SECRET_ACCESS_KEY: "YOUR_R2_WRITE_SECRET_ACCESS_KEY"
+R2_GRADIENTS_WRITE_ACCESS_KEY_ID: "YOUR_R2_GRADIENTS_WRITE_ACCESS_KEY_ID"
+R2_GRADIENTS_WRITE_SECRET_ACCESS_KEY: "YOUR_R2_GRADIENTS_WRITE_SECRET_ACCESS_KEY"
+R2_DATASET_WRITE_ACCESS_KEY_ID: "YOUR_R2_DATASET_WRITE_ACCESS_KEY_ID"
+R2_DATASET_WRITE_SECRET_ACCESS_KEY: "YOUR_R2_DATASET_WRITE_SECRET_ACCESS_KEY"
+
+# R2 Dataset variables
+# R2_DATASET_ACCOUNT_ID: "YOUR_R2_DATASET_ACCOUNT_ID"
+# R2_DATASET_BUCKET_NAME: "YOUR_R2_DATASET_BUCKET_NAME"
+# R2_DATASET_READ_ACCESS_KEY_ID: "YOUR_R2_DATASET_READ_ACCESS_KEY_ID"
+# R2_DATASET_READ_SECRET_ACCESS_KEY: "YOUR_R2_DATASET_READ_SECRET_ACCESS_KEY"
+
+# R2_AGGREGATOR_ACCOUNT_ID: "YOUR_R2_AGGREGATOR_ACCOUNT_ID"
+# R2_AGGREGATOR_BUCKET_NAME: "YOUR_R2_AGGREGATOR_BUCKET_NAME" # make it "aggregator"
+# R2_AGGREGATOR_WRITE_ACCESS_KEY_ID: "YOUR_R2_AGGREGATOR_WRITE_ACCESS_KEY_ID"
+# R2_AGGREGATOR_WRITE_SECRET_ACCESS_KEY: "YOUR_R2_AGGREGATOR_WRITE_SECRET_ACCESS_KEY"
+# R2_AGGREGATOR_READ_ACCESS_KEY_ID: "YOUR_R2_AGGREGATOR_READ_ACCESS_KEY_ID"
+# R2_AGGREGATOR_READ_SECRET_ACCESS_KEY: "YOUR_R2_AGGREGATOR_READ_SECRET_ACCESS_KEY"

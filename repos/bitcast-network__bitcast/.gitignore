@@ -1,0 +1,17 @@
+.env
+__pycache__/
+.pytest_cache/
+venv/
+venv_bitcast/
+*.pkl
+cache_directory/
+bitcast/cache/
+client_secret.json
+nodes.json
+wandb/
+*.egg-info/
+build/
+.cursor/
+.dev_planning/
+.vscode
+historical_videos.jsonl

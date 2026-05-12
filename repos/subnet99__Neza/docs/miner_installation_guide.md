@@ -1,0 +1,154 @@
+# Miner Installation Guide
+
+## Environment Requirements
+
+Before starting the installation, please ensure your system meets the following requirements:
+
+### Miner Node
+
+- Python 3.10 or higher
+- NVIDIA driver version > 525
+- Meet the [hardware requirements](../README.md#miner-recommended-configuration)
+
+## Installation
+
+### Install ComfyUI
+
+ComfyUI can be installed on separate GPU servers and prepared in advance:
+
+- According to your GPU model, refer to [ComfyUI](https://github.com/comfyanonymous/ComfyUI) to prepare the system environment.
+- Install pm2 (skip this step if already installed)
+
+```bash
+chmod +x ./scripts/install_pm2.sh
+./scripts/install_pm2.sh
+```
+
+- Setup ComfyUI
+
+If you have multiple GPUs, simply repeat running `setup_comfyui.sh` for each GPU:
+
+```bash
+chmod +x ./scripts/setup_comfyui.sh
+./scripts/setup_comfyui.sh
+```
+
+**Note**: You can run multiple ComfyUI instances on different GPU servers and configure them in the environment variables.
+
+- Install ComfyUI-Manager and required custom nodes and models:
+
+```bash
+chmod +x ./scripts/setup_comfyui_manager.sh
+./scripts/setup_comfyui_manager.sh
+```
+
+**Note**: This script will install `ComfyUI-Manager` and automatically download all necessary custom nodes and models. Due to environmental factors (e.g., GPU, Python version, dependency support), the installation success rate may vary. Please **verify that ComfyUI starts normally** and all custom nodes and models are loaded before proceeding.
+
+### Clone Repository
+
+```bash
+git clone https://github.com/subnet99/Neza.git
+cd Neza
+```
+
+#### Create Virtual Environment
+
+It's recommended to use venv to create an isolated Python environment:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+#### Install Dependencies
+
+```bash
+# Install PyTorch (choose the appropriate command based on your CUDA version)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+
+# Install subnet dependencies
+pip install -r requirements.txt
+
+pip install -e .
+```
+
+#### Set Environment Variables
+
+1. Create a configuration file:
+
+```bash
+cp env.example .env
+```
+
+2. Edit the .env file and set the following parameters:
+
+```
+# ComfyUI Server Configuration
+# Configure multiple ComfyUI servers if using distributed GPU setup
+# Format: IP1:PORT1,IP2:PORT2,IP3:PORT3
+COMFYUI_SERVERS=127.0.0.1:8188
+
+# API Models and Keys (for Miner)
+# Simple format: model1,model2|key1,key2;model3|key3
+# Example: sora-2,sora-2-pro|sk-xxx,key2;sora-2|sk-xxx2
+API_MODELS=
+```
+
+3. Configure API keys using `.keys.json` file (compatible with API_MODELS):
+
+```bash
+cp .keys.json.example .keys.json
+```
+
+Edit `.keys.json` and fill in your API keys:
+
+```json
+[
+  {
+    "model": "sora-2",
+    "keys": [
+      "your-api-key-1",
+      "your-api-key-2"
+    ],
+    "base_url": "https://xxx.azure.com"
+  },
+  {
+    "model": "sora-2-pro",
+    "keys": [
+      "your-api-key-3"
+    ]
+  }
+]
+```
+
+**Note**: 
+- You can use `API_MODELS` environment variable and `.keys.json` file together. Both configurations will be loaded and merged. The `.keys.json` file supports more flexible configuration with base_url per model.
+- The `base_url` field is optional. If not provided, the system will use the official default API address for that model.
+
+## Miner Startup Command
+
+Mainnet
+
+```bash
+pm2 start neurons/miner.py -- \
+  --netuid 99 \
+  --subtensor.network finney \
+  --wallet.name [wallet_name] \
+  --wallet.hotkey [hotkey] \
+  --axon.port {port} \
+  --axon.external_ip {ip} \
+  --logging.trace
+```
+
+Testnet
+
+```bash
+pm2 start neurons/miner.py -- \
+  --netuid 377 \
+  --subtensor.network test \
+  --wallet.name [wallet_name] \
+  --wallet.hotkey [hotkey] \
+  --axon.port {port} \
+  --axon.external_ip {ip} \
+  --logging.trace
+```

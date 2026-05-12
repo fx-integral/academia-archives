@@ -1,0 +1,1127 @@
+# The MIT License (MIT)
+# Copyright © 2025 Resi Labs
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+# documentation files (the “Software”), to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
+# and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+# the Software.
+
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+# THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+from collections import defaultdict
+import copy
+import sys
+import threading
+import time
+import traceback
+import typing
+import os
+import bittensor as bt
+import datetime as dt
+from common import constants, utils
+from common.data import CompressedMinerIndex, TimeBucket
+from common.protocol import (
+    GetDataEntityBucket,
+    GetMinerIndex,
+    GetContentsByBuckets,
+    REQUEST_LIMIT_BY_TYPE_PER_PERIOD
+)
+
+from scraping.config.config_reader import ConfigReader
+from scraping.coordinator import ScraperCoordinator
+from scraping.miner_provider import MinerScraperProvider
+from storage.miner.sqlite_miner_storage import SqliteMinerStorage
+from neurons.config import NeuronType, check_config, create_config
+from upload_utils.s3_uploader import S3PartitionedUploader
+from dynamic_desirability.desirability_retrieval import sync_run_retrieval
+
+from common.data import DataLabel, DataSource, DataEntity
+from common.protocol import OnDemandRequest
+from common.date_range import DateRange
+from scraping.scraper import ScrapeConfig, ScraperId
+
+import json
+
+# Import zipcode mining components
+from common.resi_api_client import create_api_client
+
+# Enable logging to the miner TODO move it to some different location
+bt.logging.set_info(True)
+bt.logging.set_debug(True)
+
+
+class Miner:
+    """The Glorious Miner."""
+
+    def __init__(self, config=None):
+        self.config = copy.deepcopy(config or create_config(NeuronType.MINER))
+        check_config(self.config)
+
+        bt.logging(config=self.config, logging_dir=self.config.full_path)
+        bt.logging.info(self.config)
+        # Handle uploader configuration (fix for store_true + default=True conflict)
+        if hasattr(self.config, 'no_use_uploader') and self.config.no_use_uploader:
+            self.use_uploader = False
+            bt.logging.info("S3 uploading disabled by --no_use_uploader flag")
+        else:
+            self.use_uploader = True  # Default to enabled
+            bt.logging.info("S3 uploading enabled")
+            
+        self.use_gravity_retrieval = self.config.gravity
+        
+        # Auto-configure S3 auth URL based on subnet
+        if self.config.netuid == 428:  # Testnet
+            if self.config.s3_auth_url == "https://api.resilabs.ai":  # Default mainnet URL
+                self.config.s3_auth_url = "https://api-staging.resilabs.ai"
+                bt.logging.info(f"Auto-configured testnet S3 auth URL: {self.config.s3_auth_url}")
+        else:  # Mainnet or other subnets
+            if not hasattr(self.config, 's3_auth_url') or not self.config.s3_auth_url:
+                self.config.s3_auth_url = "https://api.resilabs.ai"
+                bt.logging.info(f"Auto-configured mainnet S3 auth URL: {self.config.s3_auth_url}")
+
+        if self.config.offline:
+            bt.logging.success(
+                "Running in offline mode. Skipping bittensor object setup and axon creation."
+            )
+
+            self.uid = 0  # Offline mode so assume it's == 0
+        else:
+            # The wallet holds the cryptographic key pairs for the miner.
+            self.wallet = bt.wallet(config=self.config)
+            bt.logging.info(f"Wallet: {self.wallet}.")
+
+            # The subtensor is our connection to the Bittensor blockchain.
+            self.subtensor = bt.subtensor(config=self.config)
+            bt.logging.info(f"Subtensor: {self.subtensor}.")
+
+            # The metagraph holds the state of the network, letting us know about other validators and miners.
+            self.metagraph = self.subtensor.metagraph(self.config.netuid)
+            bt.logging.info(f"Metagraph: {self.metagraph}.")
+
+            # Each miner gets a unique identity (UID) in the network for differentiation.
+            if self.wallet.hotkey.ss58_address in self.metagraph.hotkeys:
+                self.uid = self.metagraph.hotkeys.index(self.wallet.hotkey.ss58_address)
+                bt.logging.info(
+                    f"Running neuron on subnet: {self.config.netuid} with uid {self.uid} using network: {self.subtensor.chain_endpoint}."
+                )
+            else:
+                self.uid = 0
+                bt.logging.warning(
+                    f"Hotkey {self.wallet.hotkey.ss58_address} not found in metagraph. Assuming this is a test."
+                )
+
+            self.last_sync_timestamp = dt.datetime.min
+            self.step = 0
+
+            # The axon handles request processing, allowing validators to send this miner requests.
+            self.axon = bt.axon(wallet=self.wallet, port=self.config.axon.port)
+
+            # Attach determiners which functions are called when servicing a request.
+            bt.logging.info("Attaching forward function to miner axon.")
+            self.axon.attach(
+                forward_fn=self.get_index,
+                blacklist_fn=self.get_index_blacklist,
+                priority_fn=self.get_index_priority,
+            ).attach(
+                forward_fn=self.get_data_entity_bucket,
+                blacklist_fn=self.get_data_entity_bucket_blacklist,
+                priority_fn=self.get_data_entity_bucket_priority,
+            ).attach(
+                forward_fn=self.get_contents_by_buckets,
+                blacklist_fn=self.get_contents_by_buckets_blacklist,
+                priority_fn=self.get_contents_by_buckets_priority,
+            ).attach(
+                forward_fn=self.handle_on_demand,
+                blacklist_fn=self.handle_on_demand_blacklist,
+                priority_fn=self.handle_on_demand_priority
+            )
+
+            bt.logging.success(f"Axon created: {self.axon}.")
+
+        # Instantiate runners.
+        self.should_exit: bool = False
+        self.is_running: bool = False
+        self.thread: threading.Thread = None
+        self.compressed_index_refresh_thread: threading.Thread = None
+        self.lookup_thread: threading.Thread = None
+        self.s3_partitioned_thread: threading.Thread = None
+
+        self.lock = threading.RLock()
+        self.vpermit_rao_limit = self.config.vpermit_rao_limit
+
+        if self.use_uploader and not self.config.offline:
+            bt.logging.info(f"Initializing S3 uploader with auth URL: {self.config.s3_auth_url}")
+            self.s3_partitioned_uploader = S3PartitionedUploader(
+                db_path=self.config.neuron.database_name,
+                subtensor=self.subtensor,
+                wallet=self.wallet,
+                s3_auth_url=self.config.s3_auth_url,
+                state_file=self.config.miner_upload_state_file,
+            )
+            bt.logging.success("S3 uploader initialized successfully")
+        else:
+            bt.logging.warning(f"S3 uploader not initialized - use_uploader: {self.use_uploader}, offline: {self.config.offline}")
+
+        # Instantiate storage.
+        self.storage = SqliteMinerStorage(
+            self.config.neuron.database_name,
+            self.config.neuron.max_database_size_gb_hint,
+        )
+
+        bt.logging.success(
+            f"Successfully connected to miner storage: {self.config.neuron.database_name}."
+        )
+
+        # Configure the ScraperCoordinator
+        bt.logging.info(
+            f"Loading scraping config from {self.config.neuron.scraping_config_file}."
+        )
+        scraping_config = ConfigReader.load_config(
+            self.config.neuron.scraping_config_file
+        )
+        bt.logging.success(f"Loaded scraping config: {scraping_config}.")
+
+        self.scraping_coordinator = ScraperCoordinator(
+            scraper_provider=MinerScraperProvider(),
+            miner_storage=self.storage,
+            config=scraping_config,
+        )
+
+        # Configure per hotkey per request limits.
+        self.request_lock = threading.RLock()
+        self.last_cleared_request_limits = dt.datetime.now()
+        self.requests_by_type_by_hotkey = defaultdict(lambda: defaultdict(lambda: 0))
+        
+        # Initialize zipcode mining components (enabled by default)
+        self.zipcode_mining_enabled = not getattr(self.config, 'disable_zipcode_mining', False)
+        self.api_client = None
+        self.current_epoch_data = None
+        self.zipcode_mining_thread = None
+        
+        if self.zipcode_mining_enabled and not self.config.offline:
+            try:
+                self.api_client = create_api_client(self.config, self.wallet)
+                bt.logging.success("ResiLabs API client initialized for zipcode mining")
+                
+                # Test API connectivity
+                health = self.api_client.check_health()
+                if health.get('status') == 'ok':
+                    bt.logging.success(f"API server connected: {health.get('service', 'Unknown')}")
+                else:
+                    bt.logging.warning("API server health check failed, but continuing...")
+                    
+            except Exception as e:
+                bt.logging.error(f"Failed to initialize API client: {e}")
+                bt.logging.warning("Continuing without zipcode mining functionality")
+                self.zipcode_mining_enabled = False
+        elif self.zipcode_mining_enabled:
+            bt.logging.warning("Zipcode mining enabled but running in offline mode - disabling")
+            self.zipcode_mining_enabled = False
+
+    def refresh_index(self):
+        """
+        Refreshes the cached compressed miner index periodically off the hot path of GetMinerIndex requests.
+        """
+        while not self.should_exit:
+            try:
+                # Refresh the index if it hasn't been refreshed in the configured time period.
+                self.storage.refresh_compressed_index(
+                    time_delta=constants.MINER_CACHE_FRESHNESS
+                )
+                bt.logging.trace("Refresh index thread finished refreshing the index.")
+                # Wait freshness period + 1 minute to try refreshing again.
+                # Wait the additional minute to ensure that the next refresh sees a 'stale' index.
+                time.sleep(
+                    (
+                        constants.MINER_CACHE_FRESHNESS + dt.timedelta(minutes=1)
+                    ).total_seconds()
+                )
+            # In case of unforeseen errors, the refresh thread will log the error and continue operations.
+            except Exception:
+                bt.logging.error(traceback.format_exc())
+                # Sleep 5 minutes to avoid constant refresh attempts if they are consistently erroring.
+                time.sleep(60 * 5)
+
+    def get_updated_lookup(self):
+        if not self.use_gravity_retrieval:
+            bt.logging.info("Gravity lookup retrieval is not enabled.")
+            return
+
+        last_update = None
+        while not self.should_exit:
+            try:
+                current_datetime = dt.datetime.utcnow()
+
+                bt.logging.info(f"Checking for update. Last update: {last_update}, Current time: {current_datetime}")
+
+                # Check if it's a new day and we haven't updated yet
+                if last_update is None or current_datetime.date() > last_update.date():
+                    bt.logging.info("Retrieving the latest dynamic lookup...")
+                    sync_run_retrieval(self.config)
+                    bt.logging.info(f"New desirable data list has been written to total.json")
+                    last_update = current_datetime
+                    bt.logging.info(f"Updated dynamic lookup at {last_update}")
+                else:
+                    bt.logging.info("No update needed at this time.")
+
+                # Sleep for 5 minutes before checking again
+                bt.logging.info("Sleeping for 5 minutes...")
+                time.sleep(300)
+
+            except Exception as e:
+                bt.logging.error(f"Error in get_updated_lookup: {str(e)}")
+                bt.logging.exception("Exception details:")
+                time.sleep(300)  # Wait 5 minutes before trying again
+
+    def upload_s3_partitioned(self):
+        """Upload DD data to S3 in partitioned format"""
+        # Wait time before starting first upload (shorter for testnet)
+        if self.config.netuid == 428:  # Testnet
+            initial_wait = dt.timedelta(minutes=5).total_seconds()
+            bt.logging.info("Testnet: Waiting 5 minutes before first S3 upload")
+        else:  # Mainnet
+            initial_wait = dt.timedelta(minutes=30).total_seconds()
+            bt.logging.info("Mainnet: Waiting 30 minutes before first S3 upload")
+        
+        time.sleep(initial_wait)
+
+        while not self.should_exit:
+            try:
+                bt.logging.info("Starting S3 partitioned upload for DD data")
+                success = self.s3_partitioned_uploader.upload_dd_data()
+                if success:
+                    bt.logging.success("S3 partitioned upload completed successfully")
+                else:
+                    bt.logging.warning("S3 partitioned upload completed with some failures")
+            except Exception:
+                bt.logging.error(traceback.format_exc())
+
+            # Upload frequency based on network
+            if self.config.netuid == 428:  # Testnet
+                # Upload every 5 minutes for testnet (fast testing with increased rate limits)
+                time_sleep_val = dt.timedelta(minutes=5).total_seconds()
+                bt.logging.info("Using testnet upload frequency: 5 minutes")
+            else:  # Mainnet
+                # Upload every 2 hours for mainnet
+                time_sleep_val = dt.timedelta(hours=2).total_seconds()
+                bt.logging.info("Using mainnet upload frequency: 2 hours")
+            time.sleep(time_sleep_val)
+
+    def run_zipcode_mining_cycle(self):
+        """
+        Main zipcode mining cycle - runs continuously to check for new epochs
+        """
+        if not self.zipcode_mining_enabled or not self.api_client:
+            bt.logging.warning("Zipcode mining not enabled or API client not available")
+            return
+        
+        bt.logging.info("Starting zipcode mining cycle...")
+        
+        while not self.should_exit:
+            try:
+                # Check for current epoch assignments
+                current_epoch = self.api_client.get_current_epoch_info()
+                
+                if not current_epoch:
+                    bt.logging.info("No current epoch available, waiting...")
+                    time.sleep(60)  # Wait 1 minute before checking again
+                    continue
+                
+                epoch_id = current_epoch.get('id')
+                
+                # Check if this is a new epoch we haven't processed
+                if (not self.current_epoch_data or 
+                    self.current_epoch_data.get('epochId') != epoch_id):
+                    
+                    bt.logging.info(f"New epoch detected: {epoch_id}")
+                    
+                    # Get zipcode assignments for this epoch
+                    assignments = self.api_client.get_current_zipcode_assignments()
+                    
+                    if assignments.get('success'):
+                        self.current_epoch_data = assignments
+                        bt.logging.success(f"Received {len(assignments.get('zipcodes', []))} zipcode assignments")
+                        
+                        # Start mining for assigned zipcodes
+                        self.execute_zipcode_mining(assignments)
+                    else:
+                        bt.logging.error("Failed to get zipcode assignments")
+                
+                # Wait before checking for next epoch
+                time.sleep(300)  # Check every 5 minutes
+                
+            except Exception as e:
+                bt.logging.error(f"Error in zipcode mining cycle: {e}")
+                time.sleep(300)  # Wait 5 minutes on error
+    
+    def execute_zipcode_mining(self, epoch_assignments: dict):
+        """
+        Execute mining for assigned zipcodes in current epoch
+        
+        Args:
+            epoch_assignments: Epoch assignment data from API
+        """
+        epoch_id = epoch_assignments['epochId']
+        nonce = epoch_assignments['nonce']
+        zipcodes = epoch_assignments.get('zipcodes', [])
+        deadline = epoch_assignments.get('submissionDeadline')
+        
+        bt.logging.info(f"Starting mining for epoch {epoch_id} with {len(zipcodes)} zipcodes")
+        bt.logging.info(f"Submission deadline: {deadline}")
+        
+        # Update status to IN_PROGRESS
+        try:
+            self.api_client.update_miner_status(
+                epoch_id=epoch_id,
+                nonce=nonce,
+                status="IN_PROGRESS",
+                listings_scraped=0
+            )
+        except Exception as e:
+            bt.logging.warning(f"Failed to update initial status: {e}")
+        
+        # Mine each assigned zipcode
+        completed_zipcodes = []
+        total_listings = 0
+        
+        for zipcode_info in zipcodes:
+            zipcode = zipcode_info['zipcode']
+            expected_listings = zipcode_info['expectedListings']
+            
+            bt.logging.info(f"Mining zipcode {zipcode} (target: {expected_listings} listings)")
+            
+            try:
+                # Execute scraping for this specific zipcode
+                listings_data = self.scrape_zipcode_data(zipcode, expected_listings)
+                
+                if listings_data:
+                    # Store data locally
+                    self.store_zipcode_data(zipcode, listings_data, epoch_id)
+                    
+                    completed_zipcodes.append({
+                        'zipcode': zipcode,
+                        'listingsScraped': len(listings_data),
+                        'completedAt': dt.datetime.utcnow().isoformat() + 'Z'
+                    })
+                    
+                    total_listings += len(listings_data)
+                    
+                    bt.logging.success(f"Completed zipcode {zipcode}: {len(listings_data)} listings")
+                else:
+                    bt.logging.warning(f"No data found for zipcode {zipcode}")
+                
+                # Update progress periodically
+                if len(completed_zipcodes) % 5 == 0:
+                    try:
+                        self.api_client.update_miner_status(
+                            epoch_id=epoch_id,
+                            nonce=nonce,
+                            status="IN_PROGRESS",
+                            listings_scraped=total_listings,
+                            zipcodes_completed=completed_zipcodes
+                        )
+                    except Exception as e:
+                        bt.logging.warning(f"Failed to update progress: {e}")
+                        
+            except Exception as e:
+                bt.logging.error(f"Failed to mine zipcode {zipcode}: {e}")
+                continue
+        
+        # Upload all data to S3
+        bt.logging.info("Uploading epoch data to S3...")
+        s3_success = self.upload_epoch_data_to_s3(epoch_id, completed_zipcodes)
+        
+        # Final status update
+        final_status = "COMPLETED" if s3_success else "FAILED"
+        
+        try:
+            self.api_client.update_miner_status(
+                epoch_id=epoch_id,
+                nonce=nonce,
+                status=final_status,
+                listings_scraped=total_listings,
+                zipcodes_completed=completed_zipcodes,
+                s3_upload_complete=s3_success,
+                s3_upload_timestamp=dt.datetime.utcnow().isoformat() + 'Z' if s3_success else None
+            )
+            
+            bt.logging.success(f"Epoch {epoch_id} mining completed: {final_status}")
+            
+        except Exception as e:
+            bt.logging.error(f"Failed to update final status: {e}")
+    
+    def scrape_zipcode_data(self, zipcode: str, expected_listings: int) -> list:
+        """
+        Scrape real estate data for a specific zipcode
+        
+        This integrates with the existing scraping system to target specific zipcodes
+        
+        Args:
+            zipcode: Target zipcode to scrape
+            expected_listings: Expected number of listings
+            
+        Returns:
+            List of scraped listing data
+        """
+        
+        bt.logging.info(f"Scraping data for zipcode {zipcode} (target: {expected_listings})")
+        
+        try:
+            # Get configured zipcode scraper
+            scraper = self.get_zipcode_scraper()
+            
+            if not scraper:
+                bt.logging.error("No zipcode scraper configured")
+                return []
+            
+            # Log scraper info
+            scraper_info = scraper.get_scraper_info()
+            bt.logging.info(f"Using scraper: {scraper_info['name']} v{scraper_info['version']} ({scraper_info['source']})")
+            
+            # Scrape the zipcode
+            listings = scraper.scrape_zipcode(
+                zipcode=zipcode,
+                target_count=expected_listings,
+                timeout=300  # 5 minute timeout
+            )
+            
+            bt.logging.success(f"Scraped {len(listings)} listings for zipcode {zipcode}")
+            return listings
+            
+        except Exception as e:
+            bt.logging.error(f"Error scraping zipcode {zipcode}: {e}")
+            return []
+    
+    def get_zipcode_scraper(self):
+        """
+        Get the configured zipcode scraper instance
+        
+        Miners can override this method to use their own custom scrapers.
+        By default, uses RapidAPI Zillow scraper (functional but expensive).
+        
+        Returns:
+            ZipcodeScraperInterface implementation
+        """
+        try:
+            # Import scraper classes
+            from scraping.zillow_rapidapi_zipcode_scraper import create_rapidapi_zillow_scraper
+            from scraping.zipcode_mock_scraper import create_mock_scraper
+            from scraping.zipcode_scraper_interface import ZipcodeScraperConfig
+            import os
+            
+            # Check if custom scraper is configured
+            custom_scraper_class = getattr(self.config, 'custom_zipcode_scraper', None)
+            
+            if custom_scraper_class:
+                bt.logging.info("Using custom zipcode scraper")
+                return custom_scraper_class()
+            
+            # Try to use RapidAPI Zillow scraper if API key is available
+            rapidapi_key = getattr(self.config, 'rapidapi_zillow_key', None) or os.getenv('RAPIDAPI_ZILLOW_KEY')
+            
+            if rapidapi_key:
+                bt.logging.info("Using RapidAPI Zillow scraper (WARNING: This incurs API costs)")
+                bt.logging.warning("RapidAPI costs: ~$0.015 per call, $0.50-2.00 per epoch")
+                bt.logging.warning("For cost efficiency, replace with custom scraper implementation")
+                
+                # Configure RapidAPI scraper with conservative settings
+                config = ZipcodeScraperConfig(
+                    max_requests_per_minute=20,  # Stay within rate limits
+                    request_delay_seconds=3.0,   # Conservative delay
+                    max_retries=2
+                )
+                
+                return create_rapidapi_zillow_scraper(rapidapi_key, config, "RecentlySold")
+            else:
+                # Fallback to mock scraper with warning
+                bt.logging.warning("No RapidAPI key found (set RAPIDAPI_ZILLOW_KEY env var)")
+                bt.logging.warning("Using mock scraper - replace with real implementation for production")
+                bt.logging.info("To use RapidAPI: export RAPIDAPI_ZILLOW_KEY=your_key")
+                bt.logging.info("To use custom scraper: implement ZipcodeScraperInterface")
+                
+                # Configure mock scraper
+                config = ZipcodeScraperConfig(
+                    max_requests_per_minute=30,
+                    request_delay_seconds=1.0,
+                    max_retries=3
+                )
+                
+                return create_mock_scraper(config)
+                
+        except Exception as e:
+            bt.logging.error(f"Failed to create zipcode scraper: {e}")
+            return None
+    
+    def store_zipcode_data(self, zipcode: str, listings_data: list, epoch_id: str):
+        """
+        Store zipcode data locally with epoch metadata
+        
+        Args:
+            zipcode: Zipcode for the data
+            listings_data: Scraped listing data
+            epoch_id: Current epoch ID
+        """
+        try:
+            bt.logging.info(f"Storing {len(listings_data)} listings for zipcode {zipcode}")
+            
+            # Add epoch metadata to each listing
+            for listing in listings_data:
+                listing['epoch_id'] = epoch_id
+                listing['zipcode'] = zipcode
+                listing['scraped_for_epoch'] = True
+                listing['submission_timestamp'] = dt.datetime.now(dt.timezone.utc).isoformat()
+            
+            # Store in existing storage system using new epoch methods
+            success = self.storage.store_epoch_zipcode_data(
+                epoch_id=epoch_id,
+                zipcode=zipcode,
+                listings_data=listings_data,
+                miner_hotkey=self.wallet.hotkey.ss58_address
+            )
+            
+            if success:
+                bt.logging.success(f"Stored data for zipcode {zipcode} in epoch {epoch_id}")
+            else:
+                bt.logging.error(f"Failed to store data for zipcode {zipcode}")
+            
+        except Exception as e:
+            bt.logging.error(f"Failed to store zipcode data: {e}")
+    
+    def upload_epoch_data_to_s3(self, epoch_id: str, completed_zipcodes: list) -> bool:
+        """
+        Upload epoch mining data to S3 using API credentials
+        
+        Args:
+            epoch_id: Current epoch ID
+            completed_zipcodes: List of completed zipcode data
+            
+        Returns:
+            True if upload successful
+        """
+        if not self.api_client:
+            bt.logging.warning("API client not available for S3 upload")
+            return False
+        
+        try:
+            bt.logging.info(f"Uploading epoch {epoch_id} data to S3...")
+            
+            # Get S3 credentials from ResiLabs API
+            s3_creds = self.api_client.get_s3_upload_credentials()
+            
+            if not s3_creds.get('url'):
+                bt.logging.error("Failed to get S3 upload credentials from API")
+                return False
+            
+            # Get epoch data from storage
+            epoch_data = self.storage.get_epoch_data(epoch_id)
+            
+            if not epoch_data:
+                bt.logging.warning(f"No epoch data found for {epoch_id}")
+                return True  # Not an error if no data to upload
+            
+            # Upload data for each zipcode
+            upload_success = True
+            miner_hotkey = self.wallet.hotkey.ss58_address
+            
+            for zipcode, listings_data in epoch_data.items():
+                try:
+                    # Create epoch-specific data structure
+                    zipcode_upload_data = {
+                        'epoch_id': epoch_id,
+                        'zipcode': zipcode,
+                        'miner_hotkey': miner_hotkey,
+                        'submission_timestamp': dt.datetime.now(dt.timezone.utc).isoformat(),
+                        'listing_count': len(listings_data),
+                        'listings': listings_data
+                    }
+                    
+                    # Upload this zipcode's data
+                    zipcode_success = self._upload_zipcode_data_to_s3(
+                        zipcode_upload_data, s3_creds, epoch_id, zipcode
+                    )
+                    
+                    if zipcode_success:
+                        # Mark as uploaded in storage
+                        self.storage.mark_epoch_data_uploaded(epoch_id, zipcode, miner_hotkey)
+                        bt.logging.success(f"Uploaded data for zipcode {zipcode}")
+                    else:
+                        bt.logging.error(f"Failed to upload data for zipcode {zipcode}")
+                        upload_success = False
+                        
+                except Exception as zipcode_error:
+                    bt.logging.error(f"Error uploading zipcode {zipcode}: {zipcode_error}")
+                    upload_success = False
+            
+            if upload_success:
+                bt.logging.success(f"Successfully uploaded all epoch {epoch_id} data to S3")
+            else:
+                bt.logging.error(f"Some uploads failed for epoch {epoch_id}")
+            
+            return upload_success
+            
+        except Exception as e:
+            bt.logging.error(f"Failed to upload epoch data to S3: {e}")
+            return False
+    
+    def _upload_zipcode_data_to_s3(self, zipcode_data: dict, s3_creds: dict, 
+                                  epoch_id: str, zipcode: str) -> bool:
+        """
+        Upload individual zipcode data to S3
+        
+        Args:
+            zipcode_data: Formatted zipcode data
+            s3_creds: S3 credentials from API
+            epoch_id: Epoch ID
+            zipcode: Zipcode
+            
+        Returns:
+            True if upload successful
+        """
+        try:
+            import json
+            import tempfile
+            import pandas as pd
+            
+            # Create temporary file for upload
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as temp_file:
+                json.dump(zipcode_data, temp_file, default=str, indent=2)
+                temp_file_path = temp_file.name
+            
+            try:
+                # Create S3 path following the expected structure
+                # Path: data/hotkey={miner_hotkey}/epoch={epoch_id}/zipcode={zipcode}/data.json
+                timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+                s3_path = f"data/hotkey={zipcode_data['miner_hotkey']}/epoch={epoch_id}/zipcode={zipcode}/data_{timestamp}.json"
+                
+                # Use the S3Auth utility for upload
+                from upload_utils.s3_utils import S3Auth
+                s3_auth = S3Auth(self.config.s3_auth_url)  # Use existing auth URL
+                
+                # Upload using the credentials from ResiLabs API
+                upload_success = s3_auth.upload_file_with_path(
+                    temp_file_path, s3_path, s3_creds
+                )
+                
+                return upload_success
+                
+            finally:
+                # Clean up temporary file
+                if os.path.exists(temp_file_path):
+                    os.remove(temp_file_path)
+                    
+        except Exception as e:
+            bt.logging.error(f"Error in zipcode S3 upload: {e}")
+            return False
+
+    def run(self):
+        """
+        Initiates and manages the main loop for the miner.
+        """
+
+        if self.config.offline:
+            bt.logging.success("Running in offline mode. Skipping axon serving.")
+        else:
+            # Check that miner is registered on the network.
+            self.sync()
+
+            # Serve passes the axon information to the network + netuid we are hosting on.
+            # This will auto-update if the axon port of external ip have changed.
+            bt.logging.info(
+                f"Serving miner axon {self.axon} on network: {self.config.subtensor.chain_endpoint} with netuid: {self.config.netuid}."
+            )
+            self.axon.serve(netuid=self.config.netuid, subtensor=self.subtensor)
+
+            # Start  starts the miner's axon, making it active on the network.
+            self.axon.start()
+
+            self.last_sync_timestamp = dt.datetime.now()
+            bt.logging.success(f"Miner starting at {self.last_sync_timestamp}.")
+
+        self.scraping_coordinator.run_in_background_thread()
+
+        while not self.should_exit:
+            # This loop maintains the miner's operations until intentionally stopped.
+            try:
+                # In offline mode we just idle while the scraping_coordinator runs.
+                if self.config.offline:
+                    while not self.should_exit:
+                        time.sleep(12)
+                else:
+                    # Epoch length defaults to 100 blocks at 12 seconds each for 20 minutes.
+                    while dt.datetime.now() - self.last_sync_timestamp < (
+                        dt.timedelta(seconds=12 * self.config.neuron.epoch_length)
+                    ):
+                        # Wait before checking again.
+                        time.sleep(12)
+
+                        # Check if we should exit.
+                        if self.should_exit:
+                            break
+
+                    # Sync metagraph.
+                    self.sync()
+
+                    self._log_status(self.step)
+
+                    self.last_sync_timestamp = dt.datetime.now()
+                    self.step += 1
+
+            # If someone intentionally stops the miner, it'll safely terminate operations.
+            except KeyboardInterrupt:
+                if not self.config.offline:
+                    self.axon.stop()
+                self.scraping_coordinator.stop()
+                bt.logging.success("Miner killed by keyboard interrupt.")
+                sys.exit()
+
+            # In case of unforeseen errors, the miner will log the error and continue operations.
+            except Exception as e:
+                bt.logging.error(traceback.format_exc())
+
+    def run_in_background_thread(self):
+        """
+        Starts the miner's operations in a separate background thread.
+        This is useful for non-blocking operations.
+        """
+        if not self.is_running:
+            bt.logging.debug("Starting miner in background thread.")
+            self.should_exit = False
+            self.thread = threading.Thread(target=self.run, daemon=True)
+            self.thread.start()
+            self.compressed_index_refresh_thread = threading.Thread(
+                target=self.refresh_index, daemon=True
+            )
+            self.compressed_index_refresh_thread.start()
+            self.lookup_thread = threading.Thread(
+                target=self.get_updated_lookup, daemon=True
+            )
+            self.lookup_thread.start()
+
+            if self.use_uploader and hasattr(self, 's3_partitioned_uploader'):
+                bt.logging.info("Starting S3 upload thread...")
+                self.s3_partitioned_thread = threading.Thread(
+                    target=self.upload_s3_partitioned, daemon=True
+                )
+                self.s3_partitioned_thread.start()
+                bt.logging.success("S3 upload thread started successfully")
+            
+            # Start zipcode mining thread if enabled
+            if self.zipcode_mining_enabled and self.api_client:
+                bt.logging.info("Starting zipcode mining thread...")
+                self.zipcode_mining_thread = threading.Thread(
+                    target=self.run_zipcode_mining_cycle, daemon=True
+                )
+                self.zipcode_mining_thread.start()
+                bt.logging.success("Zipcode mining thread started successfully")
+            else:
+                bt.logging.warning("S3 upload thread not started - uploader not available")
+
+            self.is_running = True
+            bt.logging.debug("Started")
+
+    def stop_run_thread(self):
+        """
+        Stops the miner's operations that are running in the background thread.
+        """
+        if self.is_running:
+            bt.logging.debug("Stopping miner in background thread.")
+            self.should_exit = True
+            self.thread.join(5)
+            self.compressed_index_refresh_thread.join(5)
+            self.s3_partitioned_thread.join(5)
+            self.lookup_thread.join(5)
+            self.is_running = False
+            bt.logging.debug("Stopped")
+
+    def __enter__(self):
+        """
+        Starts the miner's operations in a background thread upon entering the context.
+        This method facilitates the use of the miner in a 'with' statement.
+        """
+        self.run_in_background_thread()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        """
+        Stops the miner's background operations upon exiting the context.
+        This method facilitates the use of the miner in a 'with' statement.
+
+        Args:
+            exc_type: The type of the exception that caused the context to be exited.
+                      None if the context was exited without an exception.
+            exc_value: The instance of the exception that caused the context to be exited.
+                       None if the context was exited without an exception.
+            traceback: A traceback object encoding the stack trace.
+                       None if the context was exited without an exception.
+        """
+        self.stop_run_thread()
+
+    def resync_metagraph(self):
+        """Resyncs the metagraph and updates the hotkeys and moving averages based on the new metagraph."""
+        bt.logging.info("Attempting to resync the metagraph.")
+
+        # Sync the metagraph.
+        new_metagraph = self.subtensor.metagraph(netuid=self.config.netuid)
+        with self.lock:
+            self.metagraph = new_metagraph
+
+        bt.logging.success("Successfuly resynced the metagraph.")
+
+    def _log_status(self, step: int):
+        """Logs a summary of the miner status in the subnet."""
+        relative_incentive = self.metagraph.I[self.uid].item() / max(self.metagraph.I)
+        incentive_and_hk = zip(self.metagraph.I, self.metagraph.hotkeys)
+        incentive_and_hk = sorted(incentive_and_hk, key=lambda x: x[0], reverse=True)
+        position = -1
+        for i, (_, hk) in enumerate(incentive_and_hk):
+            if hk == self.wallet.hotkey.ss58_address:
+                position = i
+                break
+        log = (
+            f"Step:{step} | "
+            f"Block:{self.metagraph.block.item()} | "
+            f"Stake:{self.metagraph.S[self.uid]} | "
+            f"Incentive:{self.metagraph.I[self.uid]} | "
+            f"Relative Incentive:{relative_incentive} | "
+            f"Position:{position} | "
+            f"Emission:{self.metagraph.E[self.uid]}"
+        )
+        bt.logging.info(log)
+
+    async def get_index(self, synapse: GetMinerIndex) -> GetMinerIndex:
+        """Runs after the GetMinerIndex synapse has been deserialized (i.e. after synapse.data is available)."""
+        bt.logging.info(
+            f"Got to a GetMinerIndex request from {synapse.dendrite.hotkey}."
+        )
+
+        # Only synapse.version 4 is supported at this time.
+        if synapse.version < 4:
+            bt.logging.error(f"Unsupported protocol version: {synapse.version}.")
+            return synapse
+
+        # Return the appropriate amount of max buckets based on protocol of the requesting validator.
+        compressed_index = self.storage.get_compressed_index(
+            bucket_count_limit=constants.DATA_ENTITY_BUCKET_COUNT_LIMIT_PER_MINER_INDEX_PROTOCOL_4
+        )
+        synapse.compressed_index_serialized = compressed_index.model_dump_json()
+        bt.logging.success(
+            f"Returning compressed miner index of {CompressedMinerIndex.size_bytes(compressed_index)} bytes "
+            + f"across {CompressedMinerIndex.bucket_count(compressed_index)} buckets to {synapse.dendrite.hotkey}."
+        )
+
+        synapse.version = constants.PROTOCOL_VERSION
+
+        return synapse
+
+    async def get_index_blacklist(
+        self, synapse: GetMinerIndex
+    ) -> typing.Tuple[bool, str]:
+        return self.default_blacklist(synapse)
+
+    async def get_index_priority(self, synapse: GetMinerIndex) -> float:
+        return self.default_priority(synapse)
+
+    async def get_data_entity_bucket(
+        self, synapse: GetDataEntityBucket
+    ) -> GetDataEntityBucket:
+        """Runs after the GetDataEntityBucket synapse has been deserialized (i.e. after synapse.data is available)."""
+        bt.logging.info(
+            f"Got to a GetDataEntityBucket request from {synapse.dendrite.hotkey} for Bucket ID: {str(synapse.data_entity_bucket_id)}."
+        )
+
+        # List all the data entities that this miner has for the requested DataEntityBucket.
+        synapse.data_entities = self.storage.list_data_entities_in_data_entity_bucket(
+            synapse.data_entity_bucket_id
+        )
+        synapse.version = constants.PROTOCOL_VERSION
+
+        bt.logging.success(
+            f"Returning Bucket ID: {str(synapse.data_entity_bucket_id)} with {len(synapse.data_entities)} entities to {synapse.dendrite.hotkey}."
+        )
+
+        return synapse
+
+    async def get_data_entity_bucket_blacklist(
+        self, synapse: GetDataEntityBucket
+    ) -> typing.Tuple[bool, str]:
+        return self.default_blacklist(synapse)
+
+    async def get_data_entity_bucket_priority(
+        self, synapse: GetDataEntityBucket
+    ) -> float:
+        return self.default_priority(synapse)
+
+    async def handle_on_demand(self, synapse: OnDemandRequest) -> OnDemandRequest:
+        """
+        Handle on-demand data requests from validators.
+        Unsupported requests return empty results.
+        """
+        bt.logging.info(f"Got on-demand request from {synapse.dendrite.hotkey} for source: {synapse.source}")
+
+        # For unsupported sources, return empty results
+        if synapse.source in [DataSource.X, DataSource.REDDIT, DataSource.YOUTUBE]:
+            bt.logging.info(f"Data source not supported - returning empty results")
+            synapse.data = []
+            synapse.version = constants.PROTOCOL_VERSION
+            return synapse
+
+        # For other data sources
+        bt.logging.warning(f"Data source not supported - returning empty results")
+        synapse.data = []
+        synapse.version = constants.PROTOCOL_VERSION
+        return synapse
+
+    async def handle_on_demand_blacklist(
+            self, synapse: OnDemandRequest
+    ) -> typing.Tuple[bool, str]:
+        """Blacklist function for on-demand requests"""
+        return self.default_blacklist(synapse)
+
+    async def handle_on_demand_priority(
+            self, synapse: OnDemandRequest
+    ) -> float:
+        """Priority function for on-demand requests"""
+        return self.default_priority(synapse)
+
+    async def get_contents_by_buckets(
+        self, synapse: GetContentsByBuckets
+    ) -> GetContentsByBuckets:
+        """Used to bulk expose raw contents for all entities within the requested buckets to validators for user queries."""
+        bt.logging.info(
+            f"Got to a GetContentsByBuckets request from {synapse.dendrite.hotkey} for Bucket IDs: {str(synapse.data_entity_bucket_ids)}."
+        )
+
+        # Check that the maximum number of buckets to be requested at once is respected.
+        if len(synapse.data_entity_bucket_ids) > constants.BULK_BUCKETS_COUNT_LIMIT:
+            bt.logging.warning(
+                f"Rejecting GetContentsByBuckets request from {synapse.dendrite.hotkey} at {synapse.dendrite.ip} for requesting {len(synapse.data_entity_bucket_ids)} data entity buckets over limit of {constants.BULK_BUCKETS_COUNT_LIMIT}."
+            )
+            return synapse
+
+        # Get a dict of all the contents by DataEntityBucketId for the requested Buckets.
+        buckets_to_contents = self.storage.list_contents_in_data_entity_buckets(
+            synapse.data_entity_bucket_ids
+        )
+        synapse.bucket_ids_to_contents = [
+            (k, v) for k, v in buckets_to_contents.items()
+        ]
+        synapse.version = constants.PROTOCOL_VERSION
+
+        bt.logging.success(
+            f"Returning Bucket IDs: {str(synapse.data_entity_bucket_ids)} with {sum(len(contents) for (_,contents) in synapse.bucket_ids_to_contents)} entities to {synapse.dendrite.hotkey}."
+        )
+
+        return synapse
+
+    async def get_contents_by_buckets_blacklist(
+        self, synapse: GetContentsByBuckets
+    ) -> typing.Tuple[bool, str]:
+        return self.default_blacklist(synapse)
+
+    async def get_contents_by_buckets_priority(
+        self, synapse: GetContentsByBuckets
+    ) -> float:
+        return self.default_priority(synapse)
+
+    def default_blacklist(self, synapse: bt.Synapse) -> typing.Tuple[bool, str]:
+        """The default blacklist that only allows requests from validators."""
+        hotkey = synapse.dendrite.hotkey
+        ip = synapse.dendrite.ip
+        synapse_type = type(synapse)
+
+        if hotkey not in self.metagraph.hotkeys:
+            # Ignore requests from unrecognized entities.
+            return (
+                True,
+                f"Unrecognized hotkey {hotkey} at {ip}",
+            )
+
+        uid = self.metagraph.hotkeys.index(hotkey)
+        
+        if not utils.is_validator(uid, self.metagraph, self.vpermit_rao_limit):
+            return (
+                True,
+                f"Hotkey {hotkey} at {ip} is not a validator",
+            )
+
+        with self.request_lock:
+            # Check if we need to clear the request limit counters.
+            if (
+                dt.datetime.now() - self.last_cleared_request_limits
+            ) >= constants.MIN_EVALUATION_PERIOD:
+                bt.logging.trace(
+                    f"Clearing request limit counters by hotkey after an eval period: {constants.MIN_EVALUATION_PERIOD}."
+                )
+                for request_type in self.requests_by_type_by_hotkey:
+                    self.requests_by_type_by_hotkey[request_type] = defaultdict(
+                        lambda: 0
+                    )
+                self.last_cleared_request_limits = dt.datetime.now()
+
+            # Record request.
+            self.requests_by_type_by_hotkey[synapse_type][hotkey] += 1
+
+            # Safety check for unmapped request types although unrecognized request types are handled earlier.
+            if synapse_type not in REQUEST_LIMIT_BY_TYPE_PER_PERIOD:
+                return (
+                    True,
+                    f"Hotkey {hotkey} at {ip} sent request for unmapped type: {synapse_type.__name__}.",
+                )
+
+            # Allow 2x the limit per period to account for restarts.
+            if (
+                self.requests_by_type_by_hotkey[synapse_type][hotkey]
+                > 2 * REQUEST_LIMIT_BY_TYPE_PER_PERIOD[synapse_type]
+            ):
+                return (
+                    True,
+                    f"Hotkey {hotkey} at {ip} over eval period request limit for {synapse_type.__name__}.",
+                )
+
+        return False, ""
+
+    def default_priority(self, synapse: bt.Synapse) -> float:
+        """The default priority that prioritizes by validator stake."""
+        caller_uid = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
+        priority = float(self.metagraph.S[caller_uid])
+        bt.logging.trace(
+            f"Prioritizing {synapse.dendrite.hotkey} with value: {priority}.",
+        )
+        return priority
+
+    def get_config_for_test(self) -> bt.config:
+        return self.config
+
+    def sync(self):
+        """
+        Wrapper for synchronizing the state of the network for the given miner.
+        """
+        # Ensure miner hotkey is still registered on the network.
+        self.check_registered()
+
+        self.resync_metagraph()
+
+    def check_registered(self):
+        # --- Check for registration.
+        if not self.subtensor.is_hotkey_registered(
+            netuid=self.config.netuid,
+            hotkey_ss58=self.wallet.hotkey.ss58_address,
+        ):
+            bt.logging.error(
+                f"Wallet: {self.wallet} is not registered on netuid {self.config.netuid}."
+                f" Please register the hotkey using `btcli subnets register` before trying again."
+            )
+            sys.exit(1)
+
+
+if __name__ == "__main__":
+    with Miner() as miner:
+        while True:
+            time.sleep(60)

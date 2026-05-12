@@ -1,0 +1,100 @@
+[package]
+name = "basilica-validator"
+version = "0.1.0"
+edition = "2021"
+description = "Basilca Validator - Bittensor neuron for verification and scoring"
+license = "MIT"
+rust-version = "1.70"
+
+[lib]
+name = "basilica_validator"
+path = "src/lib.rs"
+
+[[bin]]
+name = "basilica-validator"
+path = "src/main.rs"
+
+[dependencies]
+# Workspace dependencies
+alloy-primitives = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tokio-stream = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+sqlx = { workspace = true }
+tonic = { workspace = true }
+tonic-health = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+clap-verbosity-flag = { workspace = true }
+axum = { workspace = true, features = ["macros"] }
+tower-http = { workspace = true, features = ["limit"] }
+
+# Additional dependencies for validator
+futures = { workspace = true }
+futures-util = { workspace = true, optional = true }
+async-trait = { workspace = true }
+toml = { workspace = true }
+url = { workspace = true }
+prost-types = { workspace = true }
+async-stream = { workspace = true }
+num_cpus = { workspace = true }
+lru = { workspace = true }
+eventsource-stream = { workspace = true }
+regex = { workspace = true }
+rust_decimal = { workspace = true }
+bigdecimal = { workspace = true }
+
+# Internal dependencies
+basilica-common = { path = "../basilica-common" }
+basilica-protocol = { path = "../basilica-protocol" }
+bittensor = { workspace = true }
+
+# Validator-specific dependencies
+# Bittensor integration (placeholder - adjust when available)
+# bittensor-rs = "0.1"
+
+# HTTP client for external communications
+reqwest = { workspace = true }
+kube = { version = "0.88", features = ["rustls-tls"] }
+k8s-openapi = { version = "0.21", features = ["v1_29"] }
+aws-config = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+aws-sdk-secretsmanager = { workspace = true }
+
+# Temporary file handling
+tempfile = { workspace = true }
+
+# Challenge implementation dependencies
+rand = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+fastrand = { workspace = true }
+
+# System information and process management
+sysinfo = { workspace = true }
+libc = { workspace = true }
+
+# SSH key management
+ssh-key = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+wiremock = { workspace = true }
+once_cell = { workspace = true }
+
+[features]
+default = ["client"]
+# Enable HTTP client for external services
+client = ["futures-util"]
+# Enable test utilities
+test-utils = []
+# Enable CLI support with clap derives
+cli = []

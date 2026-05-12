@@ -1,0 +1,1130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" href="static/favicon.ico" />
+    <title>OMEGA Leaderboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/vue@2.6.14/dist/vue.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@2.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+    <style>
+        /* Apply base font styles */
+        html, body {
+            font-family: Roboto, sans-serif;
+            line-height: 1.5;
+            height: 101%; /* Ensure the html and body elements take up the full height of the window */
+            margin: 0; /* Reset any default margin */
+            padding: 0; /* Reset any default padding */
+        }
+
+        body {
+            font-size: 16px;
+            line-height: 1.6;
+            font-weight: 400;
+            background-color: #0a1128;
+            background-image: 
+                linear-gradient(
+                    to bottom,
+                    rgba(255, 255, 255, 0) 0%, /* Fully transparent */
+                    rgba(255, 255, 255, 0) calc(100% - 700px), /* Transparent until 200px from the bottom */
+                    #0a1128 calc(100% - 200px),
+                    #0a1128 100% /* Transition to the background color over the last 200px */
+                ),
+                url(https://omegatron.ai/static/images/0423e77f5905b1f1bccb.png);
+            background-size: cover;
+            background-repeat: no-repeat;
+            background-position: center;
+            color: #ffffff; /* Light text color for better readability */
+        }
+        /*
+        body::before {
+            position: absolute;
+            content: "";
+            width: 100%;
+            height: 100%;
+            top: 0;
+            left: 0;
+            background-image: linear-gradient(to bottom, #0a1128 0%, rgba(10, 17, 40, 0.8078431373) 30%, rgba(10, 17, 40, 0.5607843137) 60%, rgba(10, 17, 40, 0.1450980392) 95%) !important;
+            z-index: 1;
+        }*/
+        .logo {
+            display: block; /* Use block to apply margin auto for centering */
+            width: 75px; /* Set the width of the logo container */
+            height: 75px; /* Set the height of the logo container */
+            margin: 0 auto; /* Center the logo horizontally */
+            margin-top: 2rem; /* Add space above the logo */
+        }
+
+        .logo svg {
+            width: 100%; /* Make the SVG fill the container */
+            height: 100%; /* Make the SVG fill the container */
+        }
+
+        h1 {
+            text-align: center;
+            font-size: 2.5rem;
+            margin-bottom: 3rem;
+            margin-top: 0;
+            text-shadow: 3px 3px 4px rgba(0, 0, 0, 0.75);
+        }
+
+        /* Table styles */
+        table {
+            width: 90%;
+            margin: 0 auto; /* Center table horizontally */
+            border-collapse: collapse;
+            text-indent: 0;
+            color: #ffffff; /* Ensure table text is light-colored */
+            border-radius: 10px; /* Rounded corners */
+            box-shadow: 4px 4px 8px 0 rgba(70, 70, 70, 0.3); /* Drop shadow */
+        }
+
+        /* not first child */
+        tr:not(:first-child) {
+            cursor: pointer;
+            transition: background-color 0.3s ease, box-shadow 0.3s ease;
+        }
+        
+        tr:not(:first-child):hover {
+            background-color: rgba(98, 30, 100, 0.4); /* More translucent background color */
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+        }
+
+        tr.graph-row:hover {
+            background-color: #1f2a48; /* Dark background for headers */
+        }
+
+        th.center {
+            text-align: center;
+        }
+
+        .width520 {
+            width: 520px;
+        }
+
+        .width20 {
+            width: 20px;
+        }
+
+        /* Style for table headers and cells to inherit the rounded corners */
+        th, td {
+            /*border: 1px solid #ddd;  Light gray border for cells */
+            padding: 8px; /* Padding for cell content */
+            text-align: left;
+            width: 10%;
+        }
+
+        th {
+            background-color: #272727; /* Dark background for headers */
+            color: #ffffff; /* Light text color for headers */
+            font-weight: bold; /* Bold font weight for better readability */
+        }
+
+        /* Style for the first and last cells in each row to inherit the rounded corners */
+        th:first-child {
+            border-top-left-radius: 10px; /* Top-left rounded corner */
+        }
+
+        th:last-child {
+            border-top-right-radius: 10px; /* Top-right rounded corner */
+        }
+
+        /* Style for the last row to inherit the rounded corners */
+        tr:last-child td:first-child {
+            border-bottom-left-radius: 10px; /* Bottom-left rounded corner */
+        }
+
+        tr:last-child td:last-child {
+            border-bottom-right-radius: 10px; /* Bottom-right rounded corner */
+        }
+
+        /* Body styles */
+        tbody tr:nth-child(odd) {
+            background-color: #162035; /* Dark background for odd rows */
+        }
+
+        tbody tr:nth-child(even) {
+            background-color: #1f2a48; /* Slightly different dark background for even rows */
+        }
+
+        /* Footer styles */
+        tfoot {
+            font-weight: bold;
+            background-color: #1f2a48; /* Consistent background for footer */
+        }
+
+        .refresh-icon {
+            cursor: pointer;
+        }
+
+        .sortable {
+            cursor: pointer;
+        }
+
+        .arrow {
+            display: inline-block;
+            margin-left: 5px;
+        }
+
+        .arrow-up::before {
+            content: '▲';
+        }
+
+        .arrow-down::before {
+            content: '▼';
+        }
+
+        input[type="text"] {
+            width: 30%; /* Match the table width or adjust as needed */
+            padding: 10px; /* Larger padding for a taller input field */
+            margin-bottom: 20px; /* Space between the input field and the table */
+            font-size: 16px; /* Larger font size for better readability */
+            border: 1px solid #ccc; /* Subtle border color */
+            border-radius: 5px; /* Slightly rounded corners */
+            box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.1); /* Inner shadow for depth */
+            display: block; /* Ensure it's a block-level element */
+            margin-left: 11%; /* Combined with margin-right: auto, centers the input */
+            margin-right: auto;
+        }
+
+        .input-social-container {
+            display: flex;
+            align-items: center;
+        }
+
+        .info-text {
+            margin-left: 9em;
+            margin-right: 0em;
+        }
+       
+        .social-icons {
+            position: absolute;
+            right: 5%;
+            display: flex;
+            align-items: center;
+        }
+
+        .social-icons button {
+            background: none;
+            border: none;
+            cursor: pointer;
+        }
+
+        .social-icon {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            width: 50px; /* Adjust size as needed */
+            height: 50px; /* Adjust size as needed */
+            border-radius: 50%; /* Make it circular */
+            border: 1px solid #ccc; /* Light gray border */
+            margin-left: 15px; /* Space between icons */
+            overflow: hidden; /* Ensure the content fits the circular shape */
+            margin-bottom: 2em;
+        }
+
+        .social-icon img,
+        .social-icon svg {
+            width: 100%;
+            height: 100%;
+            display: block;
+            object-fit: cover; /* Ensure the image covers the area */
+        }
+
+        /* Responsive styles for smaller screens */
+        @media (max-width: 768px) {
+            body {
+                font-size: 0.9em; /* Smaller font size on mobile */
+            }
+
+            h1 {
+                font-size: 1.5rem; /* Adjust heading size for mobile */
+            }
+
+            .logo {
+                width: 30%; /* Increase width percentage for smaller screens */
+            }
+
+            input[type="text"] {
+                width: 80%; /* Increase width for mobile */
+                padding: 8px; /* Adjust padding */
+                font-size: 1em; /* Adjust font size */
+            }
+
+            table {
+                width: 100%; /* Full width on mobile */
+            }
+        }
+
+        .chart-card {
+            background-color: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1), 0 1px 3px rgba(0, 0, 0, 0.08);
+            padding: 20px;
+            margin: 20px auto;
+            max-width: 88%;
+            transition: transform 0.3s ease-in-out, box-shadow 0.3s ease-in-out;
+            margin-bottom: 40px;
+        }
+
+        .chart-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 7px 14px rgba(0, 0, 0, 0.15), 0 3px 6px rgba(0, 0, 0, 0.1);
+        }
+
+        .chart-title {
+            color: #ffffff;
+            font-size: 1.5rem;
+            margin-bottom: 15px;
+            text-align: center;
+        }
+
+        .chart-container {
+            position: relative;
+            height: 40vh;
+            width: 100%;
+        }
+
+        /* Responsive adjustments */
+        @media (max-width: 768px) {
+            .chart-card {
+                padding: 15px;
+                margin: 15px auto;
+            }
+
+            .chart-title {
+                font-size: 1.2rem;
+            }
+
+            .chart-container {
+                height: 50vh;
+            }
+        }
+
+        .miner-chart-container {
+            height: 300px;
+            margin-top: 20px;
+            margin-bottom: 20px;
+        }
+        .expanded-row {
+            background-color: rgba(255, 255, 255, 0.05);
+            transition: all 0.3s ease;
+        }
+        .expanded-content {
+            padding: 20px;
+        }
+
+        .focus-metrics {
+            display: flex;
+            justify-content: space-around;
+            flex-wrap: wrap;
+            margin-bottom: 20px;
+        }
+
+        .focus-metric {
+            background-color: rgba(255, 255, 255, 0.1);
+            border-radius: 8px;
+            padding: 15px;
+            text-align: center;
+            flex: 1;
+            margin: 10px;
+            min-width: 200px;
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+        }
+
+        .focus-metric-title {
+            font-size: 1.2rem;
+            margin-bottom: 10px;
+            color: #c0c0c0;
+            font-weight: bold;
+        }
+
+        .focus-metric-value {
+            font-size: 1.5rem;
+            font-weight: bold;
+        }
+
+        .focus-metric-value-usd {
+            font-size: 1.0rem;
+            color: #aaaaaa;
+        }
+    </style>
+</head>
+<body>
+    <div id="app">
+        <div class="logo">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 75 75">
+                <!-- Define the drop shadow filter -->
+                <defs>
+                    <filter id="text-shadow" x="-20%" y="-20%" width="140%" height="140%">
+                        <feGaussianBlur in="SourceAlpha" stdDeviation="2" result="blur"/>
+                        <feOffset in="blur" dx="2" dy="2" result="offsetBlur"/>
+                        <feMerge>
+                            <feMergeNode in="offsetBlur"/>
+                            <feMergeNode in="SourceGraphic"/>
+                        </feMerge>
+                    </filter>
+                </defs>
+                <text x="50%" y="70%" dominant-baseline="middle" text-anchor="middle" font-family="Roboto" font-size="100" fill="#068AC7" filter="url(#text-shadow)">Ω</text>
+            </svg>
+        </div>
+        <h1>OMEGA Leaderboard</h1>
+        <div v-if="focusVideoData" class="chart-card">
+            <h2 class="chart-title">Ω Focus KPIs</h2>
+            <div class="focus-metrics">
+                <div class="focus-metric">
+                    <div class="focus-metric-title">TOTAL WALLETS</div>
+                    <div class="focus-metric-value">{{ totalWallets }}</div>
+                </div>
+                <div class="focus-metric">
+                    <div class="focus-metric-title">TOTAL TASKS DONE</div>
+                    <div class="focus-metric-value">{{ totalVideosPurchased }}</div>
+                </div>
+                <div class="focus-metric">
+                    <div class="focus-metric-title">TOTAL TAO BALANCE</div>
+                    <div class="focus-metric-value">{{ totalTaoBalance.toFixed(3) }} <span class="focus-metric-value-usd">(${{ totalTaoBalanceUSD }} USD)</span></div>
+                </div>
+                <div class="focus-metric">
+                    <div class="focus-metric-title">TOTAL TAO REVENUE</div>
+                    <div class="focus-metric-value">{{ totalTaoRevenue.toFixed(3) }} <span class="focus-metric-value-usd">(${{ totalTaoRevenueUSD }} USD)</span></div>
+                </div>
+            </div>
+            <div class="chart-container">
+                <canvas ref="focusVideoChart"></canvas>
+            </div>
+        </div>
+
+        <div v-if="datasetSizeData" class="chart-card">
+            <h2 class="chart-title">OMEGA Multimodal Dataset Size Over Time</h2>
+            <div class="focus-metrics">
+                <div class="focus-metric">
+                    <div class="focus-metric-title">TOTAL ROWS</div>
+                    <div class="focus-metric-value">{{ totalRows.toLocaleString() }}</div>
+                </div>
+                <div class="focus-metric">
+                    <div class="focus-metric-title">MEMORY SIZE (GB)</div>
+                    <div class="focus-metric-value">{{ memory_size_gb.toFixed(2) }}</div>
+                </div>
+            </div>
+            <div class="chart-container">
+                <canvas ref="datasetSizeChart"></canvas>
+            </div>
+        </div>
+        
+        <div class="input-social-container">
+            <p class="info-text">Click on a row to display miner performance graph.</p>
+            <input type="text" v-model="filterKey" placeholder="Filter by hotkey...">
+            <div class="social-icons">
+                <a href="https://twitter.com/omegalabsai" target="_blank" class="social-icon"><button class="" type="button"><span class=""><img src="https://omegatron.ai/static/images/16b3234e15bf0aece98c.png"></span></button></a>
+                <a href="https://github.com/omegalabsinc" target="_blank" class="social-icon"><button class="" type="button"><span class=""><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="none"><path fill="#fff" d="M12 2.247a10 10 0 0 0-3.162 19.487c.5.088.687-.212.687-.475 0-.237-.012-1.025-.012-1.862-2.513.462-3.163-.613-3.363-1.175a3.64 3.64 0 0 0-1.025-1.413c-.35-.187-.85-.65-.012-.662a2 2 0 0 1 1.537 1.025 2.137 2.137 0 0 0 2.913.825c.043-.509.27-.984.637-1.338-2.225-.25-4.55-1.112-4.55-4.937a3.9 3.9 0 0 1 1.025-2.688 3.6 3.6 0 0 1 .1-2.65s.837-.262 2.75 1.025a9.43 9.43 0 0 1 5 0c1.912-1.3 2.75-1.025 2.75-1.025.37.838.406 1.786.1 2.65a3.87 3.87 0 0 1 1.025 2.688c0 3.837-2.337 4.687-4.562 4.937a2.37 2.37 0 0 1 .675 1.85c0 1.338-.013 2.413-.013 2.75 0 .263.188.575.688.475A10.005 10.005 0 0 0 12 2.247"></path></svg></span></button></a>
+            </div>
+        </div>
+        <table>
+            <tr>
+                <th class="center width520">Hotkey</th>
+                <th>Project</th>
+                <th class="sortable" @click="sortBy('datapoints')">Datapoints<span v-if="sortKey === 'datapoints'" class="arrow" :class="{ 'arrow-up': sortOrder > 0, 'arrow-down': sortOrder < 0 }"></span></th>
+                <th class="sortable" @click="sortBy('avg_desc_relevance')">Avg Desc Relevance<span v-if="sortKey === 'avg_desc_relevance'" class="arrow" :class="{ 'arrow-up': sortOrder > 0, 'arrow-down': sortOrder < 0 }"></span></th>
+                <th class="sortable" @click="sortBy('avg_query_relevance')">Avg Query Relevance<span v-if="sortKey === 'avg_query_relevance'" class="arrow" :class="{ 'arrow-up': sortOrder > 0, 'arrow-down': sortOrder < 0 }"></span></th>
+                <th class="sortable" @click="sortBy('avg_score')">Avg Score<span v-if="sortKey === 'avg_score'" class="arrow" :class="{ 'arrow-up': sortOrder > 0, 'arrow-down': sortOrder < 0 }"></span></th>
+                <th>Last Updated</th>
+                <th class="width20"><span class="refresh-icon" @click="fetchData">&#x21bb;</span></th>
+            </tr>
+            <template v-for="miner in filteredMiners">
+                <tr :key="miner.hotkey" @click="toggleExpand(miner)" :class="{ 'expanded-row': miner.expanded }">
+                    <td class="width520">{{ miner.hotkey }}</td>
+                    <td>{{ miner.is_bittensor ? 'Bittensor' : 'Commune' }}</td>
+                    <td>{{ miner.datapoints }}</td>
+                    <td>{{ miner.avg_desc_relevance }}</td>
+                    <td>{{ miner.avg_query_relevance }}</td>
+                    <td>{{ miner.avg_score }}</td>
+                    <td>{{ miner.last_updated }}</td>
+                    <td class="width20"></td>
+                </tr>
+                <tr v-if="miner.expanded" :key="miner.hotkey + '-expanded'" class="graph-row">
+                    <td colspan="8">
+                        <div class="expanded-content">
+                            <div class="miner-chart-container">
+                                <canvas :ref="'minerChart-' + miner.hotkey"></canvas>
+                            </div>
+                        </div>
+                    </td>
+                </tr>
+            </template>
+        </table>
+    </div>
+    <div>&nbsp;</div>
+
+    <script>
+        new Vue({
+            el: '#app',
+            data: {
+                miners: [],
+                filterKey: '',
+                sortKey: '',
+                sortOrder: 1,
+                datasetSizeData: null,
+                chartCreated: false,
+                minerCharts: {},
+                focusVideoData: null,
+                totalWallets: 0,
+                totalVideosPurchased: 0,
+                totalTaoBalance: 0.0,
+                totalTaoRevenue: 0.0,
+                focusVideoChartCreated: false,
+                taoPrice: 0,
+            },
+            computed: {
+                filteredMiners() {
+                    return this.miners.filter(miner => {
+                        return miner.hotkey.toLowerCase().includes(this.filterKey.toLowerCase());
+                    }).sort((a, b) => {
+                        let modifier = this.sortOrder;
+                        if(a[this.sortKey] < b[this.sortKey]) return -1 * modifier;
+                        if(a[this.sortKey] > b[this.sortKey]) return 1 * modifier;
+                        return 0;
+                    });
+                },
+                totalTaoBalanceUSD() {
+                    return (this.totalTaoBalance * this.taoPrice).toFixed(2);
+                },
+                totalTaoRevenueUSD() {
+                    return (this.totalTaoRevenue * this.taoPrice).toFixed(2);
+                }
+            },
+            watch: {
+                datasetSizeData: {
+                    handler(newData) {
+                        console.log('Dataset size data updated:', newData);
+                        this.$nextTick(() => {
+                            this.createOrUpdateChart();
+                        });
+                    },
+                    deep: true
+                }
+            },
+            methods: {
+                fetchData() {
+                    axios.get('/api/leaderboard')
+                        .then(response => {
+                            this.miners = response.data;
+                        })
+                        .catch(error => {
+                            console.error('There was an error fetching the leaderboard data:', error);
+                        });
+                },
+                sortBy(key) {
+                    if (this.sortKey === key) {
+                        this.sortOrder *= -1;
+                    } else {
+                        this.sortKey = key;
+                        this.sortOrder = 1;
+                    }
+                },
+                fetchDatasetSizeData() {
+                    console.log('Fetching dataset size data...');
+                    axios.get('/api/leaderboard-dataset-data')
+                        .then(response => {
+                            console.log('Dataset size data received:', response.data);
+                            const data = response.data;
+                            
+                            // Process the data to extract only what we need
+                            this.datasetSizeData = {
+                                labels: data.map(item => item.snapshot_date),
+                                datasets: [
+                                    {
+                                        label: 'TOTAL ROWS',
+                                        borderColor: '#98C379', // Green
+                                        backgroundColor: '#98C379',
+                                        data: data.map(item => ({
+                                            x: item.snapshot_date,
+                                            y: item.total_rows
+                                        })),
+                                        yAxisID: 'y'
+                                    },
+                                    {
+                                        label: 'MEMORY SIZE (GB)',
+                                        borderColor: '#61AFEF', // Blue
+                                        backgroundColor: '#61AFEF',
+                                        data: data.map(item => ({
+                                            x: item.snapshot_date,
+                                            y: item.memory_size_gb
+                                        })),
+                                        yAxisID: 'y1'
+                                    }
+                                ]
+                            };
+
+                            this.totalRows = data[data.length - 1].total_rows;
+                            this.memory_size_gb = data[data.length - 1].memory_size_gb;
+                            
+                            this.$nextTick(() => {
+                                this.createOrUpdateChart();
+                            });
+                        })
+                        .catch(error => {
+                            console.error('There was an error fetching the dataset size data:', error);
+                        });
+                },
+                createOrUpdateChart() {
+                    const canvas = this.$refs.datasetSizeChart;
+                    if (canvas && this.datasetSizeData && !this.chartCreated) {
+                        const ctx = canvas.getContext('2d');
+
+                        this.chart = new Chart(ctx, {
+                            type: 'line',
+                            data: {
+                                labels: this.datasetSizeData.labels,
+                                datasets: this.datasetSizeData.datasets,
+                            },
+                            options: {
+                                responsive: true,
+                                maintainAspectRatio: false,
+                                scales: {
+                                    x: {
+                                        type: 'time',
+                                        time: {
+                                            unit: 'month',
+                                            displayFormats: {
+                                                day: 'MMM yyyy'
+                                            }
+                                        },
+                                        title: {
+                                            display: true,
+                                            text: 'DATE (UTC)',
+                                            color: '#E0E0E0',
+                                            font: {
+                                                size: 14,
+                                                weight: 'bold'
+                                            }
+                                        },
+                                        ticks: {
+                                            color: '#E0E0E0',
+                                            font: {
+                                                size: 12
+                                            },
+                                            source: 'data',
+                                            maxRotation: 0,
+                                            autoSkip: true,
+                                            maxTicksLimit: 12
+                                        }
+                                    },
+                                    y: {
+                                        type: 'linear',
+                                        display: true,
+                                        position: 'left',
+                                        title: {
+                                            display: true,
+                                            text: 'TOTAL ROWS',
+                                            color: '#E0E0E0',
+                                            font: {
+                                                size: 14,
+                                                weight: 'bold'
+                                            }
+                                        },
+                                        ticks: {
+                                            color: '#E0E0E0',
+                                            font: {
+                                                size: 12
+                                            },
+                                            callback: function(value, index, values) {
+                                                return value.toLocaleString();
+                                            }
+                                        }
+                                    },
+                                    y1: {
+                                        type: 'linear',
+                                        display: true,
+                                        position: 'right',
+                                        title: {
+                                            display: true,
+                                            text: 'MEMORY SIZE (GB)',
+                                            color: '#E0E0E0',
+                                            font: {
+                                                size: 14,
+                                                weight: 'bold'
+                                            }
+                                        },
+                                        ticks: {
+                                            color: '#E0E0E0',
+                                            font: {
+                                                size: 12
+                                            },
+                                            callback: function(value, index, values) {
+                                                return value.toLocaleString();
+                                            }
+                                        },
+                                        grid: {
+                                            drawOnChartArea: false
+                                        }
+                                    },
+                                },
+                                plugins: {
+                                    legend: {
+                                        labels: {
+                                            color: '#E0E0E0',
+                                            font: {
+                                                size: 12
+                                            }
+                                        }
+                                    },
+                                    tooltip: {
+                                        callbacks: {
+                                            title: function(tooltipItems) {
+                                                return tooltipItems[0].label + ' (UTC)';
+                                            },
+                                            label: function(context) {
+                                                let label = context.dataset.label || '';
+                                                if (label) {
+                                                    label += ': ';
+                                                }
+                                                if (context.parsed.y !== null) {
+                                                    label += context.parsed.y.toLocaleString();
+                                                }
+                                                return label;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                        this.chartCreated = true;
+                    } else if (this.chart && this.datasetSizeData) {
+                        this.chart.data = this.datasetSizeData;
+                        this.chart.update();
+                    } else {
+                        console.log('Unable to create or update chart. Canvas:', !!canvas, 'Data:', !!this.datasetSizeData, 'Chart created:', this.chartCreated);
+                    }
+                },
+                toggleExpand(miner) {
+                    this.$set(miner, 'expanded', !miner.expanded);
+                    if (miner.expanded) {
+                        this.fetchMinerData(miner.hotkey);
+                    }
+                },
+                fetchMinerData(hotkey) {
+                    axios.get(`/api/leaderboard-miner-data?hotkey=${hotkey}`)
+                        .then(response => {
+                            this.createMinerChart(hotkey, response.data);
+                        })
+                        .catch(error => {
+                            console.error('Error fetching miner data:', error);
+                        });
+                },
+                createMinerChart(hotkey, data) {
+                    const canvas = this.$refs[`minerChart-${hotkey}`][0];
+                    const ctx = canvas.getContext('2d');
+
+                    if (this.minerCharts[hotkey]) {
+                        this.minerCharts[hotkey].destroy();
+                    }
+
+                    this.minerCharts[hotkey] = new Chart(ctx, {
+                        type: 'line',
+                        data: {
+                            labels: data.map(item => item.snapshot_date),
+                            datasets: [
+                                {
+                                    label: 'Datapoints',
+                                    borderColor: '#98C379', // Green
+                                    backgroundColor: '#98C379',
+                                    data: data.map(item => ({x: item.snapshot_date, y: item.datapoints})),
+                                    yAxisID: 'y'
+                                },
+                                {
+                                    label: 'Avg Score',
+                                    borderColor: '#61AFEF', // Blue
+                                    backgroundColor: '#61AFEF',
+                                    data: data.map(item => ({x: item.snapshot_date, y: item.avg_score})),
+                                    yAxisID: 'y1'
+                                },
+                                {
+                                    label: 'Avg Query Relevance',
+                                    borderColor: '#D19A66',
+                                    backgroundColor: '#D19A66',
+                                    data: data.map(item => ({x: item.snapshot_date, y: item.avg_query_relevance})),
+                                    yAxisID: 'y1'
+                                },
+                                {
+                                    label: 'Avg Desc Relevance',
+                                    borderColor: '#C678DD',
+                                    backgroundColor: '#C678DD',
+                                    data: data.map(item => ({x: item.snapshot_date, y: item.avg_desc_relevance})),
+                                    yAxisID: 'y1'
+                                },
+                                {
+                                    label: 'Incentive',
+                                    borderColor: '#E06C75',
+                                    backgroundColor: '#E06C75',
+                                    data: data.map(item => ({x: item.snapshot_date, y: item.incentive})),
+                                    yAxisID: 'y2'
+                                }
+                            ]
+                        },
+                        options: {
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            scales: {
+                                x: {
+                                    type: 'time',
+                                    time: {
+                                        parser: 'yyyy-MM-dd',
+                                        unit: 'day',
+                                        displayFormats: {
+                                            day: 'MMM d, yyyy'
+                                        }
+                                    },
+                                    title: {
+                                        display: true,
+                                        text: 'DATE (UTC)',
+                                        color: '#E0E0E0',
+                                        font: {
+                                            size: 14,
+                                            weight: 'bold'
+                                        }
+                                    },
+                                    ticks: {
+                                        color: '#E0E0E0',
+                                        font: {
+                                            size: 12
+                                        }
+                                    }
+                                },
+                                y: {
+                                    type: 'linear',
+                                    display: true,
+                                    position: 'left',
+                                    title: {
+                                        display: true,
+                                        text: 'DATAPOINTS',
+                                        color: '#E0E0E0',
+                                        font: {
+                                            size: 14,
+                                            weight: 'bold'
+                                        }
+                                    },
+                                    ticks: {
+                                        color: '#E0E0E0',
+                                        font: {
+                                            size: 12
+                                        },
+                                        callback: function(value) {
+                                            return value.toLocaleString();
+                                        }
+                                    }
+                                },
+                                y1: {
+                                    type: 'linear',
+                                    display: true,
+                                    position: 'right',
+                                    min: 0,
+                                    max: 1,
+                                    title: {
+                                        display: true,
+                                        text: 'SCORES',
+                                        color: '#E0E0E0',
+                                        font: {
+                                            size: 14,
+                                            weight: 'bold'
+                                        }
+                                    },
+                                    ticks: {
+                                        color: '#E0E0E0',
+                                        font: {
+                                            size: 12
+                                        }
+                                    },
+                                    grid: {
+                                        drawOnChartArea: false
+                                    }
+                                },
+                                y2: {
+                                    type: 'linear',
+                                    display: false,
+                                    position: 'right',
+                                    grid: {
+                                        drawOnChartArea: false,
+                                    },
+                                    ticks: {
+                                        callback: function(value, index, values) {
+                                            return value.toFixed(5);
+                                        }
+                                    }
+                                },
+                            },
+                            plugins: {
+                                legend: {
+                                    labels: {
+                                        color: '#E0E0E0',
+                                        font: {
+                                            size: 12
+                                        }
+                                    }
+                                },
+                                tooltip: {
+                                    callbacks: {
+                                        title: function(tooltipItems) {
+                                            return tooltipItems[0].label + ' (UTC)';
+                                        },
+                                        label: function(context) {
+                                            let label = context.dataset.label || '';
+                                            if (label) {
+                                                label += ': ';
+                                            }
+                                            if (context.parsed.y !== null) {
+                                                if (label.startsWith('Incentive')) {
+                                                    // Display incentive with 5 decimal places
+                                                    label += context.parsed.y.toFixed(5);
+                                                } else {
+                                                    // For other metrics, use the existing formatting
+                                                    label += context.parsed.y.toLocaleString();
+                                                }
+                                            }
+                                            return label;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    });
+
+                },
+                fetchFocusVideoData() {
+                    console.log('Fetching focus video data...');
+                    axios.get('/api/leaderboard-focus-data')
+                        .then(response => {
+                            console.log('Focus video data received:', response.data);
+                            const data = response.data;
+                            
+                            // Process the data
+                            this.focusVideoData = {
+                                labels: data.map(item => item.snapshot_date),
+                                datasets: [
+                                    {
+                                        label: 'Total Wallets',
+                                        borderColor: '#98C379', // Green
+                                        backgroundColor: '#98C379',
+                                        data: data.map(item => ({
+                                            x: item.snapshot_date,
+                                            y: item.total_wallets
+                                        })),
+                                        yAxisID: 'y2'
+                                    },
+                                    {
+                                        label: 'Total Tasks Done',
+                                        borderColor: '#61AFEF', // Blue
+                                        backgroundColor: '#61AFEF',
+                                        data: data.map(item => ({
+                                            x: item.snapshot_date,
+                                            y: item.total_videos_purchased
+                                        })),
+                                        yAxisID: 'y'
+                                    },
+                                    {
+                                        label: 'Total TAO Balance',
+                                        borderColor: '#C678DD', // Purple
+                                        backgroundColor: '#C678DD',
+                                        data: data.map(item => ({
+                                            x: item.snapshot_date,
+                                            y: item.total_tao_balance
+                                        })),
+                                        yAxisID: 'y1'
+                                    },
+                                    {
+                                        label: 'Total TAO Revenue',
+                                        borderColor: '#E06C75', // Red
+                                        backgroundColor: '#E06C75',
+                                        data: data.map(item => ({
+                                            x: item.snapshot_date,
+                                            y: item.total_tao_revenue
+                                        })),
+                                        yAxisID: 'y1'
+                                    }
+                                ]
+                            };
+
+                            this.totalWallets = data[data.length - 1].total_wallets;
+                            this.totalVideosPurchased = data[data.length - 1].total_videos_purchased;
+                            this.totalTaoBalance = data[data.length - 1].total_tao_balance;
+                            this.totalTaoRevenue = data[data.length - 1].total_tao_revenue;
+                            
+                            this.$nextTick(() => {
+                                this.createOrUpdateFocusVideoChart();
+                            });
+                        })
+                        .catch(error => {
+                            console.error('There was an error fetching the focus video data:', error);
+                        });
+                },
+                createOrUpdateFocusVideoChart() {
+                    const canvas = this.$refs.focusVideoChart;
+                    if (canvas && this.focusVideoData && !this.focusVideoChartCreated) {
+                        const ctx = canvas.getContext('2d');
+
+                        this.focusVideoChart = new Chart(ctx, {
+                            type: 'line',
+                            data: this.focusVideoData,
+                            options: {
+                                responsive: true,
+                                maintainAspectRatio: false,
+                                scales: {
+                                    x: {
+                                        type: 'time',
+                                        time: {
+                                            unit: 'month',
+                                            displayFormats: {
+                                                month: 'MMM yyyy'
+                                            }
+                                        },
+                                        title: {
+                                            display: true,
+                                            text: 'DATE',
+                                            color: '#E0E0E0',
+                                            font: {
+                                                size: 14,
+                                                weight: 'bold'
+                                            }
+                                        },
+                                        ticks: {
+                                            color: '#E0E0E0',
+                                            font: {
+                                                size: 12
+                                            },
+                                            maxRotation: 0,
+                                            autoSkip: true,
+                                            maxTicksLimit: 12
+                                        }
+                                    },
+                                    y2: {
+                                        type: 'linear',
+                                        display: false, // Hide/Show the y2-axis
+                                        position: 'left',
+                                        title: {
+                                            display: false,
+                                            text: 'TOTAL WALLETS'
+                                        },
+                                        ticks: {
+                                            color: '#98C379',
+                                            callback: function(value) {
+                                                return value >= 1000 ? value / 1000 + 'K' : value;
+                                            }
+                                        },
+                                        grid: {
+                                            drawOnChartArea: false
+                                        }
+                                    },
+                                    y: {
+                                        type: 'linear',
+                                        display: false, // Hide/Show the y-axis
+                                        position: 'left',
+                                        title: {
+                                            display: true,
+                                            text: 'COUNT',
+                                            color: '#E0E0E0',
+                                            font: {
+                                                size: 14,
+                                                weight: 'bold'
+                                            }
+                                        },
+                                        ticks: {
+                                            color: '#E0E0E0',
+                                            font: {
+                                                size: 12
+                                            },
+                                            callback: function(value) {
+                                                return value.toLocaleString();
+                                            }
+                                        }
+                                    },
+                                    y1: {
+                                        type: 'linear',
+                                        display: true,
+                                        position: 'right',
+                                        title: {
+                                            display: true,
+                                            text: 'TAO',
+                                            color: '#E0E0E0',
+                                            font: {
+                                                size: 14,
+                                                weight: 'bold'
+                                            }
+                                        },
+                                        ticks: {
+                                            color: '#E0E0E0',
+                                            font: {
+                                                size: 12
+                                            },
+                                            callback: function(value) {
+                                                return value.toFixed(2);
+                                            }
+                                        },
+                                        grid: {
+                                            drawOnChartArea: false
+                                        }
+                                    },
+                                },
+                                plugins: {
+                                    legend: {
+                                        labels: {
+                                            color: '#E0E0E0',
+                                            font: {
+                                                size: 12
+                                            }
+                                        }
+                                    },
+                                    tooltip: {
+                                        callbacks: {
+                                            title: function(tooltipItems) {
+                                                return tooltipItems[0].label.replace(', 12:00:00 a.m.', '');
+                                            },
+                                            label: function(context) {
+                                                let label = context.dataset.label || '';
+                                                if (label) {
+                                                    label += ': ';
+                                                }
+                                                if (context.parsed.y !== null) {
+                                                    if (label.includes('TAO')) {
+                                                        label += context.parsed.y.toFixed(3);
+                                                    } else {
+                                                        label += context.parsed.y.toLocaleString();
+                                                    }
+                                                }
+                                                return label;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                        this.focusVideoChartCreated = true;
+                    } else if (this.focusVideoChart && this.focusVideoData) {
+                        this.focusVideoChart.data = this.focusVideoData;
+                        this.focusVideoChart.update();
+                    } else {
+                        console.log('Unable to create or update focus video chart. Canvas:', !!canvas, 'Data:', !!this.focusVideoData, 'Chart created:', this.focusVideoChartCreated);
+                    }
+                },
+                fetchTaoPrice() {
+                    axios.get('https://focus-api.omegatron.ai/get_tao_price')
+                        .then(response => {
+                            this.taoPrice = response.data;
+                        })
+                        .catch(error => {
+                            console.error('Error fetching TAO price:', error);
+                        });
+                },
+            },
+            mounted() {
+                this.fetchData();
+                this.fetchDatasetSizeData();
+                this.fetchFocusVideoData();
+                this.fetchTaoPrice();
+            }
+        });
+    </script>
+</body>
+</html>

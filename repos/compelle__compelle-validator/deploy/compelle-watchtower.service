@@ -1,0 +1,30 @@
+[Unit]
+Description=Compelle Validator Watchtower (auto-pull github main + restart)
+Documentation=https://github.com/compelle/compelle-validator
+After=network-online.target
+
+# Auto-update for compelle-validator, ON BY DEFAULT after install.sh.
+# Polls origin/main every 10 min; if HEAD differs, runs upgrade.sh --auto
+# (no confirmation, hard reset to remote).
+#
+# To DISABLE (run upgrade.sh manually instead):
+#   sudo systemctl disable --now compelle-watchtower.timer
+# To re-enable later:
+#   sudo systemctl enable --now compelle-watchtower.timer
+#
+# Risks (operator accepts these by leaving auto-update on):
+#   - We push a bad commit -> all watchtower-enabled validators crash together
+#   - We push a malicious commit (compromised account) -> validators run it
+#   - Mitigation: keep eyes on the validator service after announcements;
+#     watchtower writes to journal so 'journalctl -u compelle-watchtower'
+#     shows what happened.
+
+[Service]
+Type=oneshot
+User=root
+# Optional: drop a watchtower.env file with COMPELLE_TARGET_REF=origin/<branch>
+# to follow a canary branch instead of main. Absent file = follow main.
+EnvironmentFile=-/etc/compelle/watchtower.env
+ExecStart=/opt/compelle-validator/deploy/upgrade.sh --auto
+StandardOutput=journal
+StandardError=journal

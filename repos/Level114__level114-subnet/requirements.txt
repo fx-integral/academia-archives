@@ -1,0 +1,17 @@
+# Level114 Subnet - Core Dependencies
+# Compatible with Python >=3.8
+
+# Bittensor framework
+bittensor>=9.11.1
+
+# Deep learning framework
+torch>=2.0.0
+
+# Scientific computing
+numpy>=1.21.0
+
+# Logging
+loguru>=0.7.0
+
+# HTTP client for external scanners
+requests>=2.31.0

@@ -1,0 +1,1205 @@
+import base64
+import os
+import time
+import random
+import argparse
+import asyncio
+import json
+import logging
+from datetime import datetime
+from dataclasses import dataclass
+from typing import List
+from bittensor import NeuronInfo
+import jwt
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from contextlib import asynccontextmanager
+
+import bittensor as bt
+
+from shared.environment_variables import (
+    VERICORE_VALIDATOR_VERSION,
+    IMMUNITY_PERIOD,
+    VALIDATOR_JWT_PUBLIC_KEY,
+    VALIDATOR_JWT_ALGORITHM,
+)
+from shared.veridex_protocol import (
+    VericoreSynapse,
+    VeridexResponse,
+    VericoreMinerStatementResponse,
+    VericoreQueryResponse,
+    VericoreStatementResponse,
+    SourceEvidence,
+    SourceType,
+    EvidenceCategory,
+    Desearch,
+    StatementResponseTiming,
+    MinerResponseTiming,
+    QueryResponseTiming,
+    SNIPPET_FETCHER_STATUS_NOT_RUN,
+)
+from shared.desearch_proof import verify_proof
+from shared.scores import (
+    UNREACHABLE_MINER_SCORE,
+    INVALID_RESPONSE_MINER_SCORE,
+    NO_STATEMENTS_PROVIDED_SCORE,
+    DUPLICATE_EXACT_MINER_STATEMENTS,
+    DESEARCH_PROOF_VALID_BONUS,
+    DESEARCH_PROOF_INVALID_PENALTY,
+    SOCIAL_BONUS_DOMAIN_X,
+    SOCIAL_BONUS_DOMAIN_REDDIT,
+    SOCIAL_BONUS_DOMAINS_X,
+    SOCIAL_BONUS_DOMAIN_REDDIT_NAME,
+)
+from shared.wallet_api_key_utils import get_linked_wallet_from_payload
+from shared.log_data import LoggerType
+from shared.proxy_log_handler import register_proxy_log_handler
+from validator.snippet_validator import run_validate_miner_snippet
+from validator.active_tester import StatementGenerator
+
+from dotenv import load_dotenv
+from dataclasses import asdict
+
+# debug
+bt.logging.set_trace()
+
+load_dotenv()
+
+REFRESH_INTERVAL_SECONDS =  60 * 10
+NUMBER_OF_MINERS = 3
+
+semaphore = asyncio.Semaphore(5)  # Limit to 10 threads at a time
+
+MAX_MINER_RESPONSES = 5
+
+LOWEST_FINAL_SCORE = -10
+HIGHEST_FINAL_SCORE = 10
+
+###############################################################################
+
+MIN_CLAMP_SCORE = -5.0
+MAX_CLAMP_SCORE = 10.0
+
+MAX_WEIGHT = 10.0  # Cap on how much weight any miner can have
+MIN_WEIGHT = 1.0  # Floor to give new miners a chance
+EXPLORATION_FACTOR = 0.1  # 10% exploration
+NEW_MINER_BONUS = 2.0
+
+
+def normalize_endpoint(s: str | None) -> str | None:
+    """Strip leading/trailing whitespace (including Unicode NBSP U+00A0) from endpoint/URL strings."""
+    if not s or not isinstance(s, str):
+        return s
+    return s.strip()
+
+
+def get_parser():
+    """Build argument parser with Bittensor and axon args (shared by get_config and __main__)."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--custom", default="my_custom_value", help="Custom value")
+    parser.add_argument("--netuid", type=int, default=1, help="Chain subnet uid")
+    bt.subtensor.add_args(parser)
+    bt.logging.add_args(parser)
+    bt.wallet.add_args(parser)
+    bt.axon.add_args(parser)
+    return parser
+
+
+@dataclass
+class MinerSelection:
+    miner_uid: int
+    miner_hotkey: str
+    neuron_info: NeuronInfo
+    scores: float
+    request_count: int
+    is_miner: bool = True  # False for validators; only is_miner=True are sent requests
+
+    def calculate_average_score(self) -> float:
+        if self.request_count == 0:
+            return 0
+        return self.scores/self.request_count
+
+###############################################################################
+# APIQueryHandler: handles miner queries, scores responses, and writes each
+# result to its own uniquely named JSON file for later processing by the daemon.
+###############################################################################
+class APIQueryHandler:
+
+    def __init__(self):
+        self.config = self.get_config()
+        bt.logging.info(f"__init {self.config}")
+        self.setup_bittensor_objects()  # Creates dendrite, wallet, subtensor, metagraph only once.
+        self.setup_logging()
+
+        self.last_refresh_time: float = 0
+        self.miners: List[NeuronInfo] = []
+        self.miner_cache: List[MinerSelection] = []
+
+        self.my_uid = self.metagraph.hotkeys.index(self.wallet.hotkey.ss58_address)
+
+        self.refresh_miner_cache()
+
+        self.statement_generator = StatementGenerator()
+        # Directory to write individual result files (shared with the daemon)
+        self.results_dir = "results"
+        os.makedirs(self.results_dir, exist_ok=True)
+
+    def _sanitize_endpoint(self, s: str) -> str:
+        """Remove non-breaking space (\\xa0) and strip whitespace from endpoint URLs."""
+        if not s or not isinstance(s, str):
+            return s
+        return s.replace("\xa0", "").strip()
+
+    def get_config(self):
+        parser = get_parser()
+        config = bt.config(parser)
+
+        # Sanitize subtensor endpoint so port/URL parsing does not fail on stray \\xa0 (e.g. from env)
+        if hasattr(config, "subtensor"):
+            for attr in ("chain_endpoint", "network"):
+                if hasattr(config.subtensor, attr):
+                    val = getattr(config.subtensor, attr)
+                    if isinstance(val, str):
+                        setattr(config.subtensor, attr, self._sanitize_endpoint(val))
+
+        bt.logging.info(f"get_config: {config}")
+        config.full_path = os.path.expanduser(
+            "{}/{}/{}/netuid{}/validator".format(
+                config.logging.logging_dir,
+                config.wallet.name,
+                config.wallet.hotkey_str,
+                config.netuid,
+            )
+        )
+        os.makedirs(config.full_path, exist_ok=True)
+        return config
+
+    def setup_logging(self):
+        bt.logging(config=self.config, logging_dir=self.config.full_path)
+        bt.logging.info("Starting APIQueryHandler with config:")
+        bt.logging.info(self.config)
+        bt_logger = logging.getLogger("bittensor")
+        register_proxy_log_handler(bt_logger, LoggerType.Validator, self.wallet)
+
+    def setup_bittensor_objects(self):
+        bt.logging.info("Setting up Bittensor objects for API Server.")
+        self.wallet = bt.wallet(config=self.config)
+        bt.logging.info(f"Wallet: {self.wallet}")
+        self.subtensor = bt.subtensor(config=self.config)
+        bt.logging.info(f"Subtensor: {self.subtensor}")
+        # Create the dendrite (used to query miners)
+        self.dendrite = bt.dendrite(wallet=self.wallet)
+        bt.logging.info(f"Dendrite: {self.dendrite}")
+        self.metagraph = self.subtensor.metagraph(self.config.netuid)
+        bt.logging.info(f"Metagraph: {self.metagraph}")
+
+        self.axon = bt.axon(wallet=self.wallet, config=self.config)
+        self.axon.serve(netuid=self.config.netuid, subtensor=self.subtensor)
+
+        if self.wallet.hotkey.ss58_address not in self.metagraph.hotkeys:
+            bt.logging.error("Wallet not registered on chain. Run 'btcli register'.")
+            exit()
+        else:
+            self.my_subnet_uid = self.metagraph.hotkeys.index(
+                self.wallet.hotkey.ss58_address
+            )
+            bt.logging.info(f"API Server running on uid: {self.my_subnet_uid}")
+
+    async def call_axon(self, miner_uid, request_id, target_axon, synapse):
+        start_time = time.time()
+        bt.logging.info(f"{self.my_uid} | {request_id} | Calling axon {target_axon.hotkey}")
+        response = await self.dendrite.call(
+            target_axon=target_axon, synapse=synapse, timeout=120, deserialize=True
+        )
+        bt.logging.info(f"{self.my_uid} | {request_id} | {miner_uid} | Called axon {target_axon.hotkey} ")
+        end_time = time.time()
+        elapsed = end_time - start_time + 1e-9
+        veridex_response: VeridexResponse = VeridexResponse(
+            synapse = response,
+            elapse_time = elapsed
+        )
+        return veridex_response
+
+    def verify_miner_connection(
+        self,
+        miner_uid: int,
+        miner_hotkey: str,
+        request_id: str,
+        neuron: NeuronInfo,
+    ) -> VericoreMinerStatementResponse | None:
+        # Could not find miner key - Shouldn't get here!
+        if miner_uid is None:
+            bt.logging.warning(
+                f"{self.my_uid} | {request_id} | Could not find miner uid for hotkey {miner_hotkey} "
+            )
+            miner_statement = VericoreMinerStatementResponse(
+                miner_hotkey="", miner_uid=-1, status="invalid_miner", raw_score=0, final_score=0,
+            )
+            return miner_statement
+
+        # Check if miner has any axon information
+        if neuron.axon_info is None:
+            bt.logging.warning(
+                f"{self.my_uid} | {request_id} | {miner_uid} | Miner doesn't have axon info"
+            )
+            miner_statement = VericoreMinerStatementResponse(
+                miner_hotkey=miner_hotkey, miner_uid=miner_uid, status="unreachable_miner", raw_score=UNREACHABLE_MINER_SCORE, final_score=UNREACHABLE_MINER_SCORE
+            )
+            return miner_statement
+
+        # Check if miner has valid ip address
+        if not neuron.axon_info.is_serving:
+            bt.logging.warning(
+                f"{self.my_uid} | {request_id} | {miner_uid} | Miner doesn't have reachable ip address"
+            )
+            miner_statement = VericoreMinerStatementResponse(
+                miner_hotkey=miner_hotkey, miner_uid=miner_uid, status="unreachable_miner", raw_score=UNREACHABLE_MINER_SCORE, final_score=UNREACHABLE_MINER_SCORE
+            )
+            return miner_statement
+
+        # miner is reachable
+        return None
+
+    def _validate_desearch_evidence(
+        self,
+        miner_uid: int,
+        miner_hotkey: str,
+        request_id: str,
+        veridex_responses: List[SourceEvidence],
+        raw_desearch,
+    ) -> VericoreMinerStatementResponse | None:
+        """
+        If any evidence is from Desearch, require desearch (list) with full proof for every item.
+        Returns an error VericoreMinerStatementResponse on failure, or None if no desearch evidence or validation passes.
+        """
+        has_desearch = any(
+            getattr(ev, "source_type", SourceType.WEB.value) == SourceType.DESEARCH.value for ev in veridex_responses
+        )
+        if not has_desearch:
+            return None
+        desearch_list = raw_desearch if isinstance(raw_desearch, list) else []
+        if not desearch_list:
+            bt.logging.warning(
+                f"{self.my_uid} | {request_id} | {miner_uid} | Desearch evidence but synapse.desearch missing or empty"
+            )
+            return VericoreMinerStatementResponse(
+                miner_hotkey=miner_hotkey,
+                miner_uid=miner_uid,
+                status="desearch_proof_missing",
+                raw_score=INVALID_RESPONSE_MINER_SCORE,
+                final_score=INVALID_RESPONSE_MINER_SCORE,
+            )
+        for item in desearch_list:
+            if not item or not getattr(item, "response_body", None) or not getattr(item, "proof", None):
+                bt.logging.warning(
+                    f"{self.my_uid} | {request_id} | {miner_uid} | Desearch evidence but synapse.desearch item missing body or proof"
+                )
+                return VericoreMinerStatementResponse(
+                    miner_hotkey=miner_hotkey,
+                    miner_uid=miner_uid,
+                    status="desearch_proof_missing",
+                    raw_score=INVALID_RESPONSE_MINER_SCORE,
+                    final_score=INVALID_RESPONSE_MINER_SCORE,
+                )
+            p = getattr(item, "proof", None)
+            if not (p and getattr(p, "signature", None) and getattr(p, "timestamp", None) and getattr(p, "expiry", None)):
+                bt.logging.warning(
+                    f"{self.my_uid} | {request_id} | {miner_uid} | Desearch proof fields incomplete"
+                )
+                return VericoreMinerStatementResponse(
+                    miner_hotkey=miner_hotkey,
+                    miner_uid=miner_uid,
+                    status="desearch_proof_incomplete",
+                    raw_score=INVALID_RESPONSE_MINER_SCORE,
+                    final_score=INVALID_RESPONSE_MINER_SCORE,
+                )
+        return None
+
+    def validate_miner_response(
+        self,
+        miner_uid: int,
+        miner_hotkey: str,
+        request_id: str,
+        miner_response
+    ) -> VericoreMinerStatementResponse | None:
+        if (
+            miner_response is None
+            or miner_response.synapse.veridex_response is None
+        ):
+            bt.logging.warning(
+                f"{self.my_uid} | {request_id} | {miner_uid} | No miner response received"
+            )
+            miner_statement = VericoreMinerStatementResponse(
+                miner_hotkey=miner_hotkey,
+                miner_uid=miner_uid,
+                status="no_response",
+                raw_score=INVALID_RESPONSE_MINER_SCORE,
+                final_score=INVALID_RESPONSE_MINER_SCORE,
+            )
+            return miner_statement
+
+        veridex_responses: List[SourceEvidence] = miner_response.synapse.veridex_response
+        if len(veridex_responses) == 0:
+            bt.logging.warning(
+                f"{self.my_uid} | {request_id} | {miner_uid} | Miner didn't return any statements"
+            )
+            miner_statement = VericoreMinerStatementResponse(
+                miner_hotkey=miner_hotkey,
+                miner_uid=miner_uid,
+                status="no_statements_provided",
+                raw_score=NO_STATEMENTS_PROVIDED_SCORE,
+                final_score=NO_STATEMENTS_PROVIDED_SCORE,
+            )
+            return miner_statement
+
+        desearch_error = self._validate_desearch_evidence(
+            miner_uid,
+            miner_hotkey,
+            request_id,
+            veridex_responses,
+            getattr(miner_response.synapse, "desearch", None),
+        )
+        if desearch_error is not None:
+            return desearch_error
+
+        # Valid statements returned
+        return None
+
+    # async def process_miner_response_with_limit(self, *args):
+    #     async with semaphore:
+    #         return await asyncio.to_thread(self.process_miner_response, *args)
+
+    def calculate_speed_factor(self, elapse_time: float) -> float:
+        # The speed factor decreases with elapse_time:
+        # - When elapse_time = 0, the score is 2.0.
+        # - When elapse_time = 30, the score is 1.0.
+        # - When elapse_time = 60, the score is clamped to 0.01 (min threshold).
+        return max(1, 2.0 - (elapse_time / 30.0))
+
+        # if elapse_time <= 15:
+        #     return 4.0  # 0 to 15 seconds maps to a speed factor of 4
+        # elif elapse_time <= 30:
+        #     return 4.0 - ((elapse_time - 15) / 15) * 2  # Linearly decrease from 4 to 2 between 15 and 30 seconds
+        # elif elapse_time <= 90:
+        #     return 2.0 - ((elapse_time - 30) / 60) * 2  # Linearly decrease from 2 to 0 between 30 and 90 seconds
+        # elif elapse_time <= 120:
+        #     return 0.0 - ((elapse_time - 90) / 30) * 1  # Linearly decrease from 0 to -1 between 90 and 120 seconds
+        # else:
+        #     return -1.0  # For any time beyond 2 minutes, return -1
+
+    async def process_miner_request(
+        self,
+        request_id: str,
+        neuron : NeuronInfo,
+        synapse: VericoreSynapse,
+        statement: str,
+        is_test: bool,
+        is_nonsense: bool,
+    ) -> VericoreMinerStatementResponse:
+        miner_hotkey = neuron.hotkey
+        miner_uid =  neuron.uid
+        try:
+            miner_statement = self.verify_miner_connection(
+                miner_uid,
+                miner_hotkey,
+                request_id,
+                neuron,
+            )
+            if miner_statement is not None:
+                return miner_statement
+
+            bt.logging.info(f"{self.my_uid} | {request_id} | { miner_uid } | Calling axon ")
+
+            # Call the miner
+            try:
+                miner_response = await self.call_axon(
+                    target_axon=neuron.axon_info, request_id=request_id, synapse=synapse, miner_uid=neuron.uid
+                )
+            except Exception as e:
+                bt.logging.error(f"{self.my_uid} | {request_id} | {miner_uid} | An error has occurred calling miner with error: {e}")
+                # exception could have been from us?
+                final_score = INVALID_RESPONSE_MINER_SCORE
+                miner_statement = VericoreMinerStatementResponse(
+                    miner_hotkey=miner_hotkey,
+                    miner_uid=miner_uid,
+                    status="no_response",
+                    raw_score=final_score,
+                    final_score=final_score,
+                )
+                return miner_statement
+
+            bt.logging.info(
+                f"{self.my_uid} | {request_id} | { miner_uid } | Received miner information"
+            )
+
+            miner_statement = self.validate_miner_response(
+                miner_uid,
+                miner_hotkey,
+                request_id,
+                miner_response
+            )
+            if miner_statement is not None:
+                bt.logging.warning(
+                    f"{self.my_uid} | {request_id} | {miner_uid} | Invalid miner response received"
+                )
+                return miner_statement
+
+
+            # Process Vericore response data
+            veridex_resp = miner_response.synapse.veridex_response or []
+            bt.logging.info(f"{self.my_uid} | {request_id} | {miner_uid} | Verifying Miner Statements. Received {len(veridex_resp)} responses. Only Processing {MAX_MINER_RESPONSES}")
+
+            # Log what we received from miner
+            for i, ev in enumerate(veridex_resp[:MAX_MINER_RESPONSES]):
+                url = getattr(ev, "url", "") or ""
+                stype = getattr(ev, "source_type", SourceType.WEB.value)
+                excerpt = (getattr(ev, "excerpt", "") or "")[:80]
+                bt.logging.info(
+                    f"{self.my_uid} | {request_id} | {miner_uid} | miner_response[{i}] url={url[:60]}... source_type={stype} excerpt={excerpt!r}..."
+                )
+            raw_desearch = getattr(miner_response.synapse, "desearch", None)
+            desearch_list = raw_desearch if isinstance(raw_desearch, list) else []
+            if desearch_list:
+                for idx, d in enumerate(desearch_list):
+                    if d and getattr(d, "response_body", None) and getattr(d, "proof", None):
+                        p = getattr(d, "proof", None)
+                        bt.logging.info(
+                            f"{self.my_uid} | {request_id} | {miner_uid} | miner_response desearch[{idx}]: response_body_b64_len={len(d.response_body)} "
+                            f"proof.signature_len={len(getattr(p, 'signature', '') or '')} timestamp={getattr(p, 'timestamp', '')!r} expiry={getattr(p, 'expiry', '')!r}"
+                        )
+                    else:
+                        bt.logging.info(f"{self.my_uid} | {request_id} | {miner_uid} | miner_response desearch[{idx}]: absent or incomplete")
+            else:
+                bt.logging.info(f"{self.my_uid} | {request_id} | {miner_uid} | miner_response desearch: absent or empty")
+            bt.logging.info(f"{self.my_uid} | {request_id} | {miner_uid} | miner_response elapse_time={getattr(miner_response, 'elapse_time', None)}")
+
+            # Desearch: verify every proof and collect all response bodies
+            desearch_proof_valid = False
+            desearch_response_bodies: List[bytes] = []
+            if desearch_list:
+                coldkey = ""
+                if hasattr(self.metagraph, "coldkeys") and miner_uid < len(self.metagraph.coldkeys):
+                    coldkey = self.metagraph.coldkeys[miner_uid]
+                else:
+                    neuron_obj = self.metagraph.neurons[miner_uid]
+                    coldkey = getattr(neuron_obj, "coldkey", "") or ""
+                if not coldkey:
+                    bt.logging.warning(f"{self.my_uid} | {request_id} | {miner_uid} | No coldkey for miner, Desearch proof invalid")
+                else:
+                    all_valid = True
+                    for d in desearch_list:
+                        if not d or not getattr(d, "response_body", None) or not getattr(d, "proof", None):
+                            all_valid = False
+                            break
+                        try:
+                            body_bytes = base64.b64decode(d.response_body)
+                            ok = verify_proof(
+                                coldkey=coldkey,
+                                response_body=body_bytes,
+                                signature_hex=d.proof.signature,
+                                timestamp=d.proof.timestamp,
+                                expiry=d.proof.expiry,
+                            )
+                            if ok:
+                                desearch_response_bodies.append(body_bytes)
+                            else:
+                                all_valid = False
+                                break
+                        except Exception as e:
+                            bt.logging.warning(f"{self.my_uid} | {request_id} | {miner_uid} | Desearch proof verification failed: {e}")
+                            all_valid = False
+                            break
+                    desearch_proof_valid = all_valid and len(desearch_response_bodies) == len(desearch_list)
+            # When any proof failed, do not pass partial bodies: no desearch snippet may pass evidence-in-body
+            if not desearch_proof_valid:
+                desearch_response_bodies = []
+
+            # Create tasks
+            tasks = [
+                run_validate_miner_snippet(
+                    request_id=request_id,
+                    miner_uid=miner_uid,
+                    original_statement=statement,
+                    miner_evidence=miner_vericore_response,
+                    desearch_response_bodies=desearch_response_bodies,
+                ) for miner_vericore_response in miner_response.synapse.veridex_response[:MAX_MINER_RESPONSES]
+            ]
+
+            vericore_statement_responses = await asyncio.gather(*tasks)
+
+            # Log performance summary for snippet validation
+            snippet_times = [r.verify_miner_time_taken_secs for r in vericore_statement_responses if r.verify_miner_time_taken_secs > 0]
+            if snippet_times:
+                avg_time = sum(snippet_times) / len(snippet_times)
+                max_time = max(snippet_times)
+                slowest_url = next((r.url for r in vericore_statement_responses if r.verify_miner_time_taken_secs == max_time), "unknown")
+                bt.logging.info(
+                    f"{self.my_uid} | {request_id} | {miner_uid} | Snippet validation summary | "
+                    f"Count: {len(snippet_times)} | Avg: {avg_time:.3f}s | Max: {max_time:.3f}s | Slowest: {slowest_url[:50]}"
+                )
+
+            for ignored_miner_response in miner_response.synapse.veridex_response[MAX_MINER_RESPONSES:]:
+                timing = StatementResponseTiming()
+                vericore_statement_responses.append(
+                    VericoreStatementResponse(
+                        url=ignored_miner_response.url,
+                        excerpt=ignored_miner_response.excerpt,
+                        snippet_found=False,
+                        domain="",
+                        local_score=0.0,
+                        snippet_score=0.0,
+                        snippet_score_reason="too_many_snippets",
+                        category=EvidenceCategory.WEB,
+                        timing=timing,
+                    )
+                )
+
+            bt.logging.info(f"{self.my_uid} | {request_id} | {miner_uid} | Scoring Miner Statements Based on Snippets")
+
+            bt.logging.info(f"{self.my_uid} | {request_id} | {miner_uid} | Calculating miner scores")
+
+            # Per-domain count of how many times we've seen this domain so far (first use = no penalty, then 0.5, 0.25, ...)
+            domain_seen_count: dict[str, int] = {}
+
+            # Calculate the miner's statement score
+            sum_of_snippets = 0
+            social_bonus_total = 0.0
+            veridex_response = miner_response.synapse.veridex_response or []
+            for i, statement_response in enumerate(vericore_statement_responses):
+                if statement_response.snippet_found:
+                    evidence = veridex_response[i] if i < len(veridex_response) else None
+                    is_desearch = evidence is not None and evidence.source_type == SourceType.DESEARCH.value
+                    # Normalize domain for case-insensitive diversity and social checks (avoids bypass via e.g. Example.COM vs example.com)
+                    domain_lower = (statement_response.domain or "").lower()
+
+                    if is_desearch:
+                        is_social_domain = domain_lower in SOCIAL_BONUS_DOMAINS_X or domain_lower == SOCIAL_BONUS_DOMAIN_REDDIT_NAME
+                        if is_social_domain:
+                            # Desearch only: x.com, twitter.com, reddit.com get no duplicate-domain penalty; domain_factor = 1
+                            domain_factor = 1.0
+                        else:
+                            times_used = domain_seen_count.get(domain_lower, 0)
+                            domain_seen_count[domain_lower] = times_used + 1
+                            domain_factor = 1.0 / (2**times_used)
+                    else:
+                        # Web: first use 1.0, second 0.5, third 0.25; etc.
+                        times_used = domain_seen_count.get(domain_lower, 0)
+                        domain_seen_count[domain_lower] = times_used + 1
+                        domain_factor = 1.0 / (2**times_used)
+                    if statement_response.context_similarity_score < 0:
+                        statement_response.context_similarity_score = 0
+
+                    statement_response.snippet_score = (
+                        statement_response.local_score *
+                        # statement_response.context_similarity_score *
+                        domain_factor *
+                        statement_response.approved_url_multiplier
+                    )
+                    statement_response.domain_factor = domain_factor
+
+                    # Social bonus: desearch snippets only, and only when desearch proofs are valid; x.com/twitter.com → +1, reddit.com → +0.5
+                    if is_desearch and desearch_proof_valid:
+                            if domain_lower in SOCIAL_BONUS_DOMAINS_X:
+                                social_bonus_total += SOCIAL_BONUS_DOMAIN_X
+                                statement_response.social_bonus_contribution = SOCIAL_BONUS_DOMAIN_X
+                            elif domain_lower == SOCIAL_BONUS_DOMAIN_REDDIT_NAME:
+                                social_bonus_total += SOCIAL_BONUS_DOMAIN_REDDIT
+                                statement_response.social_bonus_contribution = SOCIAL_BONUS_DOMAIN_REDDIT
+
+                # Add score of all snippets
+                sum_of_snippets += statement_response.snippet_score
+
+            # Calculate final score considering speed factor
+            speed_factor = self.calculate_speed_factor(miner_response.elapse_time)
+
+            # Miner-level desearch proof bonus/penalty (applied once, not per snippet)
+            desearch_adjustment = 0
+            if desearch_list:
+                if desearch_proof_valid:
+                    desearch_adjustment = DESEARCH_PROOF_VALID_BONUS
+                else:
+                    desearch_adjustment = DESEARCH_PROOF_INVALID_PENALTY
+
+            bt.logging.info(f"{self.my_uid} | {request_id} | {miner_uid} | Calculated Speed Factor: {speed_factor} | Miner response: {miner_response.elapse_time}")
+            final_score = (sum_of_snippets * speed_factor) + desearch_adjustment + social_bonus_total
+            bt.logging.info(f"{self.my_uid} | {request_id} | {miner_uid} | Final Score: {final_score} | Sum Of Snippets: {sum_of_snippets} | Desearch Adjustment: {desearch_adjustment} | Social Bonus: {social_bonus_total}")
+            if is_test and is_nonsense and final_score > 0.5:
+                final_score -= 1.0
+
+            final_score = max(LOWEST_FINAL_SCORE, final_score)
+
+            bt.logging.info(f"{self.my_uid} | {request_id} | {miner_uid} | Calculated Final Score: {final_score}")
+
+            # Calculate miner-level performance stats
+            fetch_times = [r.fetch_page_time_taken_secs for r in vericore_statement_responses if r.fetch_page_time_taken_secs > 0]
+            ai_times = [r.assess_statement_time_taken_secs for r in vericore_statement_responses if r.assess_statement_time_taken_secs > 0]
+            total_fetch = sum(fetch_times)
+            total_ai = sum(ai_times)
+            total_snippet = sum(snippet_times) if snippet_times else 0
+            total_other = total_snippet - total_fetch - total_ai
+
+            miner_timing = MinerResponseTiming(
+                elapsed_time=miner_response.elapse_time,
+                total_fetch_time_secs=total_fetch,
+                total_ai_time_secs=total_ai,
+                total_other_time_secs=total_other,
+                avg_snippet_time_secs=sum(snippet_times) / len(snippet_times) if snippet_times else 0,
+                max_snippet_time_secs=max(snippet_times) if snippet_times else 0,
+                snippet_count=len(snippet_times),
+            )
+            miner_statement = VericoreMinerStatementResponse(
+                miner_hotkey=miner_hotkey,
+                miner_uid=miner_uid,
+                status="ok",
+                speed_factor=speed_factor,
+                final_score=final_score,
+                raw_score=sum_of_snippets,
+                elapsed_time=miner_response.elapse_time,
+                vericore_responses=vericore_statement_responses,
+                total_fetch_time_secs=total_fetch,
+                total_ai_time_secs=total_ai,
+                total_other_time_secs=total_other,
+                avg_snippet_time_secs=sum(snippet_times) / len(snippet_times) if snippet_times else 0,
+                max_snippet_time_secs=max(snippet_times) if snippet_times else 0,
+                snippet_count=len(snippet_times),
+                timing=miner_timing,
+                desearch_bonus_score=desearch_adjustment,
+                social_bonus_score=social_bonus_total,
+            )
+            return miner_statement
+        except Exception as e:
+            bt.logging.error(f"{self.my_uid} | {request_id} | {miner_uid} | An error has occurred: {e}")
+            # exception could have been from us?
+            miner_statement = VericoreMinerStatementResponse(
+                miner_hotkey=miner_hotkey,
+                miner_uid=miner_uid,
+                status="error",
+                raw_score=INVALID_RESPONSE_MINER_SCORE,
+                final_score=INVALID_RESPONSE_MINER_SCORE,
+            )
+            return miner_statement
+
+    def update_miner_selection_cache(self, vericore_responses: List[VericoreMinerStatementResponse]):
+        for miner_response in vericore_responses:
+            miner_selection = self.miner_cache[miner_response.miner_uid]
+            miner_selection.request_count += 1
+            miner_selection.scores += miner_response.final_score
+
+    def check_duplicate_miner_statements(self, request_id: str, responses: List[VericoreMinerStatementResponse]):
+        sorted_responses = sorted(responses, key=lambda miner_response: miner_response.elapsed_time)
+
+        seen_miner_ids = []
+
+        for source_miner in sorted_responses:
+
+            if source_miner.status == "ok":
+
+                for target_miner in sorted_responses:
+                    if source_miner.miner_uid == target_miner.miner_uid:
+                        continue
+
+                    if target_miner.status != "ok":
+                        continue
+
+                    if target_miner.miner_uid in seen_miner_ids:
+                        continue
+
+                    source_miner.vericore_responses = sorted(source_miner.vericore_responses, key=lambda x: x.url)
+                    target_miner.vericore_responses = sorted(target_miner.vericore_responses, key=lambda x: x.url)
+
+                    source_responses = source_miner.vericore_responses
+                    target_responses = target_miner.vericore_responses
+
+                    if len(source_responses) != len(target_responses):
+                        continue
+
+                    is_same = True
+
+                    for index, source_response in enumerate(source_responses):
+
+                        if len(target_responses) > 0:
+                            target_response = target_responses[index]
+                            if target_response.url != source_response.url:
+                                is_same = False
+                                break
+                            if target_response.excerpt != source_response.excerpt:
+                                is_same = False
+                                break
+                        else:
+                            break
+
+                    if is_same:
+                        bt.logging.warning(f"{self.my_uid} | {request_id} | Duplicate miner statement found: {target_miner.miner_uid} AND {source_miner.miner_uid}")
+                        # penalise target miner since elapsed is slower than source and has exact excerpt and url
+                        target_miner.status = "duplicate_miner_statements"
+                        target_miner.raw_score = DUPLICATE_EXACT_MINER_STATEMENTS
+                        target_miner.final_score = DUPLICATE_EXACT_MINER_STATEMENTS
+                        target_miner.speed_factor = 1
+                        # clear miner local scores
+
+            seen_miner_ids.append(source_miner.miner_uid)
+
+        return sorted_responses
+
+    async def handle_query(
+        self,
+        request_id: str,
+        statement: str,
+        sources: list,
+        is_test: bool = False,
+        is_nonsense: bool = False,
+    ) -> VericoreQueryResponse:
+        """
+        1. Query a subset of miners with the given statement.
+        2. Verify that each snippet is truly on the page.
+        3. Score the responses (apply domain factor, speed factor, etc.) and update
+           the local moving_scores.
+        4. Write the complete result (including final scores) to a uniquely named JSON file.
+        """
+        subset_miners = self.select_miner_subset(number_of_miners=NUMBER_OF_MINERS)
+
+        selected_miners = ' '.join(f'[{miner.miner_uid} / {miner.calculate_average_score()}]' for miner in subset_miners)
+        bt.logging.info(f"{self.my_uid} | {request_id} | Selected miners: {selected_miners}")
+
+        synapse = VericoreSynapse(
+            statement=statement, sources=sources, request_id=request_id
+        )
+
+        responses = await asyncio.gather(
+            *[
+                self.process_miner_request(request_id, selected_miner.neuron_info, synapse, statement, is_test, is_nonsense)
+                for selected_miner in subset_miners
+            ]
+        )
+
+        bt.logging.info(f"{self.my_uid} | {request_id} | Completed all miner requests")
+
+        bt.logging.info(f"{self.my_uid} | {request_id} | Checking duplicate miner statements")
+
+        # add for debug
+        # import copy
+        # test_miner = copy.deepcopy(responses[1])
+        # test_miner.miner_uid = 3
+        # test_miner.elapsed_time = 0.001
+        # responses.append(test_miner)
+
+        responses = self.check_duplicate_miner_statements(request_id, responses)
+
+        bt.logging.info(f"{self.my_uid} | {request_id} | Duplicate miner statement check complete")
+
+        response = VericoreQueryResponse(
+            status="ok",
+            validator_uid=self.my_uid,
+            validator_hotkey=self.wallet.hotkey.ss58_address,
+            request_id=request_id,
+            statement=statement,
+            sources=sources,
+            results=responses,
+        )
+
+        bt.logging.info(f"{self.my_uid} | {request_id} | Refreshing selection cache")
+
+        # Update miner selection score cache
+        self.update_miner_selection_cache(responses)
+
+        bt.logging.info(f"{self.my_uid} | {request_id} | Selection cache refreshed")
+
+        return response
+
+    def write_result_file(self, request_id: str, result: VericoreQueryResponse):
+        filename = os.path.join(self.results_dir, f"{request_id}.json")
+        try:
+            with open(filename, "w") as f:
+                json.dump(asdict(result), f)
+            bt.logging.info(f"{self.my_uid} | {request_id} | Wrote result file: {filename}")
+        except Exception as e:
+            bt.logging.error(f"Error writing result file {filename}: {e}")
+
+    def loading_miners(self, neurons: List[NeuronInfo]):
+        bt.logging.info(f"{self.my_uid} | {self.my_uid} | Loading Miners")
+        if self.miner_cache is None or len(self.miner_cache) == 0:
+            bt.logging.info(f"{self.my_uid} | {self.my_uid} | Loading brand new miners")
+            return [
+                MinerSelection(
+                    miner_uid=index,
+                    miner_hotkey=neuron.hotkey,
+                    neuron_info=neuron,
+                    scores=0,
+                    request_count=0,
+                    is_miner=not neuron.validator_permit,
+                )
+                for index, neuron in enumerate(neurons)
+            ]
+
+        bt.logging.info(f"{self.my_uid} | Checking new miners have been loaded ")
+        miner_cache_length = len(self.miner_cache)
+        new_miner_cache = list(self.miner_cache)
+        for index, neuron in enumerate(neurons):
+            if index < miner_cache_length:
+                miner_cache = new_miner_cache[index]
+                if miner_cache.miner_hotkey != neuron.hotkey:
+                    bt.logging.info(f"{self.my_uid} | New Miner found. Resetting miner selection for uid: {index}")
+                    miner_cache.miner_hotkey = neuron.hotkey
+                    miner_cache.scores = 0
+                    miner_cache.request_count = 0
+
+                miner_cache.is_miner = not neuron.validator_permit
+                # Always update neuron_info with fresh chain data
+                miner_cache.neuron_info = neuron
+            else:
+                bt.logging.info(f"{self.my_uid} | Creating new miner selection for uid: {index}")
+                miner_selection = MinerSelection(
+                    miner_uid=index,
+                    miner_hotkey=neuron.hotkey,
+                    neuron_info=neuron,
+                    scores=0,
+                    request_count=0,
+                    is_miner=not neuron.validator_permit,
+                )
+                new_miner_cache.append(miner_selection)
+
+        return new_miner_cache
+
+    def refresh_miner_cache(self):
+        current_time = time.time()
+        if  (current_time - self.last_refresh_time) > REFRESH_INTERVAL_SECONDS:
+            bt.logging.info(f"{self.my_uid} | Refreshing metagraph")
+            self.metagraph.sync()  # Fetch new data
+            neurons = self.subtensor.neurons(netuid=self.config.netuid)
+            bt.logging.debug(f"{self.my_uid} | Found {len(neurons)} neurons")
+            self.miner_cache = self.loading_miners(neurons)
+            bt.logging.info(f"{self.my_uid} | Found {len(self.miner_cache)} miners")
+            self.last_refresh_time = current_time
+
+    def get_weighted_miners(self, miners):
+        weights = []
+
+        score_range = MAX_CLAMP_SCORE - MIN_CLAMP_SCORE
+        for miner_selection in miners:
+            miner_uid = miner_selection.miner_uid
+            raw_score = miner_selection.calculate_average_score()
+
+            # Clamp and normalize
+            clamped_score = max(MIN_CLAMP_SCORE, min(raw_score, MAX_CLAMP_SCORE))  # [-5, 10]
+            normalized = (clamped_score - MIN_CLAMP_SCORE) / score_range  # maps to [0, 1]
+            weight = MIN_WEIGHT + normalized * (MAX_WEIGHT - MIN_WEIGHT)
+
+            # Treat miners with few requests as "new" and give bonus
+            if miner_selection.request_count < IMMUNITY_PERIOD:
+                # if taper bonus - more the request - the less of a bonus
+                # bonus = NEW_MINER_BONUS * (IMMUNITY_PERIOD - miner_selection.request_count) / IMMUNITY_PERIOD
+                # Allow new miners to be called more
+                bonus = NEW_MINER_BONUS
+                weight += bonus
+
+            weights.append((miner_uid, weight))
+
+        total_weight = sum(weight for _, weight in weights)
+        # not sure if this is needed
+        if total_weight == 0:
+            return [(m, 1.0 / len(weights)) for m, _ in weights]  # fallback: equal chance
+
+        adjusted_weights = [(m, (1 - EXPLORATION_FACTOR) * w / total_weight) for m, w in weights]
+        equal_chance = EXPLORATION_FACTOR / len(weights)
+        final_weights = [(miner_uid, weight + equal_chance) for miner_uid, weight in adjusted_weights]
+
+        return final_weights
+
+    def select_miner(self, weighted_miners, number_of_miners=5):
+        miner_ids, probs = zip(*weighted_miners)
+        return random.choices(miner_ids, weights=probs, k=number_of_miners)
+
+    def select_miner_subset(self, number_of_miners=5) -> List[MinerSelection]:
+        self.refresh_miner_cache()
+
+        bt.logging.info(f"{self.my_uid} | Selecting miner subset")
+
+        # Only consider miners (exclude validators) for sending requests
+        all_miners = [m for m in self.miner_cache if m.is_miner]
+
+        if len(all_miners) <= number_of_miners:
+            return all_miners
+
+        # calculate the weights
+        weighted_miners = self.get_weighted_miners(all_miners)
+
+        bt.logging.info(f"{self.my_uid} | Weights calculated for miners")
+
+        # select the miners by uid based on the weights
+        selected_miner_uids = self.select_miner(weighted_miners, number_of_miners)
+
+        # get MinerSelection for each selected uid (weighted_miners are (miner_uid, weight))
+        selected_miners = [next(m for m in all_miners if m.miner_uid == uid) for uid in selected_miner_uids]
+
+        null_miners = [miner for miner in selected_miners if miner.neuron_info.axon_info is None or not miner.neuron_info.axon_info.is_serving]
+
+        if null_miners:
+            bt.logging.warning(f"{self.my_uid} | Detected {len(null_miners)} miners with null axons. Fetching replacements...")
+
+            available_replacement_ids = [miner.miner_uid for miner in all_miners if miner not in selected_miners and miner.neuron_info.axon_info is not None and miner.neuron_info.axon_info.is_serving]
+
+            # Add replacements for the miners that have null axons
+            for i, null_miner in enumerate(null_miners):
+                if available_replacement_ids:
+                    available_replacements = [weighted_miner for weighted_miner in weighted_miners if weighted_miner[0] in available_replacement_ids]
+                    replacement_miner_uids = self.select_miner(available_replacements, 1)
+                    if len(replacement_miner_uids) != 0:
+                        replacement_miner_uid = replacement_miner_uids[0]
+                        selected_miner_uids.append(replacement_miner_uid)
+                        available_replacement_ids.remove(replacement_miner_uid)
+                else:
+                    break
+
+        bt.logging.info(f"{self.my_uid} | Selected {len(selected_miner_uids)} miners with {len(null_miners)} null axons")
+
+        # recalculate all miners to be returned
+        selected_miners = [next(m for m in all_miners if m.miner_uid == uid) for uid in selected_miner_uids]
+
+        return selected_miners
+
+    def _hotkey_to_uid(self, hotkey: str) -> int:
+        if hotkey in self.metagraph.hotkeys:
+            return self.metagraph.hotkeys.index(hotkey)
+        return None
+
+###############################################################################
+# Set up FastAPI server
+###############################################################################
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    bt.logging.info("Application is starting...")
+    await startup_event()
+    yield  # This keeps the app running
+    bt.logging.info("Application is shutting down...")
+
+
+app = FastAPI(title="Vericore API Server", lifespan=lifespan)
+
+# DEBUG ONLY
+# Allowed origins (domains that can access the API)
+# origins = [
+#     "http://localhost:4200",  # Allow local frontend apps
+# ]
+origins = [
+    "*",
+]
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,  # Allowed origins
+    allow_credentials=True,  # Allow sending cookies (useful for auth)
+    allow_methods=["*"],  # Allow all HTTP methods
+    allow_headers=["*"],  # Allow all headers
+)
+
+
+# JWT auth: require Bearer token on all endpoints except /version and OPTIONS (CORS preflight)
+VALIDATOR_PROXY_SUB = "validator_proxy"
+
+
+class JWTAuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path == "/version":
+            return await call_next(request)
+        # OPTIONS preflight requests do not send Authorization; let them through so CORSMiddleware can respond
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
+        auth = request.headers.get("Authorization")
+        if not auth:
+            bt.logging.warning(
+                f"JWT auth: 401 for {request.url.path} — Authorization header missing"
+            )
+            return JSONResponse(
+                content={"detail": "Missing or invalid Authorization"},
+                status_code=401,
+            )
+        if not auth.startswith("Bearer "):
+            bt.logging.warning(
+                f"JWT auth: 401 for {request.url.path} — Authorization header present but not Bearer (prefix: {auth[:20]!r}...)"
+            )
+            return JSONResponse(
+                content={"detail": "Missing or invalid Authorization"},
+                status_code=401,
+            )
+        token = auth[7:].strip()
+        if not token:
+            bt.logging.warning(
+                f"JWT auth: 401 for {request.url.path} — Bearer scheme with empty token"
+            )
+            return JSONResponse(
+                content={"detail": "Missing or invalid Authorization"},
+                status_code=401,
+            )
+        bt.logging.info(
+            f"JWT auth: Bearer token received for {request.url.path} (token length={len(token)})"
+        )
+        if not VALIDATOR_JWT_PUBLIC_KEY:
+            bt.logging.warning("JWT auth: 503 — server not configured (no public key); rejecting")
+            return JSONResponse(
+                content={"detail": "Server auth not configured"},
+                status_code=503,
+            )
+        try:
+            payload = jwt.decode(
+                token,
+                VALIDATOR_JWT_PUBLIC_KEY,
+                algorithms=[VALIDATOR_JWT_ALGORITHM],
+            )
+            if payload.get("sub") != VALIDATOR_PROXY_SUB:
+                bt.logging.warning(
+                    f"JWT auth: 401 for {request.url.path} — invalid sub: got {payload.get('sub')!r}, expected {VALIDATOR_PROXY_SUB!r}"
+                )
+                return JSONResponse(
+                    content={"detail": "Invalid or expired token"},
+                    status_code=401,
+                )
+            # Expose linked wallet (if present) for endpoints that need wallet attribution
+            request.state.linked_wallet = get_linked_wallet_from_payload(payload)
+        except jwt.ExpiredSignatureError as e:
+            bt.logging.warning(
+                f"JWT auth: 401 for {request.url.path} — token expired: {e}"
+            )
+            return JSONResponse(
+                content={"detail": "Invalid or expired token"},
+                status_code=401,
+            )
+        except jwt.InvalidSignatureError as e:
+            bt.logging.warning(
+                f"JWT auth: 401 for {request.url.path} — invalid signature (wrong key or tampered): {e}"
+            )
+            return JSONResponse(
+                content={"detail": "Invalid or expired token"},
+                status_code=401,
+            )
+        except jwt.InvalidAlgorithmError as e:
+            bt.logging.warning(
+                f"JWT auth: 401 for {request.url.path} — algorithm not allowed: {e}. "
+                f"For RS256/RS384/RS512 ensure 'cryptography' is installed (pip install cryptography)."
+            )
+            return JSONResponse(
+                content={"detail": "Invalid or expired token"},
+                status_code=401,
+            )
+        except jwt.DecodeError as e:
+            bt.logging.warning(
+                f"JWT auth: 401 for {request.url.path} — decode error: {e}"
+            )
+            return JSONResponse(
+                content={"detail": "Invalid or expired token"},
+                status_code=401,
+            )
+        except jwt.InvalidTokenError as e:
+            bt.logging.warning(
+                f"JWT auth: 401 for {request.url.path} — {type(e).__name__}: {e}"
+            )
+            return JSONResponse(
+                content={"detail": "Invalid or expired token"},
+                status_code=401,
+            )
+        bt.logging.info(f"JWT auth: valid JWT accepted for {request.url.path}")
+        return await call_next(request)
+
+
+app.add_middleware(JWTAuthMiddleware)
+
+
+# Create the APIQueryHandler during startup and store it in app.state.
+async def startup_event():
+    if not VALIDATOR_JWT_PUBLIC_KEY:
+        bt.logging.warning(
+            "JWT public key not set (set VALIDATOR_JWT_PUBLIC_KEY or "
+            "VALIDATOR_JWT_PUBLIC_KEY_FILE); protected endpoints will return 503."
+        )
+    print("startup_event")
+    app.state.handler = APIQueryHandler()
+    print("APIQueryHandler instance created at startup.")
+
+@app.get("/version")
+async def version():
+    return VERICORE_VALIDATOR_VERSION
+
+@app.post("/veridex_query")
+async def veridex_query(request: Request):
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+    statement = data.get("statement")
+    sources = data.get("sources", [])
+    if not statement:
+        raise HTTPException(status_code=400, detail="Missing 'statement'")
+
+    # Check if request_id is passed. If so, use that id instead of generating id
+    request_id = data.get("request_id")
+    if request_id is None:
+        request_id = f"req-{random.getrandbits(32):08x}"
+
+    handler = app.state.handler
+    start_time = time.perf_counter()
+    result: VericoreQueryResponse = await handler.handle_query(request_id, statement, sources)
+    end_time = time.perf_counter()
+    duration = end_time - start_time
+
+    # Set latest timestamp
+    result.timestamp = time.time()
+    result.total_elapsed_time = duration
+
+    # Aggregate performance stats from all miners
+    result.miner_count = len(result.results)
+    result.total_snippet_count = sum(m.snippet_count for m in result.results)
+    result.total_fetch_time_secs = sum(m.total_fetch_time_secs for m in result.results)
+    result.total_ai_time_secs = sum(m.total_ai_time_secs for m in result.results)
+    result.total_other_time_secs = sum(m.total_other_time_secs for m in result.results)
+
+    all_snippet_times = [
+        r.verify_miner_time_taken_secs
+        for m in result.results
+        for r in m.vericore_responses
+        if r.verify_miner_time_taken_secs > 0
+    ]
+    result.avg_snippet_time_secs = sum(all_snippet_times) / len(all_snippet_times) if all_snippet_times else 0
+    result.max_snippet_time_secs = max(all_snippet_times) if all_snippet_times else 0
+
+    result.timing = QueryResponseTiming(
+        total_elapsed_time=result.total_elapsed_time,
+        timestamp=result.timestamp,
+        total_fetch_time_secs=result.total_fetch_time_secs,
+        total_ai_time_secs=result.total_ai_time_secs,
+        total_other_time_secs=result.total_other_time_secs,
+        avg_snippet_time_secs=result.avg_snippet_time_secs,
+        max_snippet_time_secs=result.max_snippet_time_secs,
+        total_snippet_count=result.total_snippet_count,
+        miner_count=result.miner_count,
+    )
+
+    # Log request-level performance summary
+    bt.logging.info(
+        f"{request_id} | Request complete | Duration: {duration:.3f}s | Miners: {result.miner_count} | "
+        f"Snippets: {result.total_snippet_count} | SnippetAvg: {result.avg_snippet_time_secs:.3f}s | SnippetMax: {result.max_snippet_time_secs:.3f}s"
+    )
+
+    handler.write_result_file(request_id, result)
+
+    return JSONResponse(asdict(result))
+
+if __name__ == "__main__":
+    import uvicorn
+
+    parser = get_parser()
+    parser.add_argument("--port", type=int, default=8080, help="Port to bind (default: 8080)")
+    args = parser.parse_args()
+
+    # Run uvicorn with one worker to ensure a single instance of APIQueryHandler.
+    uvicorn.run(
+        "validator.api_server:app",
+        host="0.0.0.0",
+        port=args.port,
+        reload=False,
+        timeout_keep_alive=500,
+        workers=1,
+    )

@@ -1,0 +1,19 @@
+Agent-Access: allowed
+
+Name: Constantinople
+Description: Decentralized LLM inference on Bittensor Subnet 97
+
+Model: Qwen/Qwen2.5-7B-Instruct
+API: https://api.constantinople.cloud/v1
+Auth: Bearer token (prefix: cst-)
+Cost: $0.50/1M input tokens, $1.50/1M output tokens (1.0 free credits on signup)
+
+Capabilities:
+- chat
+- completions
+- streaming
+- embeddings
+
+Get API key: https://www.constantinople.cloud/#api
+Docs: /SKILL.md
+Manifest: /.well-known/inference.json

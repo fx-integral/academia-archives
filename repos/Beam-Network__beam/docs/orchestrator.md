@@ -1,0 +1,622 @@
+# BEAM Orchestrator (Miner) Onboarding Guide
+
+Complete guide for setting up and running a BEAM Network orchestrator on Bittensor Subnet 304 (testnet) or Subnet 105 (mainnet).
+
+## Table of Contents
+
+1. [Overview](#overview)
+2. [Hardware Requirements](#hardware-requirements)
+3. [Software Stack](#software-stack)
+4. [Prerequisites](#prerequisites)
+5. [Installation](#installation)
+6. [Configuration](#configuration)
+7. [Running the Orchestrator](#running-the-orchestrator)
+8. [Worker Management](#worker-management)
+9. [Monitoring and Maintenance](#monitoring-and-maintenance)
+10. [Troubleshooting](#troubleshooting)
+11. [Economics and Rewards](#economics-and-rewards)
+
+---
+
+## Overview
+
+### What is an Orchestrator?
+
+In the BEAM Network, orchestrators are the "miners" on Bittensor. Unlike traditional mining, orchestrators coordinate bandwidth work rather than computing hashes.
+
+### Architecture (BeamCore V2)
+
+This repository speaks to **BeamCore V2** ([`beamcore_v2`](https://github.com/Beam-Network/beamcore_v2)): **core-server** (HTTP API + control plane, port **8000**), **orch-gateway** (orchestrator WebSocket edge, **8002**), and **worker-gateway** (worker WebSocket edge, **8001**). See BeamCore’s `README.md` and `docs/docs/architecture.md` for the canonical diagram.
+
+**Logical paths**
+
+- **Clients / validators** → `core-server` over HTTP.
+- **You (orchestrator)** ↔ `orch-gateway` over WebSocket; the gateway relays to core-server’s upstream relay — assignments and control-plane traffic are **push-style over WS**, not periodic HTTP polling for assignments.
+- **Workers** ↔ `worker-gateway` over WebSocket for task offers. Beam may host a shared worker-gateway; operators can also run an **orchestrator-owned** worker gateway URL registered with BeamCore.
+- **Bytes** move directly between storage connectors; **they do not pass through** core-server.
+
+**Execution pipeline in BeamCore:** `transfers → transfer_assignments → tasks → task_results → proofs_of_bandwidth → payments`. Task states: `pending → offered → in_progress → completed | failed | cancelled`.
+
+**PRISM:** orchestrator routing uses **qualifying** vs **qualified** pools and `prism_final_score`; confidence gates full production routing (BeamCore docs).
+
+**End-to-end flow (simplified)**
+
+1. Client creates a transfer on **core-server** (HTTP).
+2. Control plane assigns chunks to orchestrators (PostgreSQL authoritative state; redistribution / guardrail timers in BeamCore).
+3. Your node keeps the **orch-gateway** session alive and receives work; you **offer** tasks to workers over **worker-gateway** paths.
+4. Workers execute chunk transfers and POST **payment / PoB evidence** to **core-server** HTTP.
+5. Validators read metrics / PRISM inputs from BeamCore and set weights on chain; emissions follow Bittensor epochs.
+
+**This orchestrator is responsible for**
+
+1. **orch-gateway connectivity** — reconnect promptly; disconnects risk reassignment.
+2. **Worker pool** — route offers, track accept/reject/completion as implemented in this codebase.
+3. **Reporting** — payment epochs and orchestrator-facing reports as wired to BeamCore HTTP.
+4. **Pool quality** — ultimately reflected in PRISM (throughput, reliability, performance, readiness/confidence, penalties).
+
+> **Note:** Workers use the **worker-gateway** URL (`BUFFER_URL` in worker env), not core-server port 8000, for WebSocket task delivery. That gateway may be Beam-operated or your own; both are valid in BeamCore V2.
+
+### Network Information
+
+| Network | Subnet UID | Subtensor | BeamCore URL                |
+| ------- | ---------- | --------- | --------------------------- |
+| Testnet | 304        | `test`    | https://beamcore-dev.b1m.ai |
+| Mainnet | 105        | `finney`  | https://beamcore.b1m.ai     |
+
+---
+
+## Hardware Requirements
+
+### Minimum Requirements
+
+| Component | Minimum    | Recommended         |
+| --------- | ---------- | ------------------- |
+| CPU       | 4 cores    | 8+ cores            |
+| RAM       | 8 GB       | 16 GB               |
+| Storage   | 100 GB SSD | 250 GB NVMe SSD     |
+| Network   | 100 Mbps   | 1 Gbps+             |
+| Public IP | Required   | Static IP preferred |
+
+### Why These Requirements?
+
+- **CPU**: Task scheduling, proof verification, and API handling
+- **RAM**: Worker state management, proof aggregation, metagraph sync
+- **Storage**: Proof storage, logs, database (if local)
+- **Network**: Must handle API requests and BeamCore communication
+- **Public IP**: BeamCore needs to reach your orchestrator for health checks
+
+---
+
+## Software Stack
+
+### Required
+
+| Software  | Version | Purpose                |
+| --------- | ------- | ---------------------- |
+| Python    | 3.10+   | Runtime                |
+| Bittensor | 8.0+    | Blockchain interaction |
+| Git       | 2.0+    | Code deployment        |
+
+### Optional
+
+| Software             | Version | Purpose                              |
+| -------------------- | ------- | ------------------------------------ |
+| Redis                | 7+      | Caching (recommended for production) |
+| Prometheus + Grafana | -       | Monitoring                           |
+| systemd              | -       | Process management                   |
+| nginx                | -       | Reverse proxy with SSL               |
+
+### Operating System
+
+- Ubuntu 22.04 LTS (recommended)
+- Debian 12
+- Ubuntu 24.04 LTS
+
+---
+
+## Prerequisites
+
+### 1. Bittensor Wallet Setup
+
+You need a Bittensor wallet with:
+
+- A coldkey (keeps your TAO safe)
+- A hotkey (used for signing, stays on server)
+
+```bash
+# Install bittensor CLI
+pip install bittensor
+
+# Create wallet
+btcli wallet new_coldkey --wallet.name orchestrator
+btcli wallet new_hotkey --wallet.name orchestrator --wallet.hotkey default
+```
+
+### 2. Register on Subnet as Miner
+
+Orchestrators register as "miners" on the Bittensor subnet:
+
+**Testnet:**
+
+```bash
+btcli subnet register --netuid 304 --subtensor.network test \
+    --wallet.name orchestrator --wallet.hotkey default
+```
+
+**Mainnet:**
+
+```bash
+btcli subnet register --netuid 105 --subtensor.network finney \
+    --wallet.name orchestrator --wallet.hotkey default
+```
+
+### 3. Verify Registration and Get Your UID
+
+```bash
+btcli wallet overview --wallet.name orchestrator --subtensor.network test
+```
+
+You should see your UID (2-151 for public orchestrators).
+
+### 4. Prepare Hotkey for Server Use
+
+For automated deployments, use an unencrypted hotkey:
+
+```bash
+btcli wallet regen-hotkey \
+  --wallet.name orchestrator \
+  --wallet.hotkey default \
+  --no-use-password \
+  --overwrite
+
+# Secure file permissions
+chmod 600 ~/.bittensor/wallets/orchestrator/hotkeys/default
+```
+
+---
+
+## Installation
+
+### Option A: Direct Installation
+
+```bash
+# 1. Clone repository
+git clone https://github.com/Beam-Network/beam.git
+cd beam
+
+# 2. Create virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
+
+# 3. Install dependencies
+pip install -e .
+
+# 4. Navigate to orchestrator
+cd neurons/orchestrator
+```
+
+### Option B: systemd Service (Production)
+
+Use a checkout layout with `.venv` at the repository root and `neurons/orchestrator/`. Substitute `/srv/beam` below for your deploy path unless you regenerate paths via templating (`systemd` unit files **do not** expand shell variables literally).
+
+Create `/etc/systemd/system/beam-orchestrator.service`:
+
+```ini
+[Unit]
+Description=BEAM Orchestrator
+After=network.target redis.service
+
+[Service]
+Type=simple
+User=beam
+WorkingDirectory=/srv/beam/neurons/orchestrator
+Environment="PATH=/srv/beam/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/srv/beam/neurons/orchestrator/.env
+ExecStart=/srv/beam/.venv/bin/python main.py
+Restart=always
+RestartSec=10
+
+# Security
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/srv/beam /var/log/beam /tmp/beam_logs
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable beam-orchestrator
+sudo systemctl start beam-orchestrator
+```
+
+---
+
+## Configuration
+
+### Environment Variables
+
+Create `.env` in `neurons/orchestrator/`:
+
+```bash
+# =============================================================================
+# API SERVER
+# =============================================================================
+ORCHESTRATOR_HOST=0.0.0.0
+API_PORT=8000
+LOG_LEVEL=INFO
+
+# =============================================================================
+# BITTENSOR WALLET (Required)
+# =============================================================================
+WALLET_NAME=orchestrator
+WALLET_HOTKEY=default
+
+# =============================================================================
+# SUBNET CONFIGURATION
+# =============================================================================
+# Testnet
+NETUID=304
+SUBTENSOR_NETWORK=test
+
+# Mainnet (uncomment for production)
+# NETUID=105
+# SUBTENSOR_NETWORK=finney
+
+# =============================================================================
+# BEAMCORE API (Required)
+# =============================================================================
+# Testnet
+SUBNET_CORE_URL=https://beamcore-dev.b1m.ai
+ORCH_GATEWAY_URL=https://orch-gateway-dev.b1m.ai
+
+# Mainnet (uncomment for production)
+# SUBNET_CORE_URL=https://beamcore.b1m.ai
+# ORCH_GATEWAY_URL=https://orch-gateway.b1m.ai
+
+# =============================================================================
+# WORKER MANAGEMENT
+# =============================================================================
+MAX_WORKERS=10000
+WORKER_TIMEOUT=300
+MIN_WORKER_BANDWIDTH=10.0
+
+# =============================================================================
+# TASK SETTINGS
+# =============================================================================
+CHUNK_SIZE=1048576
+MAX_CONCURRENT_TASKS=1000
+TASK_TIMEOUT=120
+
+# =============================================================================
+# AUTHENTICATION
+# =============================================================================
+# Subnet auth (validators/workers)
+SUBNET_AUTH_ENABLED=true
+SUBNET_AUTH_REQUIRE_METAGRAPH=true
+
+# Client auth
+CLIENT_AUTH_ENABLED=true
+
+# =============================================================================
+# REDIS (Required for production)
+# =============================================================================
+REDIS_URL=redis://localhost:6379
+
+# =============================================================================
+# METAGRAPH
+# =============================================================================
+METAGRAPH_SYNC_INTERVAL=300
+
+```
+
+### Configuration Reference
+
+| Variable                  | Default        | Description                             |
+| ------------------------- | -------------- | --------------------------------------- |
+| `API_PORT`                | `8000`         | API port                                |
+| `WALLET_NAME`             | `orchestrator` | Bittensor wallet name                   |
+| `NETUID`                  | `304`          | Subnet UID                              |
+| `SUBNET_CORE_URL`         | Required       | BeamCore registration/auth endpoint     |
+| `ORCH_GATEWAY_URL`        | Required       | Orchestrator gateway WebSocket endpoint |
+| `MAX_WORKERS`             | `10000`        | Max workers to accept                   |
+| `WORKER_TIMEOUT`          | `300`          | Worker heartbeat timeout (seconds)      |
+| `METAGRAPH_SYNC_INTERVAL` | `300`          | Metagraph sync interval (seconds)       |
+
+Direct BeamCore HTTP is limited to orchestrator registration and auth bootstrap. Runtime orchestrator traffic uses `orch-gateway` only.
+
+### Firewall Configuration
+
+```bash
+# Orchestrator API
+sudo ufw allow 8000/tcp
+
+# Redis (if external)
+sudo ufw allow 6379/tcp
+
+# Optional: Prometheus metrics
+sudo ufw allow 9090/tcp
+```
+
+---
+
+## Running the Orchestrator
+
+### Start the Orchestrator
+
+```bash
+cd neurons/orchestrator
+source ../.venv/bin/activate
+
+python main.py
+```
+
+### Verify It's Running
+
+1. **Health check:**
+
+```bash
+curl http://localhost:8000/health
+```
+
+Expected:
+
+```json
+{
+	"status": "healthy",
+	"uid": 5,
+	"hotkey": "5Gk...",
+	"workers": 0,
+	"active_tasks": 0
+}
+```
+
+2. **Check state:**
+
+```bash
+curl http://localhost:8000/state | jq
+```
+
+3. **View logs:**
+
+```bash
+tail -f /tmp/beam_logs/orchestrator.log
+```
+
+### Expected Startup Sequence
+
+```
+INFO | Starting BEAM Orchestrator...
+INFO | Wallet: orchestrator/default
+INFO | Network: test (netuid: 304)
+INFO | Syncing metagraph...
+INFO | Metagraph synced: 10 neurons
+INFO | Orchestrator UID: 5
+INFO | BeamCore connection: https://beamcore-dev.b1m.ai
+INFO | Starting API server on 0.0.0.0:8000
+INFO | Ready to accept workers
+```
+
+---
+
+## Worker Management
+
+### How Workers Connect
+
+Workers connect to a **worker-gateway** WebSocket (env: worker `BUFFER_URL`). That gateway may be the **shared Beam worker-gateway** or an **orchestrator-owned** gateway URL registered with BeamCore — not the core-server HTTP port (8000).
+
+```
+Worker → WebSocket → worker-gateway → (BeamCore internal relay) → task offers
+Worker → HTTP → core-server — PoB / payment evidence posted here
+```
+
+### Attracting Workers
+
+Workers affiliate with orchestrators based on:
+
+1. **Uptime** - Reliable orchestrators get more tasks assigned
+2. **Performance** - BeamCore routes more chunks to orchestrators with higher Prism scores
+3. **Geographic Coverage** - Workers in diverse regions improve performance
+
+### Monitoring Workers
+
+```bash
+# Worker stats
+curl http://localhost:8000/workers/stats | jq
+
+# Full orchestrator state
+curl http://localhost:8000/state | jq
+```
+
+---
+
+## Monitoring and Maintenance
+
+### Health Endpoints
+
+| Endpoint             | Description             |
+| -------------------- | ----------------------- |
+| `GET /health`        | Basic health status     |
+| `GET /state`         | Full orchestrator state |
+| `GET /metrics`       | Prometheus metrics      |
+| `GET /metrics/json`  | JSON metrics            |
+| `GET /workers/stats` | Worker statistics       |
+
+### Key Metrics to Monitor
+
+1. **Worker Count** - Should grow over time
+2. **Task Success Rate** - Target 95%+
+3. **Payment Success** - All workers should be paid
+4. **Wallet Balance** - Keep funded for worker payments
+
+### Log Locations
+
+| Log          | Location                             |
+| ------------ | ------------------------------------ |
+| Orchestrator | `/tmp/beam_logs/orchestrator.log`    |
+| systemd      | `journalctl -u beam-orchestrator -f` |
+
+### Wallet Balance Management
+
+Your orchestrator pays workers from its wallet. Keep it funded:
+
+```bash
+# Check balance
+btcli wallet balance --wallet.name orchestrator
+
+# Transfer TAO to orchestrator hotkey
+btcli wallet transfer --dest {orchestrator_hotkey} --amount 10
+```
+
+**Payment retry system:**
+
+- Failed payments are queued and retried every 60 seconds
+- Up to 5 retry attempts per payment
+- After 5 failures, payment is dropped (validator penalty applies)
+
+### Updating the Orchestrator
+
+```bash
+cd beam
+git pull origin main
+
+# Restart
+sudo systemctl restart beam-orchestrator
+```
+
+---
+
+## Troubleshooting
+
+### Common Issues
+
+#### 1. "Hotkey not registered"
+
+```
+ERROR | Hotkey not registered on subnet 304
+```
+
+**Solution:** Register as a miner:
+
+```bash
+btcli subnet register --netuid 304 --subtensor.network test \
+    --wallet.name orchestrator --wallet.hotkey default
+```
+
+#### 2. "Enter your password" at startup
+
+The hotkey is encrypted.
+
+**Solution:** Regenerate without encryption:
+
+```bash
+btcli wallet regen-hotkey --wallet.name orchestrator \
+    --wallet.hotkey default --no-use-password --overwrite
+```
+
+#### 3. "BeamCore connection failed"
+
+```
+ERROR | Failed to connect to BeamCore
+```
+
+**Solutions:**
+
+- Verify `SUBNET_CORE_URL` is correct
+- Check network connectivity: `curl https://beamcore-dev.b1m.ai/health`
+
+#### 4. No tasks being assigned
+
+**Solutions:**
+
+- Verify BeamCore connection is working
+- Ensure orchestrator is registered on the subnet
+- Check logs for **orch-gateway** WebSocket errors, registration, and assignment handling
+
+#### 5. Worker payments failing
+
+```
+WARNING | Payment failed: insufficient balance
+```
+
+**Solutions:**
+
+- Add TAO to orchestrator wallet
+- Check payment retry queue
+- Verify wallet hotkey is accessible
+
+### Debug Mode
+
+```bash
+LOG_LEVEL=DEBUG python main.py
+```
+
+---
+
+## Economics and Rewards
+
+### How Orchestrators Earn
+
+```
+Bittensor Emissions
+        │
+        ▼
+Validator sets weights based on Prism performance score
+        │
+        ▼
+Orchestrator receives emissions
+        │
+        └─► Workers (paid per completed task)
+```
+
+### Performance Scoring (Prism)
+
+BeamCore scores orchestrators using the Prism engine, which computes a routing score from real task outcomes over a 24-hour window:
+
+| Metric               | Description                            |
+| -------------------- | -------------------------------------- |
+| Task success rate    | Completed vs total tasks               |
+| Bandwidth throughput | Average Mbps across workers            |
+| Reassignment rate    | Tasks handed off due to worker failure |
+| Timeout rate         | Tasks that exceeded deadline           |
+| Payment compliance   | Epoch payments submitted and verified  |
+
+Validators read these scores from BeamCore and set on-chain weights accordingly. Higher scores → more chunk assignments → more emissions.
+
+### Maximizing Rewards
+
+1. **Maintain high uptime** (99%+)
+2. **Attract quality workers** with reliable infrastructure
+3. **Keep wallet funded** for worker payments
+4. **Use reliable infrastructure** (low latency, good bandwidth)
+5. **Monitor and fix issues quickly**
+
+---
+
+## Quick Start Checklist
+
+- [ ] Server meets hardware requirements
+- [ ] Python 3.10+, Redis installed
+- [ ] Bittensor wallet created
+- [ ] Registered as miner on subnet (304 or 105)
+- [ ] Hotkey unencrypted for server use
+- [ ] Repository cloned and dependencies installed
+- [ ] `.env` configured correctly
+- [ ] Orchestrator started and health check passes
+- [ ] BeamCore connection working (check logs)
+- [ ] Wallet funded for worker payments
+
+---
+
+## Support
+
+- **Documentation**: https://github.com/Beam-Network/beam
+- **Discord**: [BEAM Network Discord](https://discord.gg/beam-network)
+- **GitHub Issues**: For bug reports and feature requests
+
+---
+
+_Last updated: March 2026_

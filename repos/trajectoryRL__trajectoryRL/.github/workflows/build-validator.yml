@@ -1,0 +1,75 @@
+# Build and push validator Docker image to GHCR
+#
+# All-in-one image: validator + mock-tools + agent gateway.
+# Multi-stage build bundles with Python runtime.
+#
+# Triggers:
+#   - push to staging branch → image tags: staging, sha-<commit>
+#   - push tag v*   (prod)   → image tags: latest,  sha-<commit>, <git-tag>
+#
+# Deploy to prod:
+#   git tag v1.0.0
+#   git push origin v1.0.0
+#
+# Watchtower on validator machines auto-pulls the relevant tag.
+
+name: Build Validator Image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [staging]
+    paths:
+      - "neurons/**"
+      - "trajectoryrl/**"
+      - "docker/**"
+      - "pyproject.toml"
+      - ".github/workflows/**"
+    tags:
+      - "v*"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: trajectoryrl/trajectoryrl
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ startsWith(github.ref, 'refs/tags/') && 'latest' || 'staging' }}
+            type=ref,event=tag
+            type=sha,prefix=
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.validator
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

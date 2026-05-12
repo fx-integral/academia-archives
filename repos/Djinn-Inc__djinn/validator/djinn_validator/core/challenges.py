@@ -1,0 +1,1448 @@
+"""Miner challenge system — cross-miner consensus scoring.
+
+Each epoch, the validator:
+1. Picks an active sport and fetches live games from ESPN (free, no API key)
+2. Constructs a challenge from real games + synthetic lines
+3. Sends the SAME challenge to ALL miners concurrently (Phase 1: Query)
+4. Computes per-line consensus from all responses (Phase 2: Consensus)
+5. Scores each miner against consensus + synthetic ground truth (Phase 3: Score)
+6. Requests TLSNotary proofs from outliers + random sample (Phase 4: Proof)
+
+Miners ARE the oracle — the validator has no ground truth for real lines.
+Cross-miner consensus determines correctness; synthetic lines (fake event
+IDs) provide absolute ground truth. TLSNotary proofs target outliers.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import random
+import time
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
+
+import httpx
+import structlog
+
+from djinn_validator.core.scoring import MinerScorer
+
+if TYPE_CHECKING:
+    from djinn_validator.core.espn import ESPNClient, ESPNGame
+
+# Max concurrent miner queries to avoid overwhelming the network
+_MAX_CONCURRENT_CHALLENGES = 16
+
+# Minimum miners needed for consensus to be meaningful
+MIN_MINERS_FOR_CONSENSUS = 3
+
+# Probability that an epoch requires ALL miners to submit TLSNotary proof
+FULL_PROOF_EPOCH_PROBABILITY = 0.20
+
+log = structlog.get_logger()
+
+
+# ---------------------------------------------------------------------------
+# Peer Notary Discovery
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PeerNotary:
+    """A miner that can serve as a peer notary for other miners."""
+
+    uid: int
+    ip: str
+    port: int  # miner API port
+    notary_port: int  # TCP port of the notary sidecar
+    pubkey_hex: str
+    tcp_reachable: bool = False  # True if notary TCP port is directly accessible
+    coldkey: str = ""  # SS58 coldkey from metagraph; same-coldkey peers excluded from notary matching
+
+
+async def _ws_handshake_ok(ip: str, port: int, timeout: float = 5.0) -> bool:
+    """Verify a WebSocket endpoint accepts connections (HTTP 101 upgrade).
+
+    Sends a minimal WebSocket upgrade request and checks for 101 status.
+    This catches miners whose HTTP /v1/notary/info returns 200 but whose
+    actual WebSocket sidecar at /v1/notary/ws is dead (returns 403 or hangs).
+    """
+    import base64
+    import os
+
+    ws_key = base64.b64encode(os.urandom(16)).decode()
+    request = (
+        f"GET /v1/notary/ws HTTP/1.1\r\n"
+        f"Host: {ip}:{port}\r\n"
+        f"Upgrade: websocket\r\n"
+        f"Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {ws_key}\r\n"
+        f"Sec-WebSocket-Version: 13\r\n"
+        f"\r\n"
+    )
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip, port),
+            timeout=timeout,
+        )
+        writer.write(request.encode())
+        await writer.drain()
+        # Read just enough of the response to check the status line
+        response_line = await asyncio.wait_for(
+            reader.readline(),
+            timeout=timeout,
+        )
+        writer.close()
+        await writer.wait_closed()
+        # Expect "HTTP/1.1 101 Switching Protocols\r\n"
+        return b"101" in response_line
+    except Exception:
+        return False
+
+
+async def discover_peer_notaries(
+    client: httpx.AsyncClient,
+    axons: list[dict],
+    concurrency: int = 20,
+) -> list[PeerNotary]:
+    """Discover miners running notary sidecars via /v1/notary/info.
+
+    After HTTP metadata check passes, performs a WebSocket handshake probe
+    on the notary port to verify the sidecar actually accepts connections.
+    Miners whose HTTP endpoint returns 200 but whose WebSocket is broken
+    (403, timeout, connection refused) are excluded.
+
+    Old miners without the endpoint return 404/405 and are silently skipped.
+    This ensures full backwards compatibility.
+    """
+    sem = asyncio.Semaphore(concurrency)
+    notaries: list[PeerNotary] = []
+
+    async def _probe(axon: dict) -> None:
+        ip = axon.get("ip", "")
+        port = axon.get("port", 0)
+        uid = axon.get("uid", -1)
+        if not ip or not port:
+            return
+        url = f"http://{ip}:{port}/v1/notary/info"
+        async with sem:
+            try:
+                resp = await client.get(url, timeout=5.0)
+                if resp.status_code != 200:
+                    return
+                data = resp.json()
+                if not (data.get("enabled") and data.get("pubkey_hex")):
+                    return
+                notary_port = data["port"]
+
+                # Probe: try direct TCP first (updated miners bind 0.0.0.0),
+                # fall back to WS handshake check for old miners.
+                tcp_ok = False
+                try:
+                    r, w = await asyncio.wait_for(
+                        asyncio.open_connection(ip, notary_port),
+                        timeout=3.0,
+                    )
+                    w.close()
+                    await w.wait_closed()
+                    tcp_ok = True
+                except (ConnectionRefusedError, TimeoutError, OSError):
+                    pass
+
+                if not tcp_ok and not await _ws_handshake_ok(ip, port):
+                    return
+
+                notaries.append(
+                    PeerNotary(
+                        uid=uid,
+                        ip=ip,
+                        port=port,
+                        notary_port=notary_port,
+                        pubkey_hex=data["pubkey_hex"],
+                        tcp_reachable=tcp_ok,
+                        coldkey=axon.get("coldkey", ""),
+                    )
+                )
+            except (httpx.HTTPError, Exception):
+                pass
+
+    await asyncio.gather(*[_probe(a) for a in axons])
+    return notaries
+
+
+def assign_peer_notary(
+    prover_uid: int,
+    notaries: list[PeerNotary],
+    prover_ip: str | None = None,
+    prover_coldkey: str | None = None,
+    assignment_counts: dict[int, int] | None = None,
+    max_per_notary: int = 4,
+    exclude_uids: set[int] | None = None,
+    ranked_uids: list[tuple[int, float]] | None = None,
+    pair_successes: dict[int, int] | None = None,
+    pair_failures: dict[int, int] | None = None,
+) -> PeerNotary | None:
+    """Assign a peer notary, preferring higher-ranked candidates.
+
+    When ``ranked_uids`` is provided (list of (uid, score) best-first),
+    eligible notaries are selected in rank order with weighted-random
+    sampling among the top tier to spread load. Without ranking, falls
+    back to uniform random selection.
+
+    Excludes the prover itself, any notary on the same IP address, and
+    any notary sharing the prover's coldkey. Same-coldkey self-notarization
+    is not real adversarial verification and double-rewards Sybil clusters
+    (miner credit + notary credit for the same crypto work).
+
+    Args:
+        assignment_counts: Track how many times each notary UID has been
+            assigned in the current round. Mutated in-place on assignment.
+            When None, no load-balancing cap is applied.
+        max_per_notary: Maximum assignments per notary per round.
+        exclude_uids: Notary UIDs to exclude (e.g. previously failed notaries).
+        prover_coldkey: SS58 coldkey of the prover. When provided, notaries
+            with the same coldkey are excluded (Sybil self-notarization).
+        ranked_uids: Optional list of (uid, score) sorted best-first from
+            scorer.rank_notary_candidates(). When provided, selection is
+            weighted by score rather than uniform random.
+
+    Returns None if no eligible notary is available.
+    """
+    eligible = [n for n in notaries if n.uid != prover_uid]
+    if prover_ip:
+        eligible = [n for n in eligible if n.ip != prover_ip]
+    if prover_coldkey:
+        eligible = [n for n in eligible if not n.coldkey or n.coldkey != prover_coldkey]
+    if exclude_uids:
+        eligible = [n for n in eligible if n.uid not in exclude_uids]
+    if assignment_counts is not None:
+        eligible = [n for n in eligible if assignment_counts.get(n.uid, 0) < max_per_notary]
+    if not eligible:
+        return None
+
+    # If we have ranking data, use weighted selection instead of uniform random.
+    if ranked_uids:
+        eligible_set = {n.uid for n in eligible}
+        by_uid = {n.uid: n for n in eligible}
+
+        # Build ordered list of (notary, score) respecting the ranking
+        ranked_eligible: list[tuple[PeerNotary, float]] = []
+        for uid, score in ranked_uids:
+            if uid in eligible_set:
+                ranked_eligible.append((by_uid[uid], score))
+
+        if ranked_eligible:
+            # Weighted random: add a small floor so zero-score miners still
+            # have a tiny chance (exploration), then sample proportionally.
+            floor = 0.01
+            weights = [score + floor for _, score in ranked_eligible]
+            chosen = random.choices(
+                [n for n, _ in ranked_eligible],
+                weights=weights,
+                k=1,
+            )[0]
+            if assignment_counts is not None:
+                assignment_counts[chosen.uid] = assignment_counts.get(chosen.uid, 0) + 1
+            return chosen
+
+    # If pair history exists, prefer notaries that have succeeded with this prover.
+    # This learns from cross-version incompatibilities: notaries that failed
+    # MPC handshake with this prover are deprioritized.
+    if pair_successes or pair_failures:
+        pair_scores = []
+        for n in eligible:
+            s = (pair_successes or {}).get(n.uid, 0)
+            f = (pair_failures or {}).get(n.uid, 0)
+            # Thompson-like score: successes / (successes + failures + 1)
+            # Notaries with no history get 0.5 (neutral)
+            if s + f == 0:
+                pair_scores.append((n, 0.5))
+            else:
+                pair_scores.append((n, (s + 1) / (s + f + 2)))
+        # Sort by pair score descending, pick best
+        pair_scores.sort(key=lambda x: -x[1])
+        # Weighted random among top candidates
+        weights = [score + 0.01 for _, score in pair_scores]
+        chosen = random.choices([n for n, _ in pair_scores], weights=weights, k=1)[0]
+        if assignment_counts is not None:
+            assignment_counts[chosen.uid] = assignment_counts.get(chosen.uid, 0) + 1
+        return chosen
+
+    # Fallback: uniform random (no ranking data or pair history)
+    chosen = random.choice(eligible)
+    if assignment_counts is not None:
+        assignment_counts[chosen.uid] = assignment_counts.get(chosen.uid, 0) + 1
+    return chosen
+
+
+# ---------------------------------------------------------------------------
+# Data classes for the 4-phase challenge flow
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class MinerResponse:
+    """Raw response from one miner during Phase 1 (Query)."""
+
+    uid: int
+    hotkey: str
+    ip: str
+    port: int
+    available_indices: set[int] = field(default_factory=set)
+    query_id: str | None = None
+    latency: float = 0.0
+    success: bool = False
+    error: str | None = None
+    coldkey: str = ""
+
+
+@dataclass
+class LineConsensus:
+    """Consensus result for a single challenge line."""
+
+    index: int
+    is_synthetic: bool
+    votes_available: int = 0
+    votes_unavailable: int = 0
+    total_voters: int = 0
+
+    @property
+    def consensus_available(self) -> bool:
+        """Majority says this line is available."""
+        return self.votes_available > self.votes_unavailable
+
+    @property
+    def confidence(self) -> float:
+        """Fraction of voters that agree with the majority."""
+        if self.total_voters == 0:
+            return 0.0
+        majority = max(self.votes_available, self.votes_unavailable)
+        return majority / self.total_voters
+
+    @property
+    def is_strong(self) -> bool:
+        """Strong consensus: >= 70% agreement."""
+        return self.confidence >= 0.70
+
+    @property
+    def is_tie(self) -> bool:
+        """Exactly split vote."""
+        return self.votes_available == self.votes_unavailable
+
+
+@dataclass
+class ConsensusResult:
+    """Consensus across all challenge lines from all responding miners."""
+
+    line_consensuses: dict[int, LineConsensus] = field(default_factory=dict)
+    responding_miners: int = 0
+    total_miners: int = 0
+
+    @property
+    def has_quorum(self) -> bool:
+        """Enough miners responded to compute meaningful consensus."""
+        return self.responding_miners >= MIN_MINERS_FOR_CONSENSUS
+
+
+# Sports we challenge on (must be in ESPN's supported set)
+CHALLENGE_SPORTS = [
+    "basketball_nba",
+    "americanfootball_nfl",
+    "baseball_mlb",
+    "icehockey_nhl",
+]
+
+# Limit challenges per epoch to conserve resources
+MAX_CHALLENGES_PER_EPOCH = 1
+
+
+def build_challenge_lines(games: list[ESPNGame], sport: str) -> list[dict]:
+    """Build a set of 10 candidate lines from live ESPN games.
+
+    Uses real game teams to construct plausible challenge lines. The validator
+    doesn't know if these lines are actually available — that's the miner's
+    job. We include synthetic lines with fake event IDs that shouldn't be
+    available at any sportsbook.
+    """
+    if not games:
+        return []
+
+    real_lines: list[dict] = []
+
+    for game in games:
+        if not game.home_team or not game.away_team:
+            continue
+        # Generate plausible lines for each game
+        event_id = f"espn_{game.espn_id}"
+        for market, side, line_val in _generate_plausible_lines(game):
+            real_lines.append(
+                {
+                    "sport": sport,
+                    "event_id": event_id,
+                    "home_team": game.home_team,
+                    "away_team": game.away_team,
+                    "market": market,
+                    "line": line_val,
+                    "side": side,
+                }
+            )
+
+    if not real_lines:
+        return []
+
+    # Select up to 5 real lines (lower ratio to increase synthetic coverage)
+    real_count = min(5, len(real_lines))
+    selected = random.sample(real_lines, real_count)
+
+    # Create synthetic unavailable lines — diversified to resist pattern matching.
+    # IMPORTANT: every synthetic must defeat the miner's team-name fallback in
+    # parse_bookmaker_odds.  Hashing the event_id alone is not enough because
+    # miners fall back to (home_team, away_team) matching when the event_id
+    # doesn't match the Odds API id.  We swap one team name from a *different*
+    # game so the pair never matches a real event while still looking plausible.
+    synthetic_count = min(10 - real_count, 5)
+    _synthetic_types = ["extreme_line", "fake_event", "wrong_market"]
+    for i in range(synthetic_count):
+        base = random.choice(real_lines)
+        synth_type = _synthetic_types[i % len(_synthetic_types)]
+        synth_line = base.get("line") or 0
+        synth_market = base["market"]
+
+        if synth_type == "extreme_line":
+            synth_line += random.uniform(500, 2000)
+        elif synth_type == "fake_event":
+            pass  # line stays plausible but event_id is fake
+        else:  # wrong_market
+            synth_market = "player_prop"
+
+        # Swap the away team with one from a different game so team-name
+        # matching can never resolve to a real event.
+        other_teams = [r["away_team"] for r in real_lines if r["away_team"] != base["away_team"]]
+        synth_away = random.choice(other_teams) if other_teams else f"Synthetic {i}"
+
+        selected.append(
+            {
+                "sport": sport,
+                "event_id": hashlib.sha256(f"{base['event_id']}:synthetic:{i}:{random.random()}".encode()).hexdigest()[
+                    :24
+                ],
+                "home_team": base["home_team"],
+                "away_team": synth_away,
+                "market": synth_market,
+                "line": synth_line,
+                "side": base["side"],
+                "is_synthetic": True,
+            }
+        )
+
+    # Shuffle and assign indices 1-10
+    random.shuffle(selected)
+    for i, line in enumerate(selected):
+        line["index"] = i + 1
+
+    return selected[:10]
+
+
+def _generate_plausible_lines(game: ESPNGame) -> list[tuple[str, str, float | None]]:
+    """Generate plausible betting lines for a game.
+
+    Returns (market, side, line_value) tuples.
+    """
+    lines: list[tuple[str, str, float | None]] = []
+
+    # Spread lines
+    for spread in (-3.5, -7.5, 3.5, 7.5):
+        team = game.home_team if spread < 0 else game.away_team
+        lines.append(("spreads", team, spread))
+
+    # Total lines
+    for total in (210.5, 220.5, 230.5):
+        lines.append(("totals", "Over", total))
+        lines.append(("totals", "Under", total))
+
+    # Moneyline
+    lines.append(("h2h", game.home_team, None))
+    lines.append(("h2h", game.away_team, None))
+
+    return lines
+
+
+def _sign_miner_request(
+    endpoint: str,
+    body: bytes,
+    wallet: Any | None,
+) -> dict[str, str]:
+    """Create signed auth headers for an outbound request to a miner.
+
+    Returns empty dict if wallet is unavailable (dev mode).
+    """
+    if wallet is None:
+        return {}
+    try:
+        from djinn_validator.api.middleware import create_signed_headers
+
+        return create_signed_headers(endpoint, body, wallet)
+    except Exception as e:
+        log.warning("sign_miner_request_failed", error=str(e))
+        return {}
+
+
+async def _query_one(
+    client: httpx.AsyncClient,
+    axon: dict,
+    check_payload: dict,
+    sem: asyncio.Semaphore,
+    wallet: Any | None = None,
+) -> MinerResponse | None:
+    """Phase 1: Send the challenge to one miner and collect raw response.
+
+    Returns None if the miner has no IP (skip), otherwise returns MinerResponse.
+    """
+    uid = axon["uid"]
+    hotkey = axon["hotkey"]
+    ip = axon.get("ip", "")
+    port = axon.get("port", 0)
+
+    if not ip or not port:
+        return None
+
+    resp = MinerResponse(uid=uid, hotkey=hotkey, ip=ip, port=port, coldkey=axon.get("coldkey", ""))
+    check_url = f"http://{ip}:{port}/v1/check"
+
+    async with sem:
+        start = time.perf_counter()
+        try:
+            body = json.dumps(check_payload).encode()
+            auth_headers = _sign_miner_request("/v1/check", body, wallet)
+            http_resp = await client.post(
+                check_url,
+                content=body,
+                headers={"Content-Type": "application/json", **auth_headers},
+                timeout=10.0,
+            )
+            resp.latency = time.perf_counter() - start
+
+            if http_resp.status_code != 200:
+                resp.error = f"HTTP {http_resp.status_code}"
+                return resp
+
+            data = http_resp.json()
+            raw_indices = data.get("available_indices", [])
+            resp.available_indices = {int(i) for i in raw_indices if isinstance(i, int | float | str)}
+            resp.query_id = data.get("query_id")
+            resp.success = True
+            return resp
+
+        except Exception as e:
+            resp.latency = time.perf_counter() - start
+            resp.error = str(e)[:200]
+            return resp
+
+
+def _compute_consensus(
+    responses: list[MinerResponse],
+    challenge_lines: list[dict],
+    synthetic_indices: set[int],
+) -> ConsensusResult:
+    """Phase 2: Compute per-line consensus from all successful miner responses."""
+    successful = [r for r in responses if r.success]
+    all_indices = {line["index"] for line in challenge_lines}
+
+    result = ConsensusResult(
+        responding_miners=len(successful),
+        total_miners=len(responses),
+    )
+
+    for idx in all_indices:
+        lc = LineConsensus(index=idx, is_synthetic=idx in synthetic_indices)
+        for r in successful:
+            if idx in r.available_indices:
+                lc.votes_available += 1
+            else:
+                lc.votes_unavailable += 1
+            lc.total_voters += 1
+        result.line_consensuses[idx] = lc
+
+    return result
+
+
+def _score_against_consensus(
+    response: MinerResponse,
+    consensus: ConsensusResult,
+    synthetic_indices: set[int],
+    all_line_indices: set[int],
+) -> tuple[bool, float]:
+    """Phase 3: Score one miner's response against consensus.
+
+    Returns (is_correct, accuracy_score) where:
+    - Synthetic lines: ground truth always "unavailable" (no consensus needed)
+    - Real lines with strong consensus (>=70%): match = full credit, mismatch = 0
+    - Real lines with weak consensus (50-70%): match = 0.8, mismatch = 0.3
+    - Real lines with tie: 0.5 neutral credit
+    - Below quorum (<3 miners): only synthetic lines are scored
+
+    is_correct = weighted accuracy >= 0.6
+    """
+    if not response.success:
+        return False, 0.0
+
+    total_credit = 0.0
+    total_lines = 0
+
+    for idx in all_line_indices:
+        lc = consensus.line_consensuses.get(idx)
+        if lc is None:
+            continue
+
+        miner_says_available = idx in response.available_indices
+
+        if idx in synthetic_indices:
+            # Synthetic: ground truth is always unavailable
+            total_credit += 0.0 if miner_says_available else 1.0
+            total_lines += 1
+        elif consensus.has_quorum:
+            # Real line with quorum: score against consensus
+            if lc.is_tie:
+                total_credit += 0.5
+            elif lc.is_strong:
+                agrees = miner_says_available == lc.consensus_available
+                total_credit += 1.0 if agrees else 0.0
+            else:
+                # Weak consensus (50-70%)
+                agrees = miner_says_available == lc.consensus_available
+                total_credit += 0.8 if agrees else 0.3
+            total_lines += 1
+        # else: below quorum, skip real lines (only synthetics scored)
+
+    accuracy = total_credit / total_lines if total_lines > 0 else 0.0
+    is_correct = accuracy >= 0.6
+    return is_correct, accuracy
+
+
+def _select_proof_targets(
+    responses: list[MinerResponse],
+    consensus: ConsensusResult,
+    synthetic_indices: set[int],
+    max_proofs: int = 4,
+) -> list[MinerResponse]:
+    """Phase 4: Select miners to request TLSNotary proofs from.
+
+    Priority:
+    1. Outliers — disagree with strong consensus on 2+ lines
+    2. Fill remaining slots with random miners that have query_ids
+    """
+    if not consensus.has_quorum:
+        # No meaningful consensus — just pick random miners with query_ids
+        with_qid = [r for r in responses if r.success and r.query_id]
+        return random.sample(with_qid, min(max_proofs, len(with_qid)))
+
+    # Find outliers: miners who disagree with strong consensus on 2+ lines
+    outliers: list[MinerResponse] = []
+    non_outliers_with_qid: list[MinerResponse] = []
+
+    for r in responses:
+        if not r.success or not r.query_id:
+            continue
+
+        disagreements = 0
+        for idx, lc in consensus.line_consensuses.items():
+            if idx in synthetic_indices or not lc.is_strong:
+                continue
+            miner_says = idx in r.available_indices
+            if miner_says != lc.consensus_available:
+                disagreements += 1
+
+        if disagreements >= 2:
+            outliers.append(r)
+        else:
+            non_outliers_with_qid.append(r)
+
+    # Outliers first, then fill with random
+    targets = outliers[:max_proofs]
+    remaining = max_proofs - len(targets)
+    if remaining > 0 and non_outliers_with_qid:
+        targets += random.sample(
+            non_outliers_with_qid,
+            min(remaining, len(non_outliers_with_qid)),
+        )
+
+    return targets
+
+
+@dataclass
+class ChallengeResult:
+    """Rich result from a challenge round for activity logging."""
+
+    challenged: int = 0
+    sport: str = ""
+    games_found: int = 0
+    lines_used: int = 0
+    responding: int = 0
+    consensus_quorum: bool = False
+    proofs_requested: int = 0
+    proofs_submitted: int = 0
+    miner_results: list[dict] = field(default_factory=list)
+    challenge_lines: list[dict] = field(default_factory=list)
+
+
+@dataclass
+class AttestationResult:
+    """Rich result from an attestation challenge for activity logging."""
+
+    challenged: int = 0
+    verified: int = 0
+    url: str = ""
+    reachable: int = 0
+    capable: int = 0
+    miner_results: list[dict] = field(default_factory=list)
+
+
+async def challenge_miners(
+    scorer: MinerScorer,
+    miner_axons: list[dict],
+    espn_client: ESPNClient | None = None,
+    wallet: Any | None = None,
+) -> ChallengeResult:
+    """Run a consensus-based scoring challenge against all reachable miners.
+
+    4-phase flow:
+    1. Query all miners concurrently with the same challenge
+    2. Compute per-line consensus from all responses
+    3. Score each miner against consensus + synthetic ground truth
+    4. Request TLSNotary proofs from outliers + random sample
+
+    Returns a ChallengeResult with per-miner details.
+    """
+    result = ChallengeResult()
+
+    if espn_client is None:
+        from djinn_validator.core.espn import ESPNClient
+
+        espn_client = ESPNClient()
+
+    # Pick a random sport
+    sport = random.choice(CHALLENGE_SPORTS)
+    result.sport = sport
+
+    # Fetch live games from ESPN
+    games = await espn_client.get_scoreboard(sport)
+    if not games:
+        log.debug("no_challenge_games", sport=sport)
+        return result
+
+    # Filter to in-progress or scheduled games
+    active_games = [g for g in games if g.status in ("in_progress", "scheduled", "pending")]
+    if not active_games:
+        active_games = games  # Fall back to all games if none are active
+
+    result.games_found = len(active_games)
+    challenge_lines = build_challenge_lines(active_games, sport)
+    result.lines_used = len(challenge_lines)
+    result.challenge_lines = [
+        {
+            "index": line["index"],
+            "sport": line["sport"],
+            "event_id": line["event_id"],
+            "home_team": line["home_team"],
+            "away_team": line["away_team"],
+            "market": line["market"],
+            "line": line.get("line"),
+            "side": line["side"],
+            "is_synthetic": line.get("is_synthetic", False),
+        }
+        for line in challenge_lines
+    ]
+    if len(challenge_lines) < 3:
+        log.debug("insufficient_challenge_lines", sport=sport, count=len(challenge_lines))
+        return result
+
+    # Build the check request payload (matching miner's CheckRequest model)
+    check_payload = {
+        "lines": [
+            {
+                "index": line["index"],
+                "sport": line["sport"],
+                "event_id": line["event_id"],
+                "home_team": line["home_team"],
+                "away_team": line["away_team"],
+                "market": line["market"],
+                "line": line.get("line"),
+                "side": line["side"],
+            }
+            for line in challenge_lines
+        ]
+    }
+
+    # Track which lines are synthetic (should be unavailable)
+    synthetic_indices = {line["index"] for line in challenge_lines if line.get("is_synthetic")}
+    all_line_indices = {line["index"] for line in challenge_lines}
+
+    sem = asyncio.Semaphore(_MAX_CONCURRENT_CHALLENGES)
+
+    async with httpx.AsyncClient() as client:
+        # ── Phase 1: Query all miners concurrently ──
+        raw_results = await asyncio.gather(
+            *[_query_one(client, axon, check_payload, sem, wallet=wallet) for axon in miner_axons]
+        )
+        responses = [r for r in raw_results if r is not None]
+
+        if not responses:
+            return result
+
+        # ── Phase 2: Compute consensus ──
+        consensus = _compute_consensus(responses, challenge_lines, synthetic_indices)
+        result.responding = consensus.responding_miners
+        result.consensus_quorum = consensus.has_quorum
+
+        # ── Phase 3: Score each miner against consensus ──
+        for r in responses:
+            metrics = scorer.get_or_create(r.uid, r.hotkey)
+            mr: dict = {"uid": r.uid, "latency": round(r.latency, 3)}
+            if not r.success:
+                metrics.record_query(correct=False, latency=r.latency, proof_submitted=False)
+                mr["error"] = r.error or "no response"
+                mr["correct"] = False
+                log.debug("challenge_miner_error", uid=r.uid, err=r.error)
+                result.miner_results.append(mr)
+                continue
+
+            is_correct, accuracy = _score_against_consensus(
+                r,
+                consensus,
+                synthetic_indices,
+                all_line_indices,
+            )
+            metrics.record_query(
+                correct=is_correct,
+                latency=r.latency,
+                proof_submitted=False,  # Updated in Phase 4 if proof requested
+            )
+            mr["correct"] = is_correct
+            mr["accuracy"] = round(accuracy, 2)
+            mr["available"] = len(r.available_indices)
+            result.miner_results.append(mr)
+            log.info(
+                "challenge_miner_scored",
+                uid=r.uid,
+                accuracy=round(accuracy, 2),
+                is_correct=is_correct,
+                available_count=len(r.available_indices),
+                consensus_quorum=consensus.has_quorum,
+                latency_s=round(r.latency, 3),
+                query_id=r.query_id or "none",
+            )
+
+        # ── Phase 3b: Discover peer notaries for proof requests ──
+        peer_notaries = await discover_peer_notaries(client, miner_axons)
+        _proof_notary_counts: dict[int, int] = {}
+
+        # ── Phase 4: Request proofs from targeted miners ──
+        # Spot-check: 20% of epochs require ALL miners to submit proof
+        is_full_proof_epoch = random.random() < FULL_PROOF_EPOCH_PROBABILITY
+        if is_full_proof_epoch:
+            proof_targets = [r for r in responses if r.success and r.query_id]
+            log.info("full_proof_epoch", target_count=len(proof_targets))
+        else:
+            proof_targets = _select_proof_targets(
+                responses,
+                consensus,
+                synthetic_indices,
+            )
+        _max_per = max(4, len(proof_targets) // max(len(peer_notaries), 1))
+        result.proofs_requested = len(proof_targets)
+
+        # Pre-assign notaries for all targets (must be sequential for
+        # load-balancing counts to work correctly)
+        target_notaries: list[tuple[Any, PeerNotary | None]] = []
+        for target in proof_targets:
+            metrics = scorer.get_or_create(target.uid, target.hotkey)
+            metrics.proofs_requested += 1
+            assigned_notary = assign_peer_notary(
+                target.uid,
+                peer_notaries,
+                prover_ip=target.ip,
+                prover_coldkey=target.coldkey or None,
+                assignment_counts=_proof_notary_counts,
+                max_per_notary=_max_per,
+            )
+            target_notaries.append((target, assigned_notary))
+
+        # Run proof requests in parallel (TLSNotary proofs take 30-90s each;
+        # sequential execution with 50+ targets would take hours)
+        _proof_sem = asyncio.Semaphore(8)
+
+        async def _do_proof(target: Any, notary_for_target: PeerNotary | None) -> None:
+            async with _proof_sem:
+                proof_submitted, proof_valid = await _request_and_verify_proof(
+                    client,
+                    target.ip,
+                    target.port,
+                    target.query_id,
+                    target.uid,
+                    wallet=wallet,
+                    notary=notary_for_target,
+                )
+            metrics = scorer.get_or_create(target.uid, target.hotkey)
+            if proof_submitted:
+                metrics.proofs_submitted += 1
+                if proof_valid:
+                    metrics.proofs_verified += 1
+                # Sliding window for coverage scoring
+                metrics.coverage_outcomes.append(proof_valid)
+                if len(metrics.coverage_outcomes) > 20:
+                    metrics.coverage_outcomes = metrics.coverage_outcomes[-20:]
+                result.proofs_submitted += 1
+                log.info(
+                    "challenge_proof_result",
+                    uid=target.uid,
+                    proof_submitted=proof_submitted,
+                    proof_valid=proof_valid,
+                )
+            for mr in result.miner_results:
+                if mr["uid"] == target.uid:
+                    mr["proof_requested"] = True
+                    mr["proof_submitted"] = proof_submitted
+                    mr["proof_valid"] = proof_valid
+                    break
+
+        await asyncio.gather(*[_do_proof(t, n) for t, n in target_notaries])
+
+    result.challenged = len(responses)
+    if result.challenged:
+        log.info(
+            "challenge_round_complete",
+            sport=sport,
+            miners_challenged=result.challenged,
+            consensus_quorum=consensus.has_quorum,
+            responding=consensus.responding_miners,
+        )
+    return result
+
+
+async def _request_and_verify_proof(
+    client: httpx.AsyncClient,
+    ip: str,
+    port: int,
+    query_id: str,
+    uid: int,
+    wallet: Any | None = None,
+    notary: PeerNotary | None = None,
+) -> tuple[bool, bool]:
+    """Request a TLSNotary proof from the miner and verify it.
+
+    When a peer notary is assigned, passes notary_host/notary_port/notary_ws
+    so the miner can produce a peer-notarized TLSNotary proof.
+
+    Returns (proof_submitted, proof_valid).
+    """
+    proof_url = f"http://{ip}:{port}/v1/proof"
+    try:
+        payload: dict[str, Any] = {"query_id": query_id}
+        if notary:
+            payload["notary_host"] = notary.ip
+            payload["notary_port"] = notary.notary_port
+            payload["notary_ws_port"] = notary.port
+            # Include a signed notary ticket so the peer notary can verify
+            # this connection was authorized by a validator. Old miners
+            # without ticket support will ignore this field harmlessly.
+            if wallet:
+                try:
+                    from djinn_validator.api.middleware import create_notary_ticket
+
+                    payload["notary_ticket"] = create_notary_ticket(
+                        prover_uid=uid,
+                        notary_uid=notary.uid,
+                        wallet=wallet,
+                    )
+                except Exception as e:
+                    log.warning("notary_ticket_creation_failed", uid=uid, error=str(e))
+        body = json.dumps(payload).encode()
+        auth_headers = _sign_miner_request("/v1/proof", body, wallet)
+        proof_resp = await client.post(
+            proof_url,
+            content=body,
+            headers={"Content-Type": "application/json", **auth_headers},
+            timeout=180.0,
+        )
+        if proof_resp.status_code != 200:
+            log.debug("proof_request_error", uid=uid, status=proof_resp.status_code)
+            return False, False
+
+        proof_data = proof_resp.json()
+        if proof_data.get("status") not in ("submitted", "verified"):
+            return False, False
+
+        # Extract and verify the TLSNotary presentation bytes if present
+        proof_bytes = None
+        message = proof_data.get("message", "")
+        if message:
+            try:
+                meta = json.loads(message)
+                if meta.get("type") == "tlsnotary" and meta.get("presentation"):
+                    import base64
+
+                    proof_bytes = base64.b64decode(meta["presentation"])
+            except (json.JSONDecodeError, ValueError, Exception) as e:
+                # Miner sent a message but it's malformed — reject the proof entirely.
+                # This prevents miners from gaming the system by submitting garbage
+                # metadata to get "submitted but unverified" credit.
+                log.warning("malformed_proof_metadata", uid=uid, err=str(e))
+                return False, False
+
+        if proof_bytes is None:
+            # No TLSNotary presentation — proof submitted but not verifiable
+            return True, False
+
+        try:
+            from djinn_validator.core import tlsn as tlsn_verifier
+
+            if not tlsn_verifier.is_available():
+                log.debug("tlsn_verifier_unavailable", uid=uid)
+                return True, False
+            notary_key = notary.pubkey_hex if notary else None
+            verify_result = await asyncio.wait_for(
+                tlsn_verifier.verify_proof(
+                    proof_bytes,
+                    expected_notary_key=notary_key,
+                ),
+                timeout=30.0,
+            )
+            if not verify_result.verified:
+                log.debug("proof_verification_failed", uid=uid, error=verify_result.error)
+            return True, verify_result.verified
+        except ImportError:
+            log.debug("tlsn_verifier_not_installed", uid=uid)
+            return True, False
+        except TimeoutError:
+            log.debug("proof_verification_timeout", uid=uid)
+            return True, False
+        except Exception as e:
+            log.debug("proof_verification_error", uid=uid, err=str(e))
+            return True, False
+
+    except httpx.HTTPError as e:
+        log.debug("proof_request_unreachable", uid=uid, err=str(e))
+        return False, False
+    except Exception as e:
+        log.debug("proof_request_error", uid=uid, err=str(e))
+        return False, False
+
+
+# Known-good HTTPS URLs for attestation challenges. Requirements:
+# - Public, no auth, HTTPS only
+# - Response under 10KB (must fit in 512KB MPC circuit with headroom)
+# - Live/dynamic data (harder to fabricate; caching won't help cheaters)
+# - Varied domains (tests TLS handshake across different CAs and servers)
+# - ToS-compatible: open source, public domain, or explicitly free for any use
+_ATTESTATION_CHALLENGE_URLS = [
+    # Reflectors -- vary per request (open source, designed for testing)
+    "https://httpbin.org/get",
+    "https://httpbin.org/headers",
+    # Government / public domain data
+    "https://earthquake.usgs.gov/fdsnws/event/1/count?format=geojson&starttime=2025-01-01",
+    "https://api.nbp.pl/api/exchangerates/rates/a/usd?format=json",
+    "https://date.nager.at/api/v3/NextPublicHolidays/US",
+    "https://api.nasa.gov/planetary/apod?api_key=DEMO_KEY",
+    "https://api.fda.gov/food/enforcement.json?limit=1",
+    # Open source APIs (MIT / Apache 2.0)
+    "https://dog.ceo/api/breeds/image/random",
+    "https://api.spacexdata.com/v4/launches/latest",
+    "https://official-joke-api.appspot.com/random_joke",
+    # Explicitly free APIs (no ToS restrictions on automated access)
+    "https://api.chucknorris.io/jokes/random",
+    "https://uselessfacts.jsph.pl/api/v2/facts/random",
+    "https://api.adviceslip.com/advice",
+    "https://catfact.ninja/fact",
+    "https://randomfox.ca/floof/",
+]
+
+
+def _generate_nonce_challenge_url() -> tuple[str, str]:
+    """Generate a challenge URL with an unpredictable nonce.
+
+    Uses djinn.gg/api/hash/<nonce> which returns {"input": "<nonce>",
+    "sha256": "<hash>"}. The content is deterministic: the sha256 of
+    the nonce. The validator can verify the proof body contains the
+    correct hash without fetching the URL itself. A fabricating binary
+    can't produce the right hash without actually connecting to the
+    server (or knowing SHA-256 of the nonce, which it doesn't since
+    the nonce is random).
+
+    Returns (url, expected_hash).
+    """
+    import hashlib
+    import uuid
+
+    nonce = uuid.uuid4().hex
+    expected_hash = hashlib.sha256(nonce.encode()).hexdigest()
+    url = f"https://www.djinn.gg/api/hash/{nonce}"
+    return url, expected_hash
+
+
+async def _probe_attest_capability(
+    client: httpx.AsyncClient,
+    axons: list[dict],
+    concurrency: int = 20,
+) -> list[dict]:
+    """Fast probe to find miners that have /v1/attest endpoint.
+
+    POSTs an empty body — miners with the endpoint return 422 (validation
+    error) instantly, miners without it return 404 or timeout.
+    Returns the list of axons that responded with 422.
+    """
+    sem = asyncio.Semaphore(concurrency)
+    capable: list[dict] = []
+
+    async def _probe(axon: dict) -> None:
+        url = f"http://{axon['ip']}:{axon['port']}/v1/attest"
+        async with sem:
+            try:
+                resp = await client.post(
+                    url,
+                    content=b"{}",
+                    headers={"Content-Type": "application/json"},
+                    timeout=5.0,
+                )
+                if resp.status_code == 422:
+                    capable.append(axon)
+            except httpx.HTTPError:
+                pass
+
+    await asyncio.gather(*[_probe(a) for a in axons])
+    return capable
+
+
+async def challenge_miners_attestation(
+    scorer: MinerScorer,
+    miner_axons: list[dict],
+    wallet: Any | None = None,
+) -> AttestationResult:
+    """Run a TLSNotary attestation challenge against capable miners.
+
+    Three phases:
+    1. Fast probe (5s): POST empty body to all miners to find which ones
+       have /v1/attest (422 = has it, 404/timeout = doesn't)
+    1b. Notary discovery: GET /v1/notary/info from all miners to find peer
+        notaries. Old miners without the endpoint are silently skipped.
+    2. Full challenge (210s): send real attestation to capable miners,
+       assigning a random peer notary where available.
+
+    Returns an AttestationResult with per-miner details.
+    """
+    ar = AttestationResult()
+
+    # 50% of challenges use a nonce URL for content verification.
+    # The nonce proves the prover binary is unmodified: a fabricating
+    # binary can't know the random nonce embedded in the URL path.
+    challenge_nonce: str | None = None
+    if random.random() < 0.5:
+        url, challenge_nonce = _generate_nonce_challenge_url()
+        log.info("attest_challenge_using_nonce", nonce=challenge_nonce[:12] + "...")
+    else:
+        url = random.choice(_ATTESTATION_CHALLENGE_URLS)
+    ar.url = url
+
+    reachable = [a for a in miner_axons if a.get("ip") and a.get("port")]
+    ar.reachable = len(reachable)
+
+    async with httpx.AsyncClient() as client:
+        # Phase 1: fast probe all miners (~15s for 246 miners at concurrency 20)
+        # Run capability probe and notary discovery in parallel
+        capable_task = asyncio.create_task(_probe_attest_capability(client, reachable))
+        notary_task = asyncio.create_task(discover_peer_notaries(client, reachable))
+        capable = await capable_task
+        all_notaries = await notary_task
+
+        # Prefer notaries from miners with verified proactive proofs,
+        # then narrow to version-compatible notaries by binary hash.
+        # MPC requires matching binary versions on both sides.
+        verified_notaries = [
+            n for n in all_notaries if (m := scorer.get(n.uid)) is not None and m.proactive_proof_verified
+        ]
+        if not verified_notaries:
+            peer_notaries = all_notaries
+            notaries_by_hash: dict[str, list] = {}
+        else:
+            # Group verified notaries by binary hash so we can match
+            # each prover to a compatible notary at assignment time.
+            notaries_by_hash = {}
+            for n in verified_notaries:
+                m = scorer.get(n.uid)
+                bh = m.tlsn_binary_hash if m else ""
+                notaries_by_hash.setdefault(bh or "unknown", []).append(n)
+
+            # Default pool: all verified notaries (used when prover hash unknown)
+            peer_notaries = verified_notaries
+
+        log.info(
+            "attest_challenge_notaries_filtered",
+            total=len(all_notaries),
+            verified=len(verified_notaries),
+            selected=len(peer_notaries),
+            hash_groups=len(notaries_by_hash),
+        )
+
+        ar.capable = len(capable)
+
+        # Mark miners as notary-capable if their IP hosts a notary sidecar.
+        # Multiple miners on the same server share the sidecar, so all
+        # miners on a notary IP are considered capable.
+        notary_ips = {n.ip for n in peer_notaries}
+        notary_capable_count = 0
+        for axon in reachable:
+            uid = axon.get("uid")
+            hotkey = axon.get("hotkey", "")
+            if uid is not None and hotkey:
+                m = scorer.get_or_create(uid, hotkey)
+                if axon.get("ip") in notary_ips:
+                    m.notary_capable = True
+                    notary_capable_count += 1
+
+        log.info(
+            "attest_probe_complete",
+            total=len(reachable),
+            capable=len(capable),
+            peer_notaries=len(peer_notaries),
+            notary_capable_miners=notary_capable_count,
+        )
+
+        if not capable:
+            return ar
+
+        # Filter out miners that have consistently failed attestation.
+        # No point waiting 60s for miners that have failed 3+ times and
+        # never succeeded. Give them one retry per epoch via the
+        # redemption mechanism in select_attest_miners instead.
+        filtered: list[dict] = []
+        skipped = 0
+        for axon in capable:
+            uid = axon.get("uid")
+            m = scorer._miners.get(uid) if uid is not None else None
+            if m and m.attestations_total >= 3 and m.attestations_valid == 0 and not m.proactive_proof_verified:
+                # Known-broken miner with no valid proactive proof.
+                # Skip the full timeout. Don't inflate attestations_total
+                # further; the existing failures are sufficient for the
+                # penalty. The miner can recover via proactive attestation
+                # or the redemption slot in select_attest_miners.
+                skipped += 1
+                continue
+            filtered.append(axon)
+        if skipped:
+            log.info("attest_challenge_skipped_known_broken", count=skipped)
+        capable = filtered
+
+        if not capable:
+            return ar
+
+        # Phase 2: full challenge only capable miners
+        # Higher concurrency (20) with shorter timeout (60s) to avoid
+        # spending an hour waiting for dead miners. Real TLSNotary proofs
+        # complete in 10-60s; anything over 60s is hung.
+        _notary_counts: dict[int, int] = {}
+        _max_per_notary = max(4, len(capable) // max(len(peer_notaries), 1))
+        sem = asyncio.Semaphore(20)
+        per_miner: list[dict] = []
+
+        async def _challenge_one(axon: dict) -> tuple[bool, bool]:
+            """Returns (attempted, proof_valid)."""
+            uid = axon["uid"]
+            hotkey = axon["hotkey"]
+            metrics = scorer.get_or_create(uid, hotkey)
+            miner_url = f"http://{axon['ip']}:{axon['port']}/v1/attest"
+            request_id = f"challenge-{uid}-{int(time.time())}"
+            mr: dict = {"uid": uid}
+
+            # Assign a version-compatible peer notary so the miner can't
+            # self-notarize. Match the prover's binary hash to a notary
+            # running the same version when possible.
+            prover_hash = ""
+            pm = scorer.get(uid)
+            if pm and pm.tlsn_binary_hash:
+                prover_hash = pm.tlsn_binary_hash
+            compatible_notaries = notaries_by_hash.get(prover_hash, []) if prover_hash else []
+            notary_pool = compatible_notaries if compatible_notaries else peer_notaries
+            assigned_notary = assign_peer_notary(
+                uid,
+                notary_pool,
+                prover_ip=axon.get("ip"),
+                prover_coldkey=axon.get("coldkey") or None,
+                assignment_counts=_notary_counts,
+                max_per_notary=_max_per_notary,
+            )
+
+            async with sem:
+                start = time.perf_counter()
+                try:
+                    payload: dict[str, Any] = {"url": url, "request_id": request_id}
+                    if assigned_notary:
+                        payload["notary_host"] = assigned_notary.ip
+                        payload["notary_port"] = assigned_notary.notary_port  # direct TCP port
+                        payload["notary_ws_port"] = assigned_notary.port  # API port for WS fallback
+                        mr["notary_uid"] = assigned_notary.uid
+                        mr["notary_pubkey"] = assigned_notary.pubkey_hex[:16]
+
+                    body = json.dumps(payload).encode()
+                    auth_headers = _sign_miner_request("/v1/attest", body, wallet)
+                    resp = await client.post(
+                        miner_url,
+                        content=body,
+                        headers={"Content-Type": "application/json", **auth_headers},
+                        timeout=120.0,
+                    )
+                    latency = time.perf_counter() - start
+                    mr["latency"] = round(latency, 1)
+
+                    if resp.status_code != 200:
+                        metrics.record_attestation(latency=latency, proof_valid=False)
+                        mr["error"] = f"HTTP {resp.status_code}"
+                        mr["valid"] = False
+                        log.debug("attest_challenge_error", uid=uid, status=resp.status_code)
+                        per_miner.append(mr)
+                        return True, False
+
+                    try:
+                        data = resp.json()
+                    except Exception:
+                        log.warning(
+                            "attest_challenge_malformed_json",
+                            uid=uid,
+                            response_text=resp.text[:300] if hasattr(resp, "text") else "<no text>",
+                        )
+                        metrics.record_attestation(latency=latency, proof_valid=False)
+                        mr["error"] = "malformed JSON"
+                        mr["valid"] = False
+                        per_miner.append(mr)
+                        return True, False
+
+                    proof_valid = data.get("success", False) and bool(data.get("proof_hex"))
+
+                    if proof_valid:
+                        try:
+                            from urllib.parse import urlparse
+
+                            from djinn_validator.core import tlsn as tlsn_verifier
+
+                            proof_bytes = bytes.fromhex(data["proof_hex"])
+                            expected_server = urlparse(url).hostname
+                            # Pass the assigned notary's pubkey so the verifier
+                            # tries it first (falls back to accepting any key).
+                            notary_key = assigned_notary.pubkey_hex if assigned_notary else None
+                            verify_result = await asyncio.wait_for(
+                                tlsn_verifier.verify_proof(
+                                    proof_bytes,
+                                    expected_server=expected_server,
+                                    expected_notary_key=notary_key,
+                                ),
+                                timeout=30.0,
+                            )
+                            proof_valid = verify_result.verified
+
+                            # Nonce verification: if this was a nonce challenge,
+                            # check that the expected SHA-256 hash appears in
+                            # the proof body. djinn.gg/api/hash/<nonce> returns
+                            # {"input": "<nonce>", "sha256": "<hash>"}. The
+                            # validator computed the expected hash locally, so
+                            # it can verify without trusting anyone.
+                            nonce_verified: bool | None = None
+                            if proof_valid and challenge_nonce:
+                                body = verify_result.response_body or ""
+                                nonce_verified = challenge_nonce in body
+                                if not nonce_verified:
+                                    log.warning(
+                                        "attest_nonce_mismatch",
+                                        uid=uid,
+                                        expected_hash=challenge_nonce[:16],
+                                        body_len=len(body),
+                                        body_preview=body[:200],
+                                    )
+                                else:
+                                    log.info(
+                                        "attest_nonce_verified",
+                                        uid=uid,
+                                        expected_hash=challenge_nonce[:16],
+                                    )
+                            mr["nonce_verified"] = nonce_verified
+                        except TimeoutError as e:
+                            log.warning("attest_verify_timeout", uid=uid, err=str(e))
+                            # Validator-side timeout: not the miner's fault.
+                            # Record the attempt but exclude from sliding window.
+                            metrics.record_attestation(
+                                latency=latency,
+                                proof_valid=False,
+                                validator_timeout=True,
+                            )
+                            mr["valid"] = False
+                            mr["validator_timeout"] = True
+                            per_miner.append(mr)
+                            return True, False
+                        except Exception as e:
+                            log.debug("attest_challenge_verify_error", uid=uid, err=str(e))
+                            proof_valid = False
+
+                    _phex = data.get("proof_hex") or "" if proof_valid else ""
+                    _phex_bytes = len(_phex) // 2 if _phex else 0
+                    _latency_ms = int(latency * 1000) if proof_valid else 0
+                    metrics.record_attestation(
+                        latency=latency,
+                        proof_valid=proof_valid,
+                        proof_bytes=_phex_bytes,
+                        duration_ms=_latency_ms,
+                    )
+
+                    # Record notary duty on the notary miner's metrics
+                    if assigned_notary:
+                        notary_metrics = scorer.get_or_create(
+                            assigned_notary.uid,
+                            # hotkey lookup: find it from the axon list
+                            next(
+                                (a["hotkey"] for a in miner_axons if a["uid"] == assigned_notary.uid),
+                                f"notary-{assigned_notary.uid}",
+                            ),
+                        )
+                        notary_metrics.record_notary_duty(
+                            proof_valid,
+                            proof_bytes=_phex_bytes,
+                            duration_ms=_latency_ms,
+                        )
+
+                    mr["valid"] = proof_valid
+                    mr["server"] = data.get("server_name", "")
+                    if assigned_notary:
+                        mr["peer_notary"] = True
+                    per_miner.append(mr)
+                    log.info(
+                        "attest_challenge_scored",
+                        uid=uid,
+                        proof_valid=proof_valid,
+                        latency_s=round(latency, 3),
+                        peer_notary=assigned_notary.uid if assigned_notary else None,
+                        nonce_verified=mr.get("nonce_verified"),
+                    )
+                    return True, proof_valid
+
+                except Exception as e:
+                    latency = time.perf_counter() - start
+                    metrics.record_attestation(latency=latency, proof_valid=False)
+                    mr["latency"] = round(latency, 1)
+                    mr["error"] = str(e)[:80]
+                    mr["valid"] = False
+                    per_miner.append(mr)
+                    log.debug("attest_challenge_error", uid=uid, err=str(e))
+                    return True, False
+
+        results = await asyncio.gather(*[_challenge_one(a) for a in capable])
+        ar.challenged = sum(1 for attempted, _ in results if attempted)
+        ar.verified = sum(1 for _, valid in results if valid)
+        ar.miner_results = per_miner
+
+    if ar.challenged:
+        log.info(
+            "attest_challenge_round_complete",
+            url=url,
+            probed=len(reachable),
+            capable=len(capable),
+            challenged=ar.challenged,
+            verified=ar.verified,
+        )
+    return ar

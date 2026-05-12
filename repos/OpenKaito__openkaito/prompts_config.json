@@ -1,0 +1,5 @@
+{
+    "text_embedding_prompts": [
+        "Based on the following text segment, what information do you learn? Please rephrase what you've learned into a question\nFor example -\ntext: Steven Paul Jobs (February 24, 1955 \u2013 October 5, 2011) was an American businessman, inventor, and investor best known for co-founding the technology company Apple Inc.\nquestion: when did Steve Jobs die?"
+    ]
+}

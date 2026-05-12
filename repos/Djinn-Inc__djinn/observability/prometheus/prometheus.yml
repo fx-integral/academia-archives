@@ -1,0 +1,39 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Remote validators (update targets with your deployment IPs/ports)
+  - job_name: "validator-remote"
+    static_configs:
+      - targets:
+          # Example: "YOUR_HOST_IP:12223"
+          []
+        labels:
+          environment: "testnet"
+          host: "remote"
+    metrics_path: /metrics
+    scrape_timeout: 10s
+
+  # Local validators (running on same host as prometheus)
+  - job_name: "validator-local"
+    static_configs:
+      - targets:
+          - "host.docker.internal:8431"
+          - "host.docker.internal:8432"
+        labels:
+          environment: "testnet"
+          host: "local"
+    metrics_path: /metrics
+
+  # Miner (update target with your deployment IP/port)
+  - job_name: "miner"
+    static_configs:
+      - targets:
+          # Example: "YOUR_HOST_IP:12222"
+          []
+        labels:
+          environment: "testnet"
+          host: "remote"
+    metrics_path: /metrics
+    scrape_timeout: 10s

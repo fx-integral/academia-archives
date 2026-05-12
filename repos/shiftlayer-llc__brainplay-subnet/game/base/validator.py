@@ -1,0 +1,1189 @@
+# The MIT License (MIT)
+# Copyright © 2023 Yuma Rao
+# Copyright © 2025 ShiftLayer
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+# documentation files (the “Software”), to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software,
+# and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+# the Software.
+
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+# THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+
+import copy
+import json
+import os
+import sys
+import time
+import numpy as np
+import asyncio
+import argparse
+import threading
+import subprocess
+from datetime import datetime, timezone
+import bittensor as bt
+import wandb
+
+from typing import List, Optional, Union
+from traceback import print_exception
+
+from game.base.neuron import BaseNeuron
+from game.base.utils.weight_utils import (
+    process_weights_for_netuid,
+    convert_weights_and_uids_for_emit,
+)  # TODO: Replace when bittensor switches to numpy
+from game.core.codes import (
+    get_game_code_info,
+    list_supported_game_codes,
+    list_supported_game_codes_for_weight_group,
+    normalize_game_code,
+)
+from game.core.registry import get_registry
+from game.config import add_validator_args
+from game.config.defaults import DEFAULT_SCORING_INTERVAL
+from game.storage.aggregation import parse_interval_to_seconds
+from game.storage.legacy_codenames_store import ScoreStore
+from game.storage.store import GenericStore
+from game.storage.weight_state import WeightStateStore
+from game.plugins.codenames.game_types import Competition, Game
+from dotenv import load_dotenv
+
+load_dotenv()  # take environment variables from .env.
+
+
+class BaseValidatorNeuron(BaseNeuron):
+    """
+    Base class for Bittensor validators. Your validator should inherit from this class.
+    """
+
+    neuron_type: str = "ValidatorNeuron"
+
+    @classmethod
+    def add_args(cls, parser: argparse.ArgumentParser):
+        super().add_args(parser)
+        add_validator_args(cls, parser)
+
+    def __init__(self, config=None):
+        super().__init__(config=config)
+
+        # Set up initial scoring weights for validation
+        bt.logging.info("Building validation weights.")
+
+        self.wandb_runs = [None, None]
+        # Init sync with the network. Updates the metagraph.
+        self.sync()
+
+        # Serve axon to enable external connections.
+        if not self.config.neuron.axon_off:
+            self.serve_axon()
+        else:
+            bt.logging.warning("axon off, not serving ip to chain.")
+
+        # Create asyncio event loop to manage async tasks.
+        self.loop = asyncio.get_event_loop()
+
+        # Instantiate runners
+        self.should_exit: bool = False
+        self.is_running: bool = False
+        self.thread: Union[threading.Thread, None] = None
+        self.competition_processes: dict[str, subprocess.Popen] = {}
+        self.game_plugin = None
+
+    @staticmethod
+    def _competition_codes_for_main() -> list[str]:
+        return list(list_supported_game_codes())
+
+    @staticmethod
+    def _base_validator_argv(argv: list[str]) -> list[str]:
+        cleaned_args: list[str] = []
+        skip_next = False
+        for arg in argv:
+            if skip_next:
+                skip_next = False
+                continue
+            if arg == "--competition":
+                skip_next = True
+                continue
+            if arg.startswith("--competition="):
+                continue
+            cleaned_args.append(arg)
+        return cleaned_args
+
+    def _stop_competition_subprocesses(self) -> None:
+        bt.logging.debug("Stopping competition subprocesses.")
+        for competition_code, process in list(self.competition_processes.items()):
+            if process is None:
+                continue
+            try:
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                bt.logging.warning(
+                    f"Competition subprocess {competition_code} did not exit after terminate(); killing."
+                )
+                process.kill()
+                process.wait(timeout=5)
+            finally:
+                self.competition_processes.pop(competition_code, None)
+        bt.logging.debug("Stopped competition subprocesses.")
+
+    def serve_axon(self):
+        """Serve axon to enable external connections."""
+
+        bt.logging.info("serving ip to chain...")
+        try:
+            self.axon = bt.axon(wallet=self.wallet, config=self.config)
+
+            try:
+                self.subtensor.serve_axon(
+                    netuid=self.config.netuid,
+                    axon=self.axon,
+                )
+                bt.logging.info(
+                    f"Running validator {self.axon} on network: {self.config.subtensor.chain_endpoint} with netuid: {self.config.netuid}"
+                )
+            except Exception as e:
+                bt.logging.error(f"Failed to serve Axon with exception: {e}")
+                pass
+
+        except Exception as e:
+            bt.logging.error(f"Failed to create Axon initialize with exception: {e}")
+            pass
+
+    async def concurrent_forward(self):
+        coroutines = [
+            self.forward() for _ in range(self.config.neuron.num_concurrent_forwards)
+        ]
+        await asyncio.gather(*coroutines)
+
+    def _ensure_default_game_plugins_registered(self):
+        """Register built-in plugins needed for current runtime compatibility."""
+        registry = get_registry()
+        if registry.maybe_get_by_game_code("codenames") is None:
+            from game.plugins.codenames import get_codenames_plugin
+
+            registry.register(get_codenames_plugin())
+        if registry.maybe_get_by_game_code("twentyq") is None:
+            from game.plugins.twentyq import get_twentyq_plugin
+
+            registry.register(get_twentyq_plugin())
+        if registry.maybe_get_by_game_code("supermario") is None:
+            from game.plugins.supermario import get_supermario_plugin
+
+            registry.register(get_supermario_plugin())
+        return registry
+
+    def _resolve_game_plugin_from_config(self) -> Optional[object]:
+        """Resolve the plugin for current config (or ``None`` in main mode)."""
+        if getattr(self.config, "competition", None) == "main":
+            return None
+
+        registry = self._ensure_default_game_plugins_registered()
+        competition_code = getattr(self.config, "competition", None)
+        game_code = getattr(getattr(self.config, "game", None), "code", None)
+
+        plugin = None
+        if competition_code:
+            plugin = registry.maybe_get_by_game_code(competition_code)
+            if plugin is None:
+                try:
+                    plugin = registry.get_by_competition_code(competition_code)
+                except KeyError:
+                    plugin = None
+        if plugin is None and game_code:
+            plugin = registry.maybe_get_by_game_code(game_code)
+
+        if plugin is not None:
+            plugin.validate_config(self.config)
+        return plugin
+
+    async def forward_via_plugin(self):
+        """Dispatch one validator round through the plugin layer.
+
+        Falls back to the legacy codenames forward function if no plugin is
+        resolved, so existing behavior remains available during migration.
+        """
+        plugin = self.game_plugin
+        if plugin is None:
+            plugin = self._resolve_game_plugin_from_config()
+            self.game_plugin = plugin
+
+        if plugin is None:
+            bt.logging.warning(
+                "No game plugin resolved; falling back to legacy validator forward."
+            )
+            from game.validator import forward as legacy_forward
+
+            return await legacy_forward(self)
+
+        runner = plugin.create_validator_runner(self)
+        result = await runner.run_round()
+        if getattr(plugin, "game_code", None) != "codenames":
+            self._persist_generic_session_result(result)
+        return result
+
+    def _persist_generic_session_result(self, result) -> None:
+        if not getattr(self, "generic_store", None):
+            return
+
+        self.generic_store.upsert_session(
+            {
+                "session_id": result.session_id,
+                "game_code": result.game_code,
+                "competition_code": result.competition_code,
+                "validator_hotkey": self.wallet.hotkey.ss58_address,
+                "status": result.status,
+                "started_at": result.started_at,
+                "ended_at": result.ended_at,
+                "metadata_json": json.dumps(result.metadata or {}, sort_keys=True),
+            }
+        )
+        for attempt in result.attempts:
+            self.generic_store.upsert_attempt(
+                {
+                    "attempt_id": attempt.attempt_id
+                    or f"{result.session_id}:{attempt.miner_hotkey}",
+                    "session_id": result.session_id,
+                    "miner_hotkey": attempt.miner_hotkey,
+                    "status": attempt.status,
+                    "score": attempt.score,
+                    "started_at": attempt.started_at,
+                    "ended_at": attempt.ended_at,
+                    "summary_json": json.dumps(attempt.metadata or {}, sort_keys=True),
+                }
+            )
+
+    def init_db(self):
+        scores_db_path = os.path.join("/tmp", f"{self.competition.value}.db")
+
+        # Clear the database if the flag is set
+        if getattr(self.config, "clear_db", False):
+            removed_any = False
+            for path in (
+                scores_db_path,
+                f"{scores_db_path}-wal",
+                f"{scores_db_path}-shm",
+            ):
+                if not os.path.exists(path):
+                    continue
+                try:
+                    os.remove(path)
+                    removed_any = True
+                    bt.logging.info(f"Removed existing score database file at {path}")
+                except OSError as err:
+                    bt.logging.error(
+                        f"Failed to remove existing score database file at {path}: {err}"
+                    )
+            if not removed_any:
+                bt.logging.info(
+                    "Score database flag set but no existing database files found to remove."
+                )
+
+        # Initialize endpoints urls and game code
+        self.backend_base = "https://backend.shiftlayer.ai"
+        try:
+            if getattr(self.config.subtensor, "network", None) == "test":
+                self.backend_base = "https://dev-backend.shiftlayer.ai"
+        except AttributeError:
+            pass
+        bt.logging.info(f"Using backend: {self.backend_base}")
+
+        self.active_miners_endpoint = (
+            f"{self.backend_base}/api/v1/games/{self.game.value}/miner/active"
+        )
+
+        # set endpoints for scores
+        scores_endpoint = f"{self.backend_base}/api/v1/games/{self.game.value}/score"
+        scores_fetch_endpoint = (
+            f"{self.backend_base}/api/v1/games/{self.game.value}/sync"
+        )
+
+        self.score_store = ScoreStore(
+            scores_db_path,
+            backend_url=scores_endpoint,
+            fetch_url=scores_fetch_endpoint,
+            signer=self.build_signed_headers,
+        )
+        self.score_store.init()
+        self.generic_store = GenericStore(scores_db_path)
+        self.generic_store.init()
+        self.score_store.generic_store = self.generic_store
+        self.weight_state = WeightStateStore("/tmp/brainplay_weight_state.db")
+        self.weight_state.init()
+        scoring_interval_text = DEFAULT_SCORING_INTERVAL
+        if hasattr(self.config, "scoring") and getattr(
+            self.config.scoring, "interval", None
+        ):
+            scoring_interval_text = self.config.scoring.interval
+        self.scoring_window_seconds = parse_interval_to_seconds(scoring_interval_text)
+
+    def run(self):
+        """
+        Initiates and manages the main loop for the miner on the Bittensor network. The main loop handles graceful shutdown on keyboard interrupts and logs unforeseen errors.
+
+        This function performs the following primary tasks:
+        1. Check for registration on the Bittensor network.
+        2. Continuously forwards queries to the miners on the network, rewarding their responses and updating the scores accordingly.
+        3. Periodically resynchronizes with the chain; updating the metagraph with the latest network state and setting weights.
+
+        The essence of the validator's operations is in the forward function, which is called every step. The forward function is responsible for querying the network and scoring the responses.
+
+        Note:
+            - The function leverages the global configurations set during the initialization of the miner.
+            - The miner's axon serves as its interface to the Bittensor network, handling incoming and outgoing requests.
+
+        Raises:
+            KeyboardInterrupt: If the miner is stopped by a manual interruption.
+            Exception: For unforeseen errors during the miner's operation, which are logged for diagnosis.
+        """
+
+        # Init competition and game codes
+        self.config.competition = normalize_game_code(self.config.competition)
+        competition = Competition(self.config.competition)
+        competition_info = get_game_code_info(self.config.competition)
+        configured_game_code = getattr(self.config.game, "code", None)
+        configured_game_code = normalize_game_code(configured_game_code)
+        if competition != Competition.CODENAMES and (
+            not configured_game_code or configured_game_code == "codenames"
+        ):
+            configured_game_code = competition_info.game_code
+        self.config.game.code = configured_game_code
+        game = Game(configured_game_code)
+        self.competition = competition
+        self.mechid = competition_info.publish_mechid
+        self.game = game
+        self.game_plugin = self._resolve_game_plugin_from_config()
+        if self.game_plugin is not None:
+            plugin_name = getattr(
+                self.game_plugin, "display_name", self.game_plugin.__class__.__name__
+            )
+            bt.logging.info(
+                f"Resolved game plugin: {plugin_name} "
+                f"(game={getattr(self.game_plugin, 'game_code', 'unknown')} "
+                f"competition={getattr(self.game_plugin, 'competition_code', 'unknown')} "
+                f"mechid={getattr(self.game_plugin, 'mechid', 'unknown')})"
+            )
+        else:
+            bt.logging.info(
+                f"No plugin resolved for competition={self.config.competition} "
+                "(main mode or legacy fallback)."
+            )
+
+        self.init_db()
+
+        # Init wandb
+        if self.config.wandb.off is False:
+            bt.logging.info("Wandb logging is turned on.")
+
+            def _start_wandb_run():
+                if self.wandb_runs[competition.mechid]:
+                    try:
+                        self.wandb_runs[competition.mechid].finish()
+                    except Exception as err:
+                        bt.logging.warning(
+                            f"Failed to finish existing Wandb run: {err}"
+                        )
+                # Set wandb project name based on subtensor network
+                project_name = self.config.wandb.project_name
+                if (
+                    hasattr(self.config, "subtensor")
+                    and hasattr(self.config.subtensor, "network")
+                    and self.config.subtensor.network == "test"
+                    and project_name == "brainplay"
+                ):
+                    project_name = "testnet"
+
+                bt.logging.info(
+                    f"Initializing wandb with project name: {project_name}, entity: {self.config.wandb.entity}"
+                )
+                self.wandb_runs[competition.mechid] = wandb.init(
+                    project=project_name,
+                    entity=self.config.wandb.entity,
+                    name=f"{competition.value}-{self.wallet.hotkey.ss58_address[:6]}",
+                )
+                if self.config.wandb.restart_interval > 0:
+                    _wandb_restart_timer = threading.Timer(
+                        self.config.wandb.restart_interval * 3600, _start_wandb_run
+                    )
+                    _wandb_restart_timer.daemon = True
+                    _wandb_restart_timer.start()
+                    bt.logging.info(
+                        f"Wandb auto-restart timer scheduled in {self.config.wandb.restart_interval} hours."
+                    )
+
+            _start_wandb_run()
+        else:
+            bt.logging.info("Wandb logging is turned off.")
+            self.wandb_runs[competition.mechid] = None
+
+        bt.logging.info(f"Starting {competition.value} validator main loop.")
+
+        # Check that validator is registered on the network.
+        self.sync()
+
+        bt.logging.info(f"Validator starting at block: {self.block}")
+
+        # This loop maintains the validator's operations until intentionally stopped.
+        while True:
+            try:
+                self.step += 1
+                bt.logging.info(f"step({self.step}) block({self.block})")
+
+                # Check weights version and run if matches (unless explicitly disabled).
+                if not getattr(self.config, "no_version_checking", False):
+                    weights_version = self.subtensor.get_subnet_hyperparameters(
+                        self.config.netuid
+                    ).weights_version
+                    if self.spec_version != weights_version:
+                        bt.logging.warning(
+                            f"Spec version {self.spec_version} does not match subnet weights version {weights_version}. Please upgrade your code."
+                        )
+                        time.sleep(12)
+                        continue
+                started_at = time.time()
+                # Run multiple forwards concurrently.
+                self.loop.run_until_complete(self.concurrent_forward())
+
+                # Sync metagraph and potentially set weights.
+                self.sync()
+
+                game_interval = parse_interval_to_seconds(self.config.game.interval)
+                if time.time() - started_at < game_interval:
+                    bt.logging.info(
+                        f"Sleeping for {game_interval - (time.time() - started_at)} seconds."
+                    )
+                    time.sleep(max(game_interval - (time.time() - started_at), 10))
+
+                # Check if we should exit.
+                if self.should_exit:
+                    break
+
+            # If someone intentionally stops the validator, it'll safely terminate operations.
+            except KeyboardInterrupt:
+                self.axon.stop()
+                bt.logging.success("Validator killed by keyboard interrupt.")
+                for wandb_run in self.wandb_runs.values():
+                    if wandb_run:
+                        wandb_run.finish()
+                exit()
+
+            # In case of unforeseen errors, the validator will log the error and continue operations.
+            except Exception as err:
+                bt.logging.error(f"Error during validation: {str(err)}")
+                bt.logging.debug(
+                    str(print_exception(type(err), err, err.__traceback__))
+                )
+
+                time.sleep(2)
+
+    def run_in_background_thread(self):
+        """
+        Starts the validator's operations in a background thread upon entering the context.
+        This method facilitates the use of the validator in a 'with' statement.
+        """
+        if not self.is_running:
+            bt.logging.debug("Starting validator in background thread.")
+            self.should_exit = False
+            if self.config.competition == "main":
+
+                def stream_output(prefix, process):
+                    for line in process.stdout:
+                        print(f"[{prefix}] {line}", end="")
+
+                python_exe = sys.executable
+                args = self._base_validator_argv(sys.argv.copy())
+
+                for competition_code in self._competition_codes_for_main():
+                    process = subprocess.Popen(
+                        [python_exe, "-u", *args, "--competition", competition_code],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                    )
+                    self.competition_processes[competition_code] = process
+                    threading.Thread(
+                        target=stream_output,
+                        args=(competition_code.upper(), process),
+                        daemon=True,
+                    ).start()
+            else:
+                self.thread = threading.Thread(target=self.run, daemon=True)
+                self.thread.start()
+            self.is_running = True
+            bt.logging.debug("Started")
+
+    def stop_run_thread(self):
+        """
+        Stops the validator's operations that are running in the background thread.
+        """
+        if self.is_running:
+            if self.config.competition == "main":
+                self._stop_competition_subprocesses()
+                self.is_running = False
+            else:
+                bt.logging.debug("Stopping validator in background thread.")
+                self.should_exit = True
+                self.thread.join(5)
+                self.is_running = False
+                self.score_store.close()
+                bt.logging.debug("Stopped")
+
+    def build_signed_headers(self) -> dict:
+        timestamp = int(datetime.now(tz=timezone.utc).timestamp())
+        message = f"<Bytes>{timestamp}</Bytes>"
+        signature = self.wallet.hotkey.sign(message)
+        return {
+            "X-Validator-Hotkey": self.wallet.hotkey.ss58_address,
+            "X-Validator-Signature": signature.hex(),
+            "X-Validator-Timestamp": str(timestamp),
+            "x-game-code": self.game.value or "codenames",
+            "x-competition-code": self.competition.value,
+        }
+
+    def __enter__(self):
+        self.run_in_background_thread()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        """
+        Stops the validator's background operations upon exiting the context.
+        This method facilitates the use of the validator in a 'with' statement.
+
+        Args:
+            exc_type: The type of the exception that caused the context to be exited.
+                      None if the context was exited without an exception.
+            exc_value: The instance of the exception that caused the context to be exited.
+                       None if the context was exited without an exception.
+            traceback: A traceback object encoding the stack trace.
+                       None if the context was exited without an exception.
+        """
+        if self.is_running:
+            bt.logging.debug("Stopping validator in background thread.")
+            self.should_exit = True
+            if self.config.competition == "main":
+                self._stop_competition_subprocesses()
+            if self.thread:
+                self.thread.join(5)
+            self.is_running = False
+            bt.logging.debug("Stopped")
+
+    def set_weights(self):
+        """
+        Sets the validator weights to the metagraph hotkeys based on the scores it has received from the miners. The weights determine the trust and incentive level the validator assigns to miner nodes on the network.
+        """
+
+        now = time.time()
+        blocks_since_epoch = self.subtensor.get_subnet_info(
+            self.config.netuid
+        ).blocks_since_epoch
+
+        end_ts = self.subtensor.get_timestamp().timestamp() - (blocks_since_epoch * 12)
+        since_ts = end_ts - self.scoring_window_seconds
+
+        bt.logging.info(f"Setting weights using scores from {since_ts} to {end_ts}")
+
+        competition = self.competition
+        comp_value = competition.value
+        competition_info = get_game_code_info(comp_value)
+        validator_hotkey = self.wallet.hotkey.ss58_address
+        use_generic_scores = (
+            comp_value != "codenames"
+            and getattr(self, "generic_store", None) is not None
+        )
+        latest_ts = (
+            self.generic_store.latest_timestamp(
+                comp_value, validator_hotkey=validator_hotkey
+            )
+            if use_generic_scores
+            else self.score_store.latest_scores_all_timestamp(
+                validator_hotkey=validator_hotkey
+            )
+        )
+
+        age_seconds = now - latest_ts
+        if age_seconds > 3600:
+            bt.logging.warning(
+                f"Latest synced score is older than 1 hour ({age_seconds:.0f}s). Switching to burn code."
+            )
+            self._store_and_publish_weight_snapshot(
+                competition_code=comp_value,
+                competition_info=competition_info,
+                since_ts=since_ts,
+                end_ts=end_ts,
+                raw_weights=self._burn_vector(),
+                status="stale",
+                scores_summary={"reason": "stale_scores", "age_seconds": age_seconds},
+            )
+            return
+
+        weights = np.zeros(self.metagraph.n, dtype=np.float32)
+
+        if use_generic_scores:
+            avg_scores, total_scores, counts = (
+                self.generic_store.window_average_scores_by_hotkey(
+                    comp_value, since_ts, end_ts, validator_hotkey=validator_hotkey
+                )
+            )
+            win_counts, loss_counts = self.generic_store.win_loss_counts_in_window(
+                comp_value, since_ts, end_ts, validator_hotkey=validator_hotkey
+            )
+            observer_counts = {}
+        else:
+            avg_scores, total_scores, counts = (
+                self.score_store.window_average_scores_by_hotkey(
+                    comp_value, since_ts, end_ts, validator_hotkey=validator_hotkey
+                )
+            )
+            win_counts, loss_counts = self.score_store.win_loss_counts_in_window(
+                comp_value, since_ts, end_ts, validator_hotkey=validator_hotkey
+            )
+            observer_counts = self.score_store.observer_records_in_window(
+                comp_value,
+                since_ts,
+                end_ts,
+                validator_hotkey=validator_hotkey,
+            )
+        hotkeys_with_minimum_stake = [
+            self.metagraph.hotkeys[uid]
+            for uid in range(self.metagraph.n)
+            if self.metagraph.S[uid] >= self.config.neuron.minimum_stake_requirement
+        ]
+        avg_scores = {
+            hotkey: score
+            for hotkey, score in avg_scores.items()
+            if hotkey in hotkeys_with_minimum_stake
+        }
+        counts = {
+            hotkey: count
+            for hotkey, count in counts.items()
+            if hotkey in hotkeys_with_minimum_stake
+        }
+        win_counts = {
+            hotkey: count
+            for hotkey, count in win_counts.items()
+            if hotkey in hotkeys_with_minimum_stake
+        }
+        loss_counts = {
+            hotkey: count
+            for hotkey, count in loss_counts.items()
+            if hotkey in hotkeys_with_minimum_stake
+        }
+        observer_counts = {
+            hotkey: count
+            for hotkey, count in observer_counts.items()
+            if hotkey in hotkeys_with_minimum_stake
+        }
+        total_scores = {
+            hotkey: score
+            for hotkey, score in total_scores.items()
+            if hotkey in hotkeys_with_minimum_stake
+        }
+        # Set record count limit for setting weights to avoid actors with few high
+        # scores (e.g. new registrations). Empty score windows should not crash.
+        eligible_counts = [
+            counts.get(self.metagraph.hotkeys[uid], 0)
+            for uid in range(self.metagraph.n)
+            if self.metagraph.S[uid] >= self.config.neuron.minimum_stake_requirement
+        ]
+        median_count = float(np.median(eligible_counts)) if eligible_counts else 0.0
+        record_count_limit = int(median_count * 0.9)
+        max_count = max(counts.values(), default=0)
+        bt.logging.info(
+            f"Competition {comp_value} record count limit for weight setting: {record_count_limit} (Max: {max_count}, Median: {median_count})"
+        )
+
+        avg_scores_by_uid = {
+            uid: avg_scores.get(hotkey, 0.0)
+            for uid, hotkey in enumerate(self.metagraph.hotkeys)
+        }
+
+        comp_games = (
+            self.generic_store.games_in_window(
+                comp_value, since_ts, end_ts, validator_hotkey=validator_hotkey
+            )
+            if use_generic_scores
+            else self.score_store.games_in_window(
+                since_ts,
+                end_ts,
+                comp_value,
+                validator_hotkey=validator_hotkey,
+            )
+        )
+        if comp_games < 30:
+            self._log_competition_scores(
+                comp_value=comp_value,
+                counts=counts,
+                win_counts=win_counts,
+                loss_counts=loss_counts,
+                avg_scores_by_uid=avg_scores_by_uid,
+                record_count_limit=0,
+                observer_counts=observer_counts,
+            )
+            bt.logging.warning(
+                f"Not enough games for competition {comp_value}; skipping its allocation. ({comp_games} < 30)"
+            )
+            self._store_and_publish_weight_snapshot(
+                competition_code=comp_value,
+                competition_info=competition_info,
+                since_ts=since_ts,
+                end_ts=end_ts,
+                raw_weights=self._burn_vector(),
+                status="insufficient_games",
+                scores_summary={"games": comp_games},
+            )
+            return
+
+        avg_scores_after_record_limit = {
+            hotkey: score
+            for hotkey, score in avg_scores.items()
+            if counts.get(hotkey, 0) >= record_count_limit
+        }
+        if not avg_scores_after_record_limit:
+            bt.logging.warning(
+                f"No scores for competition {comp_value}; skipping its allocation."
+            )
+            self._store_and_publish_weight_snapshot(
+                competition_code=comp_value,
+                competition_info=competition_info,
+                since_ts=since_ts,
+                end_ts=end_ts,
+                raw_weights=self._burn_vector(),
+                status="no_scores",
+                scores_summary={"games": comp_games},
+            )
+            return
+
+        top_score = max(avg_scores_after_record_limit.values())
+        if top_score <= 0:
+            bt.logging.warning(
+                f"Top score for competition {comp_value} is non-positive; skipping."
+            )
+            self._store_and_publish_weight_snapshot(
+                competition_code=comp_value,
+                competition_info=competition_info,
+                since_ts=since_ts,
+                end_ts=end_ts,
+                raw_weights=self._burn_vector(),
+                status="non_positive_top_score",
+                scores_summary={"top_score": top_score},
+            )
+            return
+
+        top_hotkeys = [
+            hotkey
+            for hotkey, score in avg_scores_after_record_limit.items()
+            if score == top_score
+        ]
+        winner_uids = []
+        for hotkey in top_hotkeys:
+            try:
+                winner_uids.append(self.metagraph.hotkeys.index(hotkey))
+            except ValueError:
+                bt.logging.warning(
+                    f"Top hotkey {hotkey} for competition {comp_value} not in metagraph."
+                )
+        if not winner_uids:
+            bt.logging.warning(
+                f"No top hotkeys for competition {comp_value} present in metagraph; skipping."
+            )
+            self._store_and_publish_weight_snapshot(
+                competition_code=comp_value,
+                competition_info=competition_info,
+                since_ts=since_ts,
+                end_ts=end_ts,
+                raw_weights=self._burn_vector(),
+                status="winner_missing",
+                scores_summary={"top_hotkeys": top_hotkeys},
+            )
+            return
+
+        if len(winner_uids) > 1:
+            bt.logging.info(
+                f"Competition {comp_value} has multiple winners: {winner_uids} with score {top_score}; skipping"
+            )
+            self._store_and_publish_weight_snapshot(
+                competition_code=comp_value,
+                competition_info=competition_info,
+                since_ts=since_ts,
+                end_ts=end_ts,
+                raw_weights=self._burn_vector(),
+                status="tied_winner",
+                scores_summary={"winner_uids": winner_uids, "top_score": top_score},
+            )
+            return
+
+        # Set minimum weight for scored miners
+        for hotkey, score in avg_scores.items():
+            if score > 0:
+                uid = self.metagraph.hotkeys.index(hotkey)
+                weights[uid] = 0.001
+
+        winner_uid = winner_uids[0]
+        weights[winner_uid] = 1.0
+        winner_hotkey = self.metagraph.hotkeys[winner_uid]
+
+        bt.logging.info(
+            f"Competition {comp_value} winner: Miner {winner_uid} Games: {counts.get(winner_hotkey, 0)}, Score: {total_scores.get(winner_hotkey, 0)}, WinRate: {(top_score * 100):.2f}%"
+        )
+
+        self._log_competition_scores(
+            comp_value=comp_value,
+            counts=counts,
+            win_counts=win_counts,
+            loss_counts=loss_counts,
+            avg_scores_by_uid=avg_scores_by_uid,
+            record_count_limit=record_count_limit,
+            observer_counts=observer_counts,
+        )
+
+        norm = np.linalg.norm(weights, ord=1, axis=0, keepdims=True)
+        if np.any(norm == 0) or np.isnan(norm).any():
+            norm = np.ones_like(norm)
+        raw_weights = weights / norm
+
+        self._store_and_publish_weight_snapshot(
+            competition_code=comp_value,
+            competition_info=competition_info,
+            since_ts=since_ts,
+            end_ts=end_ts,
+            raw_weights=raw_weights,
+            status="ready",
+            scores_summary={
+                "top_score": top_score,
+                "winner_hotkey": winner_hotkey,
+            },
+        )
+        time.sleep(12)  # Sleep to avoid nonce issues
+
+        self.resync_metagraph()
+
+    def _burn_vector(self) -> np.ndarray:
+        burn_weights = np.zeros(self.metagraph.n, dtype=np.float32)
+        if self.metagraph.n > 0:
+            burn_weights[0] = 1.0
+        return burn_weights
+
+    def _store_and_publish_weight_snapshot(
+        self,
+        *,
+        competition_code: str,
+        competition_info,
+        since_ts: float,
+        end_ts: float,
+        raw_weights: np.ndarray,
+        status: str,
+        scores_summary: dict,
+    ) -> None:
+        validator_hotkey = self.wallet.hotkey.ss58_address
+        self.weight_state.upsert_snapshot(
+            validator_hotkey=validator_hotkey,
+            competition_code=competition_code,
+            weight_group=competition_info.weight_group,
+            publish_mechid=competition_info.publish_mechid,
+            window_since_ts=int(since_ts),
+            window_end_ts=int(end_ts),
+            weights=raw_weights,
+            scores_summary=scores_summary,
+            status=status,
+        )
+        self._publish_weight_group(
+            validator_hotkey=validator_hotkey,
+            weight_group=competition_info.weight_group,
+            publish_mechid=competition_info.publish_mechid,
+        )
+
+    def _publish_weight_group(
+        self,
+        *,
+        validator_hotkey: str,
+        weight_group: str,
+        publish_mechid: int,
+    ) -> None:
+        required_codes = list_supported_game_codes_for_weight_group(weight_group)
+        snapshots = self.weight_state.get_fresh_snapshots(
+            validator_hotkey=validator_hotkey,
+            weight_group=weight_group,
+            freshness_ttl_sec=3600,
+        )
+        ready_snapshots = {
+            code: snapshot
+            for code, snapshot in snapshots.items()
+            if snapshot.get("status") == "ready"
+        }
+        non_ready_snapshots = {
+            code: snapshot
+            for code, snapshot in snapshots.items()
+            if code in required_codes and snapshot.get("status") != "ready"
+        }
+        missing_codes = [code for code in required_codes if code not in ready_snapshots]
+        if missing_codes:
+            if non_ready_snapshots:
+                status_summary = {
+                    code: snapshot.get("status")
+                    for code, snapshot in non_ready_snapshots.items()
+                }
+                bt.logging.warning(
+                    f"[WEIGHTS] Fresh non-ready snapshots for group={weight_group}: "
+                    f"{status_summary}; publishing burn weights."
+                )
+                final_weights = self._burn_vector()
+            else:
+                previous = self.weight_state.get_publication(
+                    validator_hotkey=validator_hotkey, weight_group=weight_group
+                )
+                if previous is not None:
+                    bt.logging.info(
+                        f"[WEIGHTS] Missing fresh snapshots for group={weight_group}: "
+                        f"{missing_codes}; keeping last publication."
+                    )
+                    return
+                bt.logging.warning(
+                    f"[WEIGHTS] Missing fresh snapshots for group={weight_group}: "
+                    f"{missing_codes}; publishing burn weights."
+                )
+                final_weights = self._burn_vector()
+        else:
+            ratios = self._weight_group_ratios(weight_group, ready_snapshots)
+            final_weights = np.zeros(self.metagraph.n, dtype=np.float32)
+            for code, ratio in ratios.items():
+                snapshot_weights = np.asarray(
+                    ready_snapshots[code]["weights"], dtype=np.float32
+                )
+                if snapshot_weights.shape[0] != self.metagraph.n:
+                    bt.logging.warning(
+                        f"[WEIGHTS] Snapshot size mismatch for {code}; publishing burn."
+                    )
+                    final_weights = self._burn_vector()
+                    break
+                final_weights = final_weights + (snapshot_weights * float(ratio))
+            norm = np.linalg.norm(final_weights, ord=1, axis=0, keepdims=True)
+            if np.any(norm == 0) or np.isnan(norm).any():
+                final_weights = self._burn_vector()
+            else:
+                final_weights = final_weights / norm
+
+        self._set_weights(publish_mechid, final_weights)
+        self.weight_state.upsert_publication(
+            validator_hotkey=validator_hotkey,
+            weight_group=weight_group,
+            publish_mechid=publish_mechid,
+            weights=final_weights,
+            source_competitions=list(required_codes),
+        )
+
+    @staticmethod
+    def _weight_group_ratios(
+        weight_group: str, snapshots: dict[str, dict]
+    ) -> dict[str, float]:
+        if weight_group == "llm" and {"codenames", "twentyq"}.issubset(
+            snapshots.keys()
+        ):
+            return {"codenames": 0.5, "twentyq": 0.5}
+        count = max(1, len(snapshots))
+        ratio = 1.0 / float(count)
+        return {code: ratio for code in snapshots}
+
+    def _log_competition_scores(
+        self,
+        *,
+        comp_value: str,
+        counts: dict,
+        win_counts: dict,
+        loss_counts: dict,
+        avg_scores_by_uid: dict,
+        record_count_limit: int,
+        observer_counts: dict,
+    ) -> None:
+        """Log competition scores as a table before setting weights."""
+        table_rows = []
+        for uid, hotkey in enumerate(self.metagraph.hotkeys):
+            if hotkey not in counts:
+                continue
+            games_played = int(counts.get(hotkey, 0))
+            wins_value = int(win_counts.get(hotkey, 0))
+            losses_value = int(loss_counts.get(hotkey, 0))
+            score_value = float(avg_scores_by_uid.get(uid, 0.0))
+            observer_games = int(observer_counts.get(hotkey, 0))
+            table_rows.append(
+                {
+                    "uid": uid,
+                    "hotkey": hotkey,
+                    "games": games_played,
+                    "wins": wins_value,
+                    "losses": losses_value,
+                    "score": score_value,
+                    "observer_games": observer_games,
+                    "below_limit": games_played < record_count_limit,
+                }
+            )
+
+        normal_rows = [row for row in table_rows if not row["below_limit"]]
+        below_limit_rows = [row for row in table_rows if row["below_limit"]]
+
+        normal_rows.sort(key=lambda row: (-row["score"], -row["games"], row["uid"]))
+        below_limit_rows.sort(
+            key=lambda row: (-row["score"], -row["games"], row["uid"])
+        )
+
+        ordered_rows = normal_rows + below_limit_rows
+
+        headers = [
+            "Rank",
+            "UID",
+            "Hotkey",
+            "Games Played",
+            "Win",
+            "Lost",
+            "Score",
+            "Observer Games",
+        ]
+        table_data = [headers]
+        for rank, row in enumerate(ordered_rows, start=1):
+            table_data.append(
+                [
+                    str(rank),
+                    str(row["uid"]),
+                    row["hotkey"],
+                    str(row["games"]),
+                    str(row["wins"]),
+                    str(row["losses"]),
+                    f"{row['score']:.4f}",
+                    str(row["observer_games"]),
+                ]
+            )
+
+        column_widths = [
+            max(len(row[col_index]) for row in table_data)
+            for col_index in range(len(headers))
+        ]
+
+        border_line = "+" + "+".join("-" * (width + 2) for width in column_widths) + "+"
+
+        def _format_row(
+            cells: List[str],
+            *,
+            cell_prefix: str = "",
+            cell_suffix: str = "",
+        ) -> str:
+            return (
+                "| "
+                + " | ".join(
+                    f"{cell_prefix}{cell.ljust(width)}{cell_suffix}"
+                    for cell, width in zip(cells, column_widths)
+                )
+                + " |"
+            )
+
+        header_line = _format_row(table_data[0])
+
+        table_lines = [border_line, header_line, border_line]
+
+        grey_section_started = False
+        for row_index, row_cells in enumerate(table_data[1:], start=0):
+            is_first_row = row_index == 0
+            is_below_limit = ordered_rows[row_index]["below_limit"]
+            if is_below_limit and not grey_section_started:
+                grey_section_started = True
+                table_lines.append(border_line)
+            if is_first_row:
+                formatted_line = _format_row(
+                    row_cells, cell_prefix="\033[92m", cell_suffix="\033[0m"
+                )
+            elif is_below_limit:
+                formatted_line = _format_row(
+                    row_cells, cell_prefix="\033[90m", cell_suffix="\033[0m"
+                )
+            else:
+                formatted_line = _format_row(row_cells)
+            table_lines.append(formatted_line)
+
+        table_lines.append(border_line)
+
+        table_output = "\n".join(table_lines)
+        bt.logging.info(f"{comp_value} scores:\n{table_output}")
+
+    def _burn_weights(self, mechid: int = None) -> None:
+        """Sets weights to burn code (all weight to UID 0)."""
+        burn_weights = self._burn_vector()
+        if mechid is None:
+            self._set_weights(0, burn_weights)
+            self._set_weights(1, burn_weights)
+        else:
+            self._set_weights(mechid, burn_weights)
+
+    def _set_weights(self, mechid: int, weights: np.ndarray) -> None:
+        burn_weights = np.zeros(self.metagraph.n, dtype=np.float32)
+        burn_weights[0] = 1.0
+        weights = burn_weights * self.config.burn_ratio + weights * (
+            1 - self.config.burn_ratio
+        )
+        weights = np.asarray(weights, dtype=np.float32)
+        (
+            processed_weight_uids,
+            processed_weights,
+        ) = process_weights_for_netuid(
+            uids=self.metagraph.uids,
+            weights=weights,
+            netuid=self.config.netuid,
+            subtensor=self.subtensor,
+            metagraph=self.metagraph,
+        )
+        (
+            uint_uids,
+            uint_weights,
+        ) = convert_weights_and_uids_for_emit(
+            uids=processed_weight_uids, weights=processed_weights
+        )
+        bt.logging.info(
+            f"Setting weights for mechid={mechid}: UIDs: {uint_uids}, Weights: {uint_weights}"
+        )
+        result, msg = self.subtensor.set_weights(
+            wallet=self.wallet,
+            netuid=self.config.netuid,
+            uids=uint_uids,
+            mechid=mechid,
+            weights=uint_weights,
+            wait_for_finalization=False,
+            wait_for_inclusion=False,
+            version_key=self.spec_version,
+        )
+        if result is True:
+            bt.logging.info(f"set_weights(mechid={mechid}) on chain successfully!")
+        else:
+            bt.logging.error(f"set_weights(mechid={mechid}) failed: {msg}")
+
+    def resync_metagraph(self):
+        """Resyncs the metagraph and updates the hotkeys and moving averages based on the new metagraph."""
+        bt.logging.info("resync_metagraph()")
+
+        # Copies state of metagraph before syncing.
+        previous_metagraph = copy.deepcopy(self.metagraph)
+
+        # Sync the metagraph.
+        self.metagraph = self.subtensor.metagraph(
+            self.config.netuid, mechid=self.mechid
+        )
+
+        # Check if the metagraph axon info has changed.
+        if previous_metagraph.axons == self.metagraph.axons:
+            return
+
+        bt.logging.info(
+            "Metagraph updated, re-syncing hotkeys, dendrite pool and moving averages"
+        )
+
+    def save_state(self):
+        """Saves the state of the validator to a file."""
+        bt.logging.info("Saving validator state.")
+
+    def load_state(self):
+        """Loads the state of the validator from a file."""
+        bt.logging.info("Loading validator state.")

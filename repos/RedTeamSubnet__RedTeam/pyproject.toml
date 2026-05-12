@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=70.0.0,<83.0.0", "setuptools-scm>=8.0.4,<11.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "redteam_core"
+authors = [
+	{ name = "RedTeam" },
+	{ name = "Batkhuu Byambajav", email = "batkhuu10@gmail.com" },
+	{ name = "aliyuldashev" },
+	{ name = "BaratovSokhibjon" },
+	{ name = "abdibekbolot" },
+	{ name = "asadbey" },
+]
+description = "The RedTeam subnet by Innerworks is a decentralized platform designed to drive innovation in cybersecurity through competitive programming challenges."
+readme = "README.md"
+requires-python = ">=3.10,<4.0"
+keywords = [
+	"redteam_core",
+	"bittensor",
+	"subnet",
+	"innerworks",
+	"decentralized",
+	"miners",
+	"validators",
+	"challenges",
+]
+license-files = ["LICEN[CS]E*"]
+classifiers = [
+	"Development Status :: 4 - Beta",
+	"Intended Audience :: Developers",
+	"Topic :: Software Development :: Libraries",
+	"Operating System :: OS Independent",
+	"Programming Language :: Python :: 3",
+	"Programming Language :: Python :: 3.10",
+	"Programming Language :: Python :: 3.11",
+	"Programming Language :: Python :: 3.12",
+	"Programming Language :: Python :: 3.13",
+]
+dynamic = ["version", "dependencies", "optional-dependencies"]
+
+[tool.setuptools.dynamic]
+version = { attr = "redteam_core.__version__.__version__" }
+dependencies = { file = "./requirements.txt" }
+
+[tool.setuptools.dynamic.optional-dependencies]
+# Options dependencies for DEVELOPMENT
+test = { file = ["./requirements/requirements.test.txt"] }
+build = { file = ["./requirements/requirements.build.txt"] }
+docs = { file = ["./requirements/requirements.docs.txt"] }
+dev = { file = [
+	"./requirements/requirements.test.txt",
+	"./requirements/requirements.build.txt",
+	"./requirements/requirements.docs.txt",
+	"./requirements/requirements.dev.txt",
+] }
+
+[project.urls]
+Homepage = "https://github.com/RedTeamSubnet/RedTeam"
+Documentation = "https://docs.theredteam.io"
+Repository = "https://github.com/RedTeamSubnet/RedTeam.git"
+Issues = "https://github.com/RedTeamSubnet/RedTeam/issues"
+Changelog = "https://github.com/RedTeamSubnet/RedTeam/blob/main/CHANGELOG.md"

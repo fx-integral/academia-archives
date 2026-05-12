@@ -1,0 +1,1 @@
+TARGET_IMAGE_SIZE: tuple = (224, 224)

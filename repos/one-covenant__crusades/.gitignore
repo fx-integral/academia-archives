@@ -1,0 +1,83 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment
+.env
+.env.local
+
+# Database
+*.db
+*.sqlite3
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+/benchmark/model/
+/benchmark/data/
+/submissions/
+
+# Private test data (validators only)
+benchmark/data/test.pt
+
+# Local development files
+local_storage/
+crusades.db
+crusades_local.db
+
+# Local testing files
+.local_commitments/
+benchmark/
+
+# Test scripts (optional)
+scripts/test_chi_flow.py
+scripts/reset_leaderboard.py
+
+# Tokenizers (baked into Docker image at build time, not committed)
+tokenizers/
+
+# Arbos agent runtime
+arbos/.env
+arbos/state.json
+arbos/runs/
+arbos/best_submissions/
+arbos/logs/

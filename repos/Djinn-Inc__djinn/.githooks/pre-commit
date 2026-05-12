@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+#
+# Pre-commit hook: block commits containing crypto secrets.
+# Checks staged files only. Ignores .env.example, *.sample, and this hook.
+#
+
+set -euo pipefail
+
+RED='\033[0;31m'
+NC='\033[0m'
+
+# Get staged files (added/modified), excluding safe patterns
+STAGED=$(git diff --cached --name-only --diff-filter=ACM | \
+  grep -v '\.env\.example' | \
+  grep -v '\.sample$' | \
+  grep -v 'pre-commit' | \
+  grep -v 'node_modules/' | \
+  grep -v '\.lock$' | \
+  grep -v 'foundry.lock' || true)
+
+if [ -z "$STAGED" ]; then
+  exit 0
+fi
+
+ERRORS=""
+
+# 1. Ethereum private keys: 0x + 64 hex chars (but not zero addresses or known Anvil keys)
+#    Anvil keys are well-known test keys, allow them
+ANVIL_KEYS="ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80\|59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d\|5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a\|7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6\|47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a\|8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba"
+
+# Drill / postmortem evidence files under docs/drills or docs/postmortems are
+# append-only records of PUBLIC on-chain activity (tx hashes, op ids). Scrub
+# them from the private-key scan entirely — 64-hex patterns there are the
+# whole point of the doc, not a leak.
+STAGED_NO_DRILLS=$(echo "$STAGED" | grep -Ev '^docs/(drills|postmortems)/' || true)
+
+HEX_HITS=""
+if [ -n "$STAGED_NO_DRILLS" ]; then
+  HEX_HITS=$(echo "$STAGED_NO_DRILLS" | xargs grep -nE '0x[0-9a-fA-F]{64}' 2>/dev/null | \
+    grep -v "0x0\{64\}" | \
+    grep -v "$ANVIL_KEYS" | \
+    grep -v '// Anvil' | \
+    grep -v '// anvil' | \
+    grep -v '// Default Anvil' | \
+    grep -v 'test.*anvil' | \
+    grep -v '// test fixture' | \
+    grep -v '// public metagraph' | \
+    grep -vE 'basescan\.org/(tx|address|block)/' | \
+    grep -vE 'etherscan\.io/(tx|address|block)/' || true)
+fi
+
+if [ -n "$HEX_HITS" ]; then
+  ERRORS="${ERRORS}\n${RED}Ethereum private key pattern (0x + 64 hex):${NC}\n${HEX_HITS}\n"
+fi
+
+# 2. BIP39 mnemonic phrases: look for lines containing 5+ whitespace-separated
+#    BIP39 words. Two common English words on a line (e.g. "address", "amount")
+#    should NOT trigger this. Real mnemonics have 12-24 words in sequence.
+BIP39_WORDS="abandon|abstract|absurd|abuse|access|accident|account|accuse|achieve|acid|acoustic|acquire|actual|adapt|addict|address|adjust|admit|adult|advance|advice|aerobic|afford|agree|album|alcohol|alert|alien|allow|almost|alpha|already|also|alter|always|amateur|amazing|among|amount|amused|analyst|anchor|ancient|anger|angle|angry|animal|ankle|announce|annual|another|answer|antenna|apart|apology|appear|apple|approve|april|arch|arctic|arena|army|arrange|arrest|arrive|arrow|artist|artwork|aspect|assault|asset|assist|assume|asthma|athlete|atom|attack|attend|attract|auction|audit|august|aunt|author|auto|autumn|average|avocado|avoid|awake|aware|awesome|awful|awkward|axis"
+# Exclude .sol files: Solidity keywords (address, account, revert, amount, approve,
+# balance, etc.) overlap heavily with BIP39 wordlist, causing false positives.
+# Exclude UX_FINDINGS.md and DJINN-SUGGESTIONS.md: prose findings logs with long
+# headline lines that contain many common English words matching the BIP39 word
+# list (e.g. "address" repeated 4x in a UX finding describing a contract call);
+# secrets can never appear in these append-only Markdown logs.
+STAGED_NO_SOL=$(echo "$STAGED" | grep -v '\.sol$' | grep -v 'UX_FINDINGS\.md' | grep -v 'DJINN-SUGGESTIONS\.md' || true)
+MNEMONIC_HITS=""
+if [ -n "$STAGED_NO_SOL" ]; then
+  while IFS= read -r line; do
+    # Count BIP39 words on this line
+    count=$(echo "$line" | grep -oEiw "($BIP39_WORDS)" | wc -l || true)
+    if [ "$count" -ge 5 ]; then
+      MNEMONIC_HITS="${MNEMONIC_HITS}${line}\n"
+    fi
+  done < <(echo "$STAGED_NO_SOL" | xargs grep -nEi "($BIP39_WORDS)" 2>/dev/null | grep -vi 'test.*word\|example\|placeholder\|dummy' || true)
+fi
+
+if [ -n "$MNEMONIC_HITS" ]; then
+  ERRORS="${ERRORS}\n${RED}Possible BIP39 mnemonic phrase:${NC}\n${MNEMONIC_HITS}\n"
+fi
+
+# 3. SS58 secret seeds (sr25519/ed25519 raw seeds, often 0x + 64 hex near "seed" or "mnemonic")
+SS58_HITS=$(echo "$STAGED" | xargs grep -nEi \
+  '(secret.seed|mnemonic|seed.phrase|secret.key|secret.phrase).*[:=].*["\x27]' \
+  2>/dev/null | grep -vi 'example\|placeholder\|process\.env\|config\.\|\.env\|getenv' || true)
+
+if [ -n "$SS58_HITS" ]; then
+  ERRORS="${ERRORS}\n${RED}Possible secret seed/mnemonic assignment:${NC}\n${SS58_HITS}\n"
+fi
+
+# 4. Generic secret assignment patterns (catches API keys, tokens, passwords with actual values)
+SECRET_HITS=$(echo "$STAGED" | xargs grep -nEi \
+  '(PRIVATE_KEY|SECRET_KEY|API_KEY|API_SECRET|AUTH_TOKEN)\s*[=:]\s*["\x27]0?x?[0-9a-fA-F]{20,}' \
+  2>/dev/null | grep -vi 'process\.env\|os\.getenv\|config\.\|\.env\|example\|placeholder\|your.\|TODO\|CHANGEME' || true)
+
+if [ -n "$SECRET_HITS" ]; then
+  ERRORS="${ERRORS}\n${RED}Possible hardcoded secret:${NC}\n${SECRET_HITS}\n"
+fi
+
+if [ -n "$ERRORS" ]; then
+  echo ""
+  echo -e "${RED}=== BLOCKED: Possible secrets detected in staged files ===${NC}"
+  echo -e "$ERRORS"
+  echo "If these are intentional (test fixtures, public keys), use:"
+  echo "  git commit --no-verify"
+  echo ""
+  exit 1
+fi
+
+exit 0

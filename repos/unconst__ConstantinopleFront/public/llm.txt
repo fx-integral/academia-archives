@@ -1,0 +1,21 @@
+# Constantinople
+
+Decentralized LLM inference on Bittensor Subnet 97.
+Always on. Scalable throughput. Hidden state verification.
+
+## Usage
+
+Base URL: https://api.constantinople.cloud/v1
+Model: Qwen/Qwen2.5-7B-Instruct
+Auth: Bearer token (API key required, prefix: cst-)
+
+Get an API key at https://www.constantinople.cloud/#api — free tier includes 1.0 credits.
+
+```
+curl https://api.constantinople.cloud/v1/chat/completions \
+  -H "Authorization: Bearer cst-your-key-here" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen/Qwen2.5-7B-Instruct","messages":[{"role":"user","content":"hello"}],"max_tokens":200}'
+```
+
+Full docs: /SKILL.md

@@ -1,0 +1,39 @@
+"""Compatibility shim forwarding miner-facing tool helpers to harnyx-miner SDK."""
+
+from harnyx_miner_sdk.api import (
+    LlmChatResult,
+    TestToolResponse,
+    ToolCallResponse,
+    fetch_page,
+    llm_chat,
+    search_ai,
+    search_web,
+    test_tool,
+    tooling_info,
+)
+from harnyx_miner_sdk.decorators import (
+    clear_entrypoints,
+    entrypoint,
+    entrypoint_exists,
+    get_entrypoint,
+    get_entrypoint_registry,
+    iter_entrypoints,
+)
+
+__all__ = [
+    "clear_entrypoints",
+    "entrypoint",
+    "entrypoint_exists",
+    "get_entrypoint",
+    "get_entrypoint_registry",
+    "iter_entrypoints",
+    "fetch_page",
+    "llm_chat",
+    "search_ai",
+    "search_web",
+    "test_tool",
+    "tooling_info",
+    "LlmChatResult",
+    "ToolCallResponse",
+    "TestToolResponse",
+]

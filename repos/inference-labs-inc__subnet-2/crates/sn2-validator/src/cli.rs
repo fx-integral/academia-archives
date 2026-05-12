@@ -1,0 +1,73 @@
+use clap::Parser;
+
+#[derive(Parser, Debug)]
+#[command(name = "sn2-validator", about = "Subnet-2 Validator")]
+pub struct Cli {
+    #[arg(long, default_value_t = sn2_types::DEFAULT_NETUID)]
+    pub netuid: u16,
+
+    #[arg(long, alias = "subtensor.network", default_value = "finney")]
+    pub network: String,
+
+    #[arg(long, alias = "subtensor.chain_endpoint")]
+    pub subtensor_chain_endpoint: Option<String>,
+
+    #[arg(long, alias = "wallet.name", default_value = "default")]
+    pub wallet_name: String,
+
+    #[arg(long, alias = "wallet.hotkey", default_value = "default")]
+    pub wallet_hotkey: String,
+
+    #[arg(long, alias = "wallet.path")]
+    pub wallet_path: Option<String>,
+
+    #[arg(long, alias = "logging.level", default_value = "info")]
+    pub log_level: String,
+
+    #[arg(long, default_value_t = 20)]
+    pub api_miners_pct: u32,
+
+    #[arg(long, default_value_t = false)]
+    pub disable_benchmark: bool,
+
+    #[arg(long)]
+    pub relay_url: Option<String>,
+
+    #[arg(long, default_value_t = false)]
+    pub no_relay: bool,
+
+    #[arg(long, default_value_t = 9090)]
+    pub metrics_port: u16,
+
+    #[arg(long, default_value_t = false)]
+    pub no_auto_update: bool,
+
+    #[arg(long)]
+    pub proof_api_url: Option<String>,
+
+    #[arg(long, value_delimiter = ',')]
+    pub target_uid: Vec<u16>,
+
+    #[arg(long)]
+    pub circuit_api_url: Option<String>,
+
+    #[arg(long, default_value_t = false)]
+    pub disable_metric_logging: bool,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Run without chain interaction for local integration testing"
+    )]
+    pub loopback: bool,
+
+    #[arg(
+        long,
+        default_value = "127.0.0.1:8091",
+        help = "Miner address (ip:port) for loopback mode"
+    )]
+    pub miner_address: String,
+
+    #[arg(long, value_delimiter = ',')]
+    pub additional_circuits: Vec<String>,
+}

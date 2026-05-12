@@ -1,0 +1,427 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Ranked miner leaderboard from the most recent weight submission.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [
+    {
+      "asDropdown": false,
+      "icon": "apps",
+      "includeVars": false,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "title": "Home",
+      "tooltip": "Monitoring hub",
+      "type": "link",
+      "url": "/d/grail-home"
+    },
+    {
+      "asDropdown": false,
+      "icon": "dashboard",
+      "includeVars": false,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "title": "Operations",
+      "tooltip": "Operations dashboard",
+      "type": "link",
+      "url": "/d/grail-ops"
+    },
+    {
+      "asDropdown": false,
+      "icon": "doc",
+      "includeVars": false,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "title": "Log Explorer",
+      "tooltip": "Raw log explorer",
+      "type": "link",
+      "url": "/d/grail-log-explorer"
+    }
+  ],
+  "liveNow": false,
+  "panels": [
+    {
+      "gridPos": { "h": 3, "w": 24, "x": 0, "y": 0 },
+      "id": 2,
+      "options": {
+        "code": { "language": "plaintext", "showLineNumbers": false, "showMiniMap": false },
+        "content": "Leaderboard refreshes at each weight submission (every ~20 minutes). If the table is empty, no weight submission has occurred in the selected time range. Try widening the range to **Last 2 hours** or more.\n\nThe default range is **75 minutes** to capture at least one full interval.",
+        "mode": "markdown"
+      },
+      "transparent": true,
+      "title": "",
+      "type": "text"
+    },
+    {
+      "datasource": { "type": "loki", "uid": "loki" },
+      "description": "Ranked miner leaderboard at the most recent weight submission. Shows all miners with non-zero weight, sorted by rank.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "filterable": true,
+            "inspect": false
+          },
+          "noValue": "-"
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Rank" },
+            "properties": [
+              { "id": "custom.width", "value": 55 },
+              { "id": "custom.align", "value": "center" },
+              { "id": "custom.filterable", "value": false }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "UID" },
+            "properties": [
+              { "id": "custom.width", "value": 55 },
+              { "id": "custom.align", "value": "center" }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Weight" },
+            "properties": [
+              { "id": "custom.width", "value": 105 },
+              { "id": "custom.align", "value": "right" },
+              { "id": "decimals", "value": 6 },
+              {
+                "id": "color",
+                "value": { "mode": "continuous-greens" }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": { "mode": "gradient", "type": "color-background" }
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Cap %" },
+            "properties": [
+              { "id": "custom.width", "value": 100 },
+              { "id": "custom.align", "value": "right" },
+              { "id": "decimals", "value": 1 },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "mode": "gradient",
+                  "type": "gauge",
+                  "valueDisplayMode": "text"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "red", "value": null },
+                    { "color": "orange", "value": 30 },
+                    { "color": "yellow", "value": 60 },
+                    { "color": "green", "value": 80 }
+                  ]
+                }
+              },
+              { "id": "color", "value": { "mode": "thresholds" } },
+              { "id": "min", "value": 0 },
+              { "id": "max", "value": 100 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Unique" },
+            "properties": [
+              { "id": "custom.width", "value": 80 },
+              { "id": "custom.align", "value": "right" },
+              { "id": "decimals", "value": 0 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Unique/Win" },
+            "properties": [
+              { "id": "custom.width", "value": 95 },
+              { "id": "custom.align", "value": "right" },
+              { "id": "decimals", "value": 1 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Total" },
+            "properties": [
+              { "id": "custom.width", "value": 75 },
+              { "id": "custom.align", "value": "right" },
+              { "id": "decimals", "value": 0 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Success %" },
+            "properties": [
+              { "id": "custom.width", "value": 100 },
+              { "id": "custom.align", "value": "right" },
+              { "id": "decimals", "value": 1 },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "mode": "gradient",
+                  "type": "gauge",
+                  "valueDisplayMode": "text"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "red", "value": null },
+                    { "color": "orange", "value": 50 },
+                    { "color": "yellow", "value": 80 },
+                    { "color": "green", "value": 95 }
+                  ]
+                }
+              },
+              { "id": "color", "value": { "mode": "thresholds" } },
+              { "id": "min", "value": 0 },
+              { "id": "max", "value": 100 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Active/12" },
+            "properties": [
+              { "id": "custom.width", "value": 80 },
+              { "id": "custom.align", "value": "center" },
+              { "id": "decimals", "value": 0 },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "red", "value": null },
+                    { "color": "yellow", "value": 8 },
+                    { "color": "green", "value": 11 }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": { "mode": "basic", "type": "color-background" }
+              },
+              { "id": "color", "value": { "mode": "thresholds" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Checked" },
+            "properties": [
+              { "id": "custom.width", "value": 75 },
+              { "id": "custom.align", "value": "center" },
+              { "id": "decimals", "value": 0 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Failures" },
+            "properties": [
+              { "id": "custom.width", "value": 75 },
+              { "id": "custom.align", "value": "center" },
+              { "id": "decimals", "value": 0 },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "transparent", "value": null },
+                    { "color": "dark-red", "value": 1 }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": { "mode": "basic", "type": "color-background" }
+              },
+              { "id": "color", "value": { "mode": "thresholds" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Hotkey" },
+            "properties": [
+              { "id": "custom.width", "value": 95 },
+              { "id": "custom.align", "value": "left" }
+            ]
+          }
+        ]
+      },
+      "gridPos": { "h": 22, "w": 24, "x": 0, "y": 3 },
+      "id": 1,
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": true,
+          "enablePagination": true,
+          "fields": "",
+          "reducer": ["count"],
+          "show": true
+        },
+        "frameIndex": 0,
+        "showHeader": true,
+        "sortBy": [
+          { "desc": false, "displayName": "Rank" }
+        ]
+      },
+      "targets": [
+        {
+          "datasource": { "type": "loki", "uid": "loki" },
+          "editorMode": "code",
+          "expr": "{logger=\"grail.leaderboard\"} | regexp `] (?P<raw>{.+})` | line_format `{{.raw}}` | json | __error__=``",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Miner Leaderboard",
+      "transformations": [
+        {
+          "id": "extractFields",
+          "options": {
+            "format": "json",
+            "replace": false,
+            "source": "Line"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Line": true,
+              "Time": true,
+              "id": true,
+              "tsNs": true,
+              "labels": true,
+              "event": true,
+              "interval": true,
+              "block": true,
+              "ts": true
+            },
+            "indexByName": {
+              "rank": 0,
+              "uid": 1,
+              "weight": 2,
+              "cap_pct": 3,
+              "unique_rollouts": 4,
+              "unique_per_window": 5,
+              "total_rollouts": 6,
+              "success_rate": 7,
+              "windows_active": 8,
+              "windows_checked": 9,
+              "failure_count": 10,
+              "hotkey_short": 11
+            },
+            "renameByName": {
+              "rank": "Rank",
+              "uid": "UID",
+              "weight": "Weight",
+              "cap_pct": "Cap %",
+              "unique_rollouts": "Unique",
+              "unique_per_window": "Unique/Win",
+              "total_rollouts": "Total",
+              "success_rate": "Success %",
+              "windows_active": "Active/12",
+              "windows_checked": "Checked",
+              "failure_count": "Failures",
+              "hotkey_short": "Hotkey"
+            }
+          }
+        },
+        {
+          "id": "convertFieldType",
+          "options": {
+            "conversions": [
+              { "destinationType": "number", "targetField": "Rank" },
+              { "destinationType": "number", "targetField": "UID" },
+              { "destinationType": "number", "targetField": "Weight" },
+              { "destinationType": "number", "targetField": "Cap %" },
+              { "destinationType": "number", "targetField": "Unique" },
+              { "destinationType": "number", "targetField": "Unique/Win" },
+              { "destinationType": "number", "targetField": "Total" },
+              { "destinationType": "number", "targetField": "Success %" },
+              { "destinationType": "number", "targetField": "Active/12" },
+              { "destinationType": "number", "targetField": "Checked" },
+              { "destinationType": "number", "targetField": "Failures" }
+            ]
+          }
+        },
+        {
+          "id": "groupBy",
+          "options": {
+            "fields": {
+              "UID": { "aggregations": [], "operation": "groupby" },
+              "Rank": { "aggregations": ["last"], "operation": "aggregate" },
+              "Weight": { "aggregations": ["last"], "operation": "aggregate" },
+              "Cap %": { "aggregations": ["last"], "operation": "aggregate" },
+              "Unique": { "aggregations": ["last"], "operation": "aggregate" },
+              "Unique/Win": { "aggregations": ["last"], "operation": "aggregate" },
+              "Total": { "aggregations": ["last"], "operation": "aggregate" },
+              "Success %": { "aggregations": ["last"], "operation": "aggregate" },
+              "Active/12": { "aggregations": ["last"], "operation": "aggregate" },
+              "Checked": { "aggregations": ["last"], "operation": "aggregate" },
+              "Failures": { "aggregations": ["last"], "operation": "aggregate" },
+              "Hotkey": { "aggregations": ["last"], "operation": "aggregate" }
+            }
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "renameByName": {
+              "Rank (last)": "Rank",
+              "Weight (last)": "Weight",
+              "Cap % (last)": "Cap %",
+              "Unique (last)": "Unique",
+              "Unique/Win (last)": "Unique/Win",
+              "Total (last)": "Total",
+              "Success % (last)": "Success %",
+              "Active/12 (last)": "Active/12",
+              "Checked (last)": "Checked",
+              "Failures (last)": "Failures",
+              "Hotkey (last)": "Hotkey"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              { "field": "Rank", "desc": false }
+            ]
+          }
+        }
+      ],
+      "type": "table"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["grail", "leaderboard"],
+  "templating": { "list": [] },
+  "time": { "from": "now-75m", "to": "now" },
+  "timepicker": {},
+  "timezone": "utc",
+  "title": "GRAIL Miner Leaderboard",
+  "uid": "grail-leaderboard",
+  "version": 1,
+  "weekStart": ""
+}

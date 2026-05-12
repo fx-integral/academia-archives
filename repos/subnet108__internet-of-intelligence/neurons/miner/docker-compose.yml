@@ -1,0 +1,114 @@
+version: '3.8'
+
+services:
+  report:
+    image: subnet108/report
+    restart: always
+    privileged: true
+    ports:
+      - "8000:8000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /:/host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [ gpu ]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    runtime: nvidia
+    labels:
+      autoheal: true
+    healthcheck:
+      test: [ "CMD-SHELL", "nc -zv localhost 8000" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+  agent:
+    image: subnet108/agent
+    ports:
+      - "8001:8001"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/docker:/var/lib/docker
+      - /etc/nvidia:/etc/nvidia
+      - /var/lib/nvidia:/var/lib/nvidia
+      - /etc/docker/daemon.json:/etc/docker/daemon.json
+      - /etc/nvidia-container-runtime/config.toml:/etc/nvidia-container-runtime/config.toml
+    privileged: true
+    devices:
+      - '/dev/nvidia-*:/dev/nvidia-*'
+      - "/dev/fuse"
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    restart: always
+    labels:
+      autoheal: true
+    healthcheck:
+      test: ["CMD-SHELL", "nc -zv localhost 8001"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+#    healthcheck:
+#      test: [ "CMD-SHELL", "nvidia-smi || exit 1" ]
+#      interval: 2m
+#      timeout: 10s
+#      retries: 3      
+    pid: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [ gpu ]    
+
+  watchtower:
+    image: containrrr/watchtower
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      WATCHTOWER_POLL_INTERVAL: 60
+      WATCHTOWER_NOTIFICATION_REPORT: "true"
+      WATCHTOWER_NOTIFICATION_URL: generic://open.larksuite.com/open-apis/bot/v2/hook/fb7740b9-2f85-4fa6-a5c9-095b27bfcf46
+      WATCHTOWER_NOTIFICATION_TEMPLATE: |
+        {{- if .Report -}}
+          {{- with .Report -}}
+        {{len .Scanned}} Scanned, {{len .Updated}} Updated, {{len .Failed}} Failed
+              {{- range .Updated}}
+        - {{.Name}} ({{.ImageName}}): {{.CurrentImageID.ShortID}} updated to {{.LatestImageID.ShortID}}
+              {{- end -}}
+              {{- range .Fresh}}
+        - {{.Name}} ({{.ImageName}}): {{.State}}
+            {{- end -}}
+            {{- range .Skipped}}
+        - {{.Name}} ({{.ImageName}}): {{.State}}: {{.Error}}
+            {{- end -}}
+            {{- range .Failed}}
+        - {{.Name}} ({{.ImageName}}): {{.State}}: {{.Error}}
+            {{- end -}}
+          {{- end -}}
+        {{- else -}}
+          {{range .Entries -}}{{.Message}}{{"\n"}}{{- end -}}
+        {{- end -}}
+    restart: always
+    pid: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [ gpu ]    
+
+  autoheal:
+    image: willfarrell/autoheal
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: always
+    environment:
+      - AUTOHEAL_INTERVAL=60
+      - AUTOHEAL_CONTAINER_LABEL=autoheal

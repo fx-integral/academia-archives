@@ -1,0 +1,149 @@
+---
+# Global variables
+ansible_user: ubuntu
+ansible_become: true
+
+# Grafana configuration
+grafana_version: "10.4.0"
+grafana_system_user: "grafana"
+grafana_system_group: "grafana"
+
+# Server configuration
+grafana_http_port: 3000
+grafana_domain: "{{ ansible_host }}"
+grafana_protocol: "http"
+
+# Paths
+grafana_data_dir: "/var/lib/grafana"
+grafana_logs_dir: "/var/log/grafana"
+grafana_plugins_dir: "/var/lib/grafana/plugins"
+grafana_provisioning_dir: "/etc/grafana/provisioning"
+grafana_dashboards_local_path: "/etc/grafana/dashboards"
+
+# Connection timeouts
+grafana_query_timeout: 60
+grafana_max_connections: 500
+grafana_concurrent_render_limit: 30
+
+# Authentication settings
+# Anonymous access allows users to view dashboards without logging in
+grafana_auth_anonymous_enabled: "true"
+grafana_auth_anonymous_org_name: "Templar AI"
+grafana_auth_anonymous_org_role: "Viewer"
+grafana_auth_anonymous_hide_version: "true"
+
+# Login form control - independent from anonymous access
+# Set to "true" to show the login form, "false" to hide it
+# NOTE: Even when the login form is hidden, admins can still access /login directly
+grafana_show_login_form: "true"  # Controls login form visibility (true=show, false=hide)
+grafana_disable_login_form: "{{ 'false' if grafana_show_login_form == 'true' else 'true' }}"
+grafana_home_dashboard: "templar_metrics"
+
+# Security settings
+grafana_security_admin_user: "admin"
+grafana_security_admin_password: "CHANGE_ME"  # Change this in vault
+grafana_security_secret_key: "CHANGE_ME"  # Change this in vault
+grafana_security_cookie_secure: "false"
+grafana_security_cookie_samesite: "lax"
+grafana_security_disable_gravatar: "true"
+grafana_security_strict_transport_security: "false"
+
+# InfluxDB connection
+grafana_influxdb_host: "localhost"  # Change to your InfluxDB host
+grafana_influxdb_port: "8086"
+grafana_influxdb_database: "metrics"
+grafana_influxdb_token: "CHANGE_ME"  # Add your InfluxDB authentication token here
+grafana_influxdb_protocol: "http"  # Can be overridden to https in host_vars
+grafana_influxdb_use_api_config: false  # Whether to also configure datasource via API
+
+# UI appearance settings
+grafana_hide_top_nav_bar: "true"  # Hide top navigation bar for anonymous users
+grafana_hide_sidebar: "true"      # Hide sidebar for anonymous users
+grafana_hide_footer: "true"       # Hide footer for anonymous users
+grafana_kiosk_mode: "true"        # Enable kiosk mode for clean dashboard presentation
+
+# Dashboard settings
+grafana_dashboards_min_refresh_interval: "5s"
+grafana_dashboards_folder: "Templar"
+
+# NGINX settings
+nginx_enabled: true
+nginx_ssl_enabled: false
+nginx_worker_processes: "auto"
+nginx_worker_connections: 4096
+nginx_proxy_connect_timeout: 60
+nginx_proxy_send_timeout: 60
+nginx_proxy_read_timeout: 60
+nginx_client_max_body_size: "1m"
+nginx_proxy_buffers: "32 4k"
+
+# SSL Certificate settings
+nginx_use_custom_ssl_cert: false    # Set to true to use custom certificates
+nginx_auto_rotate_cert: true        # Set to true to enable automatic certificate rotation
+nginx_cert_country: "US"            # Country code for self-signed certificate
+nginx_cert_state: "State"           # State for self-signed certificate
+nginx_cert_locality: "City"         # Locality for self-signed certificate
+nginx_cert_organization: "Templar"  # Organization name for self-signed certificate
+
+# Grafana plugins settings
+templar_version_api_url: "http://18.217.218.11/api/templar/version"
+grafana_plugins_to_allow:
+  - "marcusolsson-json-datasource"
+
+# Loki configuration
+loki_version: "2.8.2"
+loki_http_listen_port: 3100
+loki_grpc_listen_port: 9096
+loki_domain: "{{ ansible_host }}"  # Host for Loki access - set to subdomain in host_vars if needed
+loki_data_dir: "/var/lib/loki"
+loki_user: "loki"
+loki_group: "loki"
+loki_retention_period: "720h"  # 30 days
+loki_limits_ingestion_rate_mb: 10
+loki_limits_ingestion_burst_size_mb: 20
+
+# Loki storage configuration
+loki_storage_type: "filesystem"  # Options: filesystem (default), s3 (for S3 or R2)
+
+# For Cloudflare R2 storage (S3-compatible)
+loki_r2_enabled: false
+loki_r2_bucket_name: "loki-logs"
+loki_r2_endpoint: "https://<account_id>.r2.cloudflarestorage.com"
+loki_r2_region: "auto"
+loki_r2_access_key_id: "your_r2_access_key_id"  # Store in vault
+loki_r2_secret_access_key: "your_r2_secret_key"  # Store in vault
+
+# Python logging access configuration
+# Add these values to your Python logging config
+loki_python_logging_url: "http{% if nginx_ssl_enabled %}s{% endif %}://{{ loki_domain }}/loki/api/v1/push"
+loki_python_labels: '{job="python-app", env="production"}'
+
+# Fluentd configuration for log archival to R2
+fluentd_enabled: true
+fluentd_http_port: 9880
+fluentd_r2_enabled: true
+fluentd_r2_bucket: "tplr-logs"
+fluentd_r2_endpoint: "https://<account_id>.r2.cloudflarestorage.com"
+fluentd_r2_region: "auto"
+fluentd_collect_loki_logs: true
+fluentd_s3_path_prefix: "logs/version=${version}/year=%Y/month=%m/day=%d/hour=%H/"
+
+# Log collector configuration
+log_collector_enabled: true
+log_collector_user: "{{ loki_user }}"
+log_collector_group: "{{ loki_group }}"
+log_collector_loki_url: "http://localhost:{{ loki_http_listen_port }}"
+log_collector_query: '{service=~"validator"}'
+log_collector_r2_bucket: "tplr-logs"
+log_collector_r2_endpoint: "https://<account_id>.r2.cloudflarestorage.com"
+log_collector_r2_region: "auto"
+log_collector_r2_access_key_id: "your_r2_access_key_id"  # Store in vault
+log_collector_r2_secret_access_key: "your_r2_secret_key"  # Store in vault
+log_collector_buffer_size: 100
+log_collector_buffer_timeout: 60
+log_collector_debug: false
+
+# Verification settings
+fail_on_verification_error: false          # Whether to fail the playbook if verification checks fail
+save_verification_results: false           # Whether to save verification results to files
+verification_output_dir: "{{ playbook_dir }}/verification_results"

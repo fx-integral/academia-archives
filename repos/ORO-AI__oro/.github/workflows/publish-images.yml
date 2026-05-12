@@ -1,0 +1,216 @@
+name: Publish Docker Images
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag (e.g., v1.0.0 or latest)'
+        required: true
+        default: 'latest'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/oro-ai/oro
+
+jobs:
+  determine-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Determine tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          fi
+
+  build:
+    needs: determine-tag
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [proxy, sandbox, validator, search-server]
+        platform: [linux/amd64, linux/arm64]
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+          - image: proxy
+            file: docker/proxy/Dockerfile
+          - image: sandbox
+            file: docker/sandbox/Dockerfile
+          - image: validator
+            file: docker/validator/Dockerfile
+          - image: search-server
+            file: docker/search-server/Dockerfile
+
+    steps:
+      - name: Free disk space (search-server base image is ~7GB)
+        if: matrix.image == 'search-server'
+        run: sudo rm -rf /usr/share/dotnet
+
+      - name: Prepare platform pair
+        run: |
+          platform=${{ matrix.platform }}
+          echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ matrix.file }}
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            ${{ matrix.image == 'validator' && format('HF_TOKEN={0}', secrets.HF_TOKEN) || '' }}
+          outputs: type=image,name=${{ env.IMAGE_PREFIX }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/${{ matrix.image }}:cache-${{ env.PLATFORM_PAIR }}
+          cache-to: type=registry,ref=${{ env.IMAGE_PREFIX }}/${{ matrix.image }}:cache-${{ env.PLATFORM_PAIR }},mode=max
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.image }}-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  smoke-test:
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download validator digest (amd64)
+        uses: actions/download-artifact@v4
+        with:
+          name: digest-validator-linux-amd64
+          path: /tmp/digests/validator
+
+      - name: Download sandbox digest (amd64)
+        uses: actions/download-artifact@v4
+        with:
+          name: digest-sandbox-linux-amd64
+          path: /tmp/digests/sandbox
+
+      - name: Download proxy digest (amd64)
+        uses: actions/download-artifact@v4
+        with:
+          name: digest-proxy-linux-amd64
+          path: /tmp/digests/proxy
+
+      # Use the baked-in venv at .venv/bin/python — the same interpreter the
+      # ENTRYPOINT runs in production. Going through `uv run` instead would
+      # re-resolve deps from pyproject.toml at exec time and silently install
+      # anything missing from the image, hiding lockfile drift. v1.0.59 shipped
+      # exactly that bug: psutil was added to pyproject.toml but uv.lock wasn't
+      # regenerated, so `uv sync --frozen` skipped psutil at build time and
+      # the validator ImportError'd at runtime.
+      - name: Smoke test validator image
+        run: |
+          digest=$(ls /tmp/digests/validator | head -1)
+          docker run --rm --entrypoint .venv/bin/python ${{ env.IMAGE_PREFIX }}/validator@sha256:$digest \
+            -c "import subnet.validator.main; print('Validator module OK')"
+
+      - name: Smoke test sandbox image
+        run: |
+          digest=$(ls /tmp/digests/sandbox | head -1)
+          docker run --rm --entrypoint python ${{ env.IMAGE_PREFIX }}/sandbox@sha256:$digest \
+            -c "import src.agent.agent_interface; print('Sandbox module OK')"
+
+      # Boot the proxy with the same env vars that docker-compose.yml exports
+      # to a real validator deploy. If a new ${VAR} is added to
+      # nginx.conf.template without either (a) a default in the proxy
+      # Dockerfile CMD or (b) a corresponding entry in docker-compose.yml,
+      # envsubst writes empty, nginx fails with `[emerg] invalid number of
+      # arguments`, and the container exits — failing this step before the
+      # tag is published. Without this guard, v1.0.56 shipped that exact
+      # regression to staging.
+      - name: Smoke test proxy image
+        run: |
+          digest=$(ls /tmp/digests/proxy | head -1)
+          docker run -d --name proxy-smoke \
+            -e SEARCH_SERVER_URL=search-server \
+            -e SEARCH_SERVER_PORT=5632 \
+            -e CHUTES_HOST=llm.chutes.ai \
+            ${{ env.IMAGE_PREFIX }}/proxy@sha256:$digest
+          sleep 5
+          state=$(docker inspect -f '{{.State.Status}}' proxy-smoke)
+          if [ "$state" != "running" ]; then
+            echo "::error::Proxy state is '$state' (expected 'running') — nginx config likely failed to render"
+            docker logs proxy-smoke 2>&1 || true
+            docker rm -f proxy-smoke 2>/dev/null || true
+            exit 1
+          fi
+          echo "Proxy nginx config rendered and started cleanly"
+          docker rm -f proxy-smoke
+
+  merge:
+    needs: [determine-tag, smoke-test]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    strategy:
+      matrix:
+        image: [proxy, sandbox, validator, search-server]
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-${{ matrix.image }}-*
+          merge-multiple: true
+
+      - name: Create manifest and push
+        run: |
+          docker buildx imagetools create \
+            -t ${{ env.IMAGE_PREFIX }}/${{ matrix.image }}:${{ needs.determine-tag.outputs.tag }} \
+            -t ${{ env.IMAGE_PREFIX }}/${{ matrix.image }}:latest \
+            $(printf '${{ env.IMAGE_PREFIX }}/${{ matrix.image }}@sha256:%s ' $(ls /tmp/digests/))

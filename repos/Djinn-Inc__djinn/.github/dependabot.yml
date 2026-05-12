@@ -1,0 +1,82 @@
+# Dependabot keeps action versions + dependencies up to date.
+#
+# For P0-10 (MAINNET_BLOCKERS): the ipfs-mirror workflow currently
+# uses floating `@v4` tags. Long-term the plan is to pin to specific
+# commit SHAs — but that's only maintainable if Dependabot is opening
+# the upgrade PRs. Without it, SHA pins rot and the workflow fails.
+
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "08:00"
+      timezone: UTC
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns: ["*"]
+    labels:
+      - "ci"
+      - "dependencies"
+
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      minor-patch:
+        update-types: ["minor", "patch"]
+    ignore:
+      - dependency-name: next
+        update-types: ["version-update:semver-major"]
+      - dependency-name: react
+        update-types: ["version-update:semver-major"]
+      - dependency-name: react-dom
+        update-types: ["version-update:semver-major"]
+    labels:
+      - "dependencies"
+      - "web"
+
+  - package-ecosystem: npm
+    directory: /sdk
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    groups:
+      minor-patch:
+        update-types: ["minor", "patch"]
+    labels:
+      - "dependencies"
+      - "sdk"
+
+  - package-ecosystem: pip
+    directory: /validator
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      minor-patch:
+        update-types: ["minor", "patch"]
+    labels:
+      - "dependencies"
+      - "validator"
+
+  - package-ecosystem: pip
+    directory: /miner
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      minor-patch:
+        update-types: ["minor", "patch"]
+    labels:
+      - "dependencies"
+      - "miner"

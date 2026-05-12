@@ -1,0 +1,11 @@
+setuptools>=70
+requests>=2
+bittensor>=9.11
+
+# TAO Colosseum dependencies
+python-dotenv>=1.0.0
+web3>=6.0.0
+eth-account>=0.10.0
+fastapi>=0.100.0
+uvicorn>=0.23.0
+substrate-interface

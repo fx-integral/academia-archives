@@ -1,0 +1,77 @@
+[package]
+name = "basilica-cli"
+version = "0.29.0"
+edition = "2021"
+authors = ["Basilica Team"]
+description = "Unified CLI for Basilica GPU rental and network management"
+license = "MIT"
+repository = "https://github.com/one-covenant/basilica"
+
+[[bin]]
+name = "basilica"
+path = "src/main.rs"
+
+[dependencies]
+# Workspace dependencies
+tokio = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+clap = { workspace = true }
+clap-verbosity-flag = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+rust_decimal = { workspace = true }
+semver = { workspace = true }
+
+# HTTP client for API communication
+reqwest = { workspace = true, features = ["blocking"] }
+futures = { workspace = true }
+futures-util = { workspace = true }
+eventsource-stream = { workspace = true }
+
+# Terminal UI and interaction
+dialoguer = { workspace = true }
+indicatif = { workspace = true }
+console = { workspace = true }
+tabled = { workspace = true }
+
+# Shell completions
+clap_complete = { workspace = true }
+
+# File operations
+shellexpand = { workspace = true }
+etcetera = { workspace = true }
+
+# Error handling
+color-eyre = { workspace = true }
+
+# OAuth dependencies
+oauth2 = { workspace = true }
+axum = { workspace = true }
+rand = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+webbrowser = { workspace = true }
+url = { workspace = true }
+
+# Self-update
+self_update = { workspace = true }
+
+# SSH key parsing
+ssh-key = { workspace = true }
+
+# Pattern matching
+regex = { workspace = true }
+
+# URL encoding
+urlencoding = { workspace = true }
+
+# Internal crate dependencies
+basilica-common = { path = "../basilica-common" }
+basilica-sdk = { path = "../basilica-sdk" }
+basilica-validator = { path = "../basilica-validator", features = ["client", "cli"] }
+
+[dev-dependencies]

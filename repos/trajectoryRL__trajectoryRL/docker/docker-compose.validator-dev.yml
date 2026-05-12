@@ -1,0 +1,36 @@
+# TrajectoryRL Validator — Local Development
+#
+# Builds the image locally. Bind-mounts source code for
+# hot reload of validator Python code (requires container restart).
+#
+# Usage:
+#   docker compose -f docker/docker-compose.validator-dev.yml --env-file .env.validator up --build
+#   docker compose -f docker/docker-compose.validator-dev.yml logs -f validator
+#   docker compose -f docker/docker-compose.validator-dev.yml down
+
+services:
+  validator:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.validator
+    container_name: trajectoryrl_validator_dev
+    restart: unless-stopped
+    env_file:
+      - ../.env.validator
+    environment:
+      - EVAL_INTERVAL_BLOCKS=${EVAL_INTERVAL_BLOCKS:-100}
+      - WEIGHT_INTERVAL_BLOCKS=${WEIGHT_INTERVAL_BLOCKS:-360}
+      - INACTIVITY_BLOCKS=${INACTIVITY_BLOCKS:-14400}
+      # Default dev environment to the stable channel; override to "staging"
+      # to test pre-release sandbox/harness images locally.
+      - IMAGE_CHANNEL=${IMAGE_CHANNEL:-latest}
+    volumes:
+      - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
+      - ../neurons:/app/neurons
+      - ../trajectoryrl:/app/trajectoryrl
+      - /var/run/docker.sock:/var/run/docker.sock
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -1,0 +1,84 @@
+name: Run Executor QA
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+env:
+  PYTHON_DEFAULT_VERSION: "3.11"
+
+jobs:
+  linter:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./executor
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ env.PYTHON_DEFAULT_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_DEFAULT_VERSION }}
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.x"
+          enable-cache: true
+      - name: Install dependencies
+        run: uv tool install nox
+      - name: Create dotenv file
+        run: cp ./envs/dev/.env.template .env
+      - name: Run linters
+        run: nox -vs lint
+  type_check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./executor
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ env.PYTHON_DEFAULT_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_DEFAULT_VERSION }}
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.x"
+          enable-cache: true
+      - name: Install dependencies
+        run: uv tool install nox
+      - name: Create dotenv file
+        run: cp ./envs/dev/.env.template .env
+      - name: Run mypy
+        run: nox -vs type_check
+  test:
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./executor
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ env.PYTHON_DEFAULT_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_DEFAULT_VERSION }}
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.x"
+          enable-cache: true
+      - name: Install dependencies
+        run: uv tool install nox
+      - name: Prepare environment
+        run: ./setup-dev.sh
+      - name: Build backenddevelopersltd/compute-horde-job-echo:v0-latest image
+        run: docker build . -t backenddevelopersltd/compute-horde-job-echo:v0-latest
+        working-directory: ./executor/app/src/compute_horde_executor/executor/tests/integration/docker_image_for_tests
+      - name: Build backenddevelopersltd/compute-horde-streaming-job-test:v0-latest image
+        run: docker build . -t backenddevelopersltd/compute-horde-streaming-job-test:v0-latest
+        working-directory: ./executor/app/src/compute_horde_executor/executor/tests/integration/docker_image_for_streaming_job_tests
+      - name: Run unit tests
+        run: nox -vs test

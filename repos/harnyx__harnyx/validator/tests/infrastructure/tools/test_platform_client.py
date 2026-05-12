@@ -1,0 +1,342 @@
+from __future__ import annotations
+
+import re
+import socket
+from uuid import uuid4
+
+import bittensor as bt
+import httpx
+import pytest
+
+from harnyx_commons.bittensor import build_canonical_request
+from harnyx_validator.infrastructure.tools.platform_client import (
+    HttpPlatformClient,
+    PlatformClientError,
+)
+
+_HEADER_PATTERN = re.compile(
+    r'^Bittensor\s+ss58="(?P<ss58>[^"]+)",\s*sig="(?P<sig>[0-9a-f]+)"$'
+)
+
+
+def _keypair() -> bt.Keypair:
+    return bt.Keypair.create_from_mnemonic(bt.Keypair.generate_mnemonic())
+
+
+def _weights_response() -> httpx.Response:
+    payload = {
+        "weights": {"42": 0.7, "7": 0.3},
+        "champion_uid": 42,
+    }
+    return httpx.Response(status_code=200, json=payload)
+
+
+def _batch_response(
+    *,
+    batch_id,
+    task_id,
+    artifact_id,
+    champion_artifact_id,
+    budget_usd: float,
+) -> httpx.Response:
+    payload = {
+        "batch_id": str(batch_id),
+        "cutoff_at": "2025-10-17T12:00:00Z",
+        "created_at": "2025-10-17T12:00:00Z",
+        "tasks": [
+            {
+                "task_id": str(task_id),
+                "query": {"text": "smoke"},
+                "reference_answer": {"text": "ok"},
+                "budget_usd": budget_usd,
+            },
+        ],
+        "artifacts": [
+            {
+                "uid": 7,
+                "artifact_id": str(artifact_id),
+                "content_hash": "abc",
+                "size_bytes": 1,
+            }
+        ],
+        "champion_artifact_id": str(champion_artifact_id),
+        "completed_at": "2025-10-17T12:05:00Z",
+        "failed_at": None,
+    }
+    return httpx.Response(status_code=200, json=payload)
+
+
+def _artifact_response(content: bytes) -> httpx.Response:
+    return httpx.Response(status_code=200, content=content)
+
+
+class _FlakyTransport:
+    def __init__(
+        self,
+        *,
+        first_exception: type[httpx.TransportError],
+        success_response: httpx.Response,
+    ) -> None:
+        self._first_exception = first_exception
+        self._success_response = success_response
+        self.requests: list[httpx.Request] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            raise self._first_exception("timed out", request=request)
+        return self._success_response
+
+
+class _AlwaysFailTransport:
+    def __init__(self, *, exceptions: list[httpx.TransportError]) -> None:
+        self._exceptions = exceptions
+        self.requests: list[httpx.Request] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        raise self._exceptions[len(self.requests) - 1]
+
+
+def _assert_signed(request: httpx.Request, keypair: bt.Keypair) -> None:
+    header = request.headers.get("Authorization")
+    assert header is not None
+    match = _HEADER_PATTERN.match(header)
+    assert match is not None
+    assert match.group("ss58") == keypair.ss58_address
+    path = request.url.raw_path.decode()
+    query = request.url.query
+    if query:
+        path = f"{path}?{query}"
+    body = request.content or b""
+    canonical = build_canonical_request(request.method, path, body)
+    signature = bytes.fromhex(match.group("sig"))
+    assert keypair.verify(canonical, signature)
+
+
+def test_get_champion_weights_returns_weights() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        _assert_signed(request, keypair)
+        if request.method == "GET" and request.url.path == "/v1/weights":
+            return _weights_response()
+        return httpx.Response(status_code=404)
+
+    keypair = _keypair()
+    client = HttpPlatformClient(
+        base_url="https://mock.local",
+        hotkey=keypair,
+        transport=httpx.MockTransport(handler),
+    )
+
+    weights = client.get_champion_weights()
+
+    assert weights.weights == {42: 0.7, 7: 0.3}
+    assert weights.champion_uid == 42
+
+
+def test_get_miner_task_batch_parses_tasks_and_artifacts() -> None:
+    batch_id = uuid4()
+    task_id = uuid4()
+    artifact_id = uuid4()
+    champion_artifact_id = uuid4()
+    budget_usd = 0.123
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        _assert_signed(request, keypair)
+        expected_path = f"/v1/miner-task-batches/batch/{batch_id}"
+        if request.method == "GET" and request.url.path == expected_path:
+            return _batch_response(
+                batch_id=batch_id,
+                task_id=task_id,
+                artifact_id=artifact_id,
+                champion_artifact_id=champion_artifact_id,
+                budget_usd=budget_usd,
+            )
+        return httpx.Response(status_code=404)
+
+    keypair = _keypair()
+    client = HttpPlatformClient(
+        base_url="https://mock.local",
+        hotkey=keypair,
+        transport=httpx.MockTransport(handler),
+    )
+
+    batch = client.get_miner_task_batch(batch_id)
+
+    assert batch.batch_id == batch_id
+    assert batch.tasks[0].task_id == task_id
+    assert batch.tasks[0].budget_usd == pytest.approx(budget_usd)
+    assert batch.tasks[0].query.text == "smoke"
+    assert batch.tasks[0].reference_answer.text == "ok"
+    assert batch.artifacts[0].artifact_id == artifact_id
+
+
+def test_get_champion_weights_retries_transient_connect_timeout() -> None:
+    keypair = _keypair()
+    transport = _FlakyTransport(
+        first_exception=httpx.ConnectTimeout,
+        success_response=_weights_response(),
+    )
+    client = HttpPlatformClient(
+        base_url="https://mock.local",
+        hotkey=keypair,
+        transport=httpx.MockTransport(transport),
+    )
+
+    weights = client.get_champion_weights()
+
+    assert weights.weights == {42: 0.7, 7: 0.3}
+    assert weights.champion_uid == 42
+    assert [request.url.path for request in transport.requests] == [
+        "/v1/weights",
+        "/v1/weights",
+    ]
+    for request in transport.requests:
+        _assert_signed(request, keypair)
+
+
+def test_get_miner_task_batch_does_not_retry_broad_connect_error() -> None:
+    batch_id = uuid4()
+    keypair = _keypair()
+    connect_error = httpx.ConnectError("connect failed")
+    transport = _AlwaysFailTransport(exceptions=[connect_error])
+    client = HttpPlatformClient(
+        base_url="https://mock.local",
+        hotkey=keypair,
+        transport=httpx.MockTransport(transport),
+    )
+
+    with pytest.raises(httpx.ConnectError) as exc_info:
+        client.get_miner_task_batch(batch_id)
+
+    assert exc_info.value is connect_error
+    expected_path = f"/v1/miner-task-batches/batch/{batch_id}"
+    assert [request.url.path for request in transport.requests] == [expected_path]
+
+
+def test_fetch_artifact_retries_transient_connect_timeout() -> None:
+    batch_id = uuid4()
+    artifact_id = uuid4()
+    content = b"artifact"
+    keypair = _keypair()
+    transport = _FlakyTransport(
+        first_exception=httpx.ConnectTimeout,
+        success_response=_artifact_response(content),
+    )
+    client = HttpPlatformClient(
+        base_url="https://mock.local",
+        hotkey=keypair,
+        transport=httpx.MockTransport(transport),
+    )
+
+    fetched = client.fetch_artifact(batch_id, artifact_id)
+
+    expected_path = f"/v1/miner-task-batches/{batch_id}/artifacts/{artifact_id}"
+    assert fetched == content
+    assert [request.url.path for request in transport.requests] == [
+        expected_path,
+        expected_path,
+    ]
+    for request in transport.requests:
+        _assert_signed(request, keypair)
+
+
+def test_get_miner_task_batch_raises_original_exception_after_retry_exhaustion() -> None:
+    batch_id = uuid4()
+    keypair = _keypair()
+    first_exception = httpx.ConnectTimeout("first timeout")
+    final_exception = httpx.ConnectTimeout("final timeout")
+    transport = _AlwaysFailTransport(exceptions=[first_exception, final_exception])
+    client = HttpPlatformClient(
+        base_url="https://mock.local",
+        hotkey=keypair,
+        transport=httpx.MockTransport(transport),
+    )
+
+    with pytest.raises(httpx.ConnectTimeout) as exc_info:
+        client.get_miner_task_batch(batch_id)
+
+    assert exc_info.value is final_exception
+    expected_path = f"/v1/miner-task-batches/batch/{batch_id}"
+    assert [request.url.path for request in transport.requests] == [
+        expected_path,
+        expected_path,
+    ]
+
+
+def test_get_miner_task_batch_retries_connect_error_with_temporary_dns_cause() -> None:
+    batch_id = uuid4()
+    keypair = _keypair()
+    connect_error = httpx.ConnectError("connect failed")
+    connect_error.__cause__ = socket.gaierror(socket.EAI_AGAIN, "temporary dns")
+    final_exception = httpx.ConnectError("second connect failed")
+    final_exception.__cause__ = socket.gaierror(socket.EAI_AGAIN, "temporary dns")
+    transport = _AlwaysFailTransport(
+        exceptions=[
+            connect_error,
+            final_exception,
+        ]
+    )
+    client = HttpPlatformClient(
+        base_url="https://mock.local",
+        hotkey=keypair,
+        transport=httpx.MockTransport(transport),
+    )
+
+    with pytest.raises(httpx.ConnectError) as exc_info:
+        client.get_miner_task_batch(batch_id)
+
+    assert exc_info.value is final_exception
+    expected_path = f"/v1/miner-task-batches/batch/{batch_id}"
+    assert [request.url.path for request in transport.requests] == [
+        expected_path,
+        expected_path,
+    ]
+
+
+def test_get_champion_weights_does_not_retry_non_connect_transport_failure() -> None:
+    requests: list[httpx.Request] = []
+    read_timeout = httpx.ReadTimeout("read timed out")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        _assert_signed(request, keypair)
+        raise read_timeout
+
+    keypair = _keypair()
+    client = HttpPlatformClient(
+        base_url="https://mock.local",
+        hotkey=keypair,
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(httpx.ReadTimeout) as exc_info:
+        client.get_champion_weights()
+
+    assert exc_info.value is read_timeout
+    assert [request.url.path for request in requests] == ["/v1/weights"]
+
+
+def test_fetch_artifact_does_not_retry_http_status_failure() -> None:
+    batch_id = uuid4()
+    artifact_id = uuid4()
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        _assert_signed(request, keypair)
+        return httpx.Response(status_code=500)
+
+    keypair = _keypair()
+    client = HttpPlatformClient(
+        base_url="https://mock.local",
+        hotkey=keypair,
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(PlatformClientError):
+        client.fetch_artifact(batch_id, artifact_id)
+
+    assert [request.url.path for request in requests] == [
+        f"/v1/miner-task-batches/{batch_id}/artifacts/{artifact_id}",
+    ]

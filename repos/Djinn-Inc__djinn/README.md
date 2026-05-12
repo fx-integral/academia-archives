@@ -1,0 +1,323 @@
+<div align="center">
+
+# **Djinn Protocol** <!-- omit in toc -->
+
+### Intelligence × Execution
+
+Buy intelligence you can trust.
+Sell analysis you can prove.
+Signals stay secret forever — even from us.
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![CI](https://github.com/Djinn-Inc/djinn/actions/workflows/ci.yml/badge.svg)](https://github.com/Djinn-Inc/djinn/actions/workflows/ci.yml)
+
+---
+
+Bittensor Subnet 103 · Base Chain · USDC
+
+[Whitepaper](docs/whitepaper.md) · [djinn.gg](https://djinn.gg)
+</div>
+
+---
+
+- [Overview](#overview)
+- [How It Works](#how-it-works)
+- [Architecture](#architecture)
+- [Web Attestation](#web-attestation)
+- [Repository Structure](#repository-structure)
+- [Getting Started](#getting-started)
+- [Running a Validator](#running-a-validator)
+- [Running a Miner](#running-a-miner)
+- [Hardware Requirements](#hardware-requirements)
+- [Observability](#observability)
+- [Operations & Runbooks](#operations--runbooks)
+- [Development](#development)
+- [Contract Addresses](#contract-addresses)
+- [License](#license)
+
+---
+
+## Overview
+
+Djinn unbundles information from execution. Analysts (**Geniuses**) sell encrypted predictions. Buyers (**Idiots**) purchase access. Signals stay secret forever. Track records are verifiable forever. The protocol runs itself.
+
+Read the full [Whitepaper](docs/whitepaper.md) for complete protocol details.
+
+### Two Core Guarantees
+
+1. **Signals stay secret forever.** No entity, including Djinn, ever views signal content.
+2. **Track records are verifiable forever.** Cryptographic proof confirms ROI and performance without revealing individual picks.
+
+---
+
+## How It Works
+
+- **Geniuses** post encrypted signals with collateral-backed SLA guarantees
+- **Idiots** purchase signals based on verifiable track records
+- **Miners** verify real-time betting line availability via TLSNotary proofs
+- **Validators** hold Shamir key shares, coordinate MPC, and attest game outcomes
+- **Smart contracts** on Base handle escrow, collateral, and audit settlement
+
+---
+
+## Architecture
+
+| Component | Location |
+|-----------|----------|
+| Smart contracts | Base chain (Escrow, Collateral, Audit, Account, CreditLedger, OutcomeVoting, KeyRecovery) |
+| Signal commitments | Base chain (immutable, timestamped, encrypted) |
+| Data indexing | The Graph (open-source subgraph) |
+| Key shares | Bittensor validators (Shamir + SPDZ MPC) |
+| Line verification | Bittensor miners (TLSNotary-attested) |
+| Web attestation | Bittensor validators + miners (TLSNotary, alpha burn gate) |
+| Outcome attestation | Bittensor validators (2/3+ consensus) |
+| Frontend | Next.js 14 (app router) |
+| Admin dashboard | Grafana (4 dashboards: validator, miner, protocol, system) |
+
+---
+
+## Web Attestation
+
+Djinn provides a public web attestation service at [djinn.gg/attest](https://djinn.gg/attest). Generate a cryptographic TLSNotary proof that any HTTPS website served specific content at a specific time.
+
+**How it works:**
+1. Burn **0.0001 TAO** (~$0.02) of SN103 alpha to the burn address
+2. Enter the URL and your burn transaction hash at djinn.gg/attest
+3. A validator dispatches the request to a miner
+4. The miner generates a TLSNotary proof (30-90s)
+5. The validator verifies the proof and returns it to you
+
+**Use cases:** Legal evidence, journalism verification, governance transparency, academic citations.
+
+**Burn address:** `5E9tjcvFc9F9xPzGeCDoSkHoWKWmUvq4T4saydcSGL5ZbxKV`
+
+---
+
+## Repository Structure
+
+```
+djinn/
+├── contracts/           # Solidity smart contracts (Foundry)
+│   ├── src/             # Contract source (Escrow, Collateral, Audit, etc.)
+│   ├── test/            # Foundry tests (unit, fuzz, integration)
+│   └── script/          # Deployment scripts (Deploy.s.sol)
+├── web/                 # Next.js 14 client application
+│   ├── app/             # App router pages (browse, create, attest, admin)
+│   ├── components/      # React components + tests
+│   └── lib/             # Crypto, contracts, API, hooks
+├── validator/           # Bittensor validator (Python)
+│   ├── djinn_validator/ # Core package (API, MPC, scoring, chain, burn ledger)
+│   └── tests/           # pytest suite (1600+ tests)
+├── miner/               # Bittensor miner (Python)
+│   ├── djinn_miner/     # Core package (API, checker, TLSNotary, canonical odds)
+│   └── tests/           # pytest suite (450+ tests)
+├── djinn/               # Shared Python package (protocol constants, types)
+├── subgraph/            # The Graph subgraph (AssemblyScript)
+│   ├── src/             # Event handlers
+│   └── abis/            # Contract ABIs
+├── docs/                # Whitepaper, running guides, specs
+├── scripts/             # Deployment and operational scripts
+└── DEVIATIONS.md        # Whitepaper deviation log
+```
+
+---
+
+## Getting Started
+
+### Prerequisites
+
+- [Foundry](https://book.getfoundry.sh/getting-started/installation) (forge, cast, anvil)
+- [Node.js](https://nodejs.org/) 20+ with [pnpm](https://pnpm.io/)
+- [Python](https://www.python.org/) 3.11+ with [uv](https://docs.astral.sh/uv/)
+### Local Development
+
+```bash
+# Clone
+git clone https://github.com/Djinn-Inc/djinn.git
+cd djinn
+
+# Start local stack (Anvil + Validator + Miner + Web)
+cp validator/.env.example validator/.env
+cp miner/.env.example miner/.env
+cp web/.env.example web/.env
+docker compose up
+```
+
+Or run components individually:
+
+```bash
+# Smart contracts
+cd contracts && forge build && forge test -vvv
+
+# Validator
+cd validator && uv sync && uv run pytest
+
+# Miner
+cd miner && uv sync && uv run pytest
+
+# Web client
+cd web && pnpm install && pnpm dev
+```
+
+---
+
+## Running a Validator
+
+Validators hold Shamir key shares, coordinate MPC for executability checks, and attest game outcomes.
+
+```bash
+cd validator
+cp .env.example .env
+# Edit .env with your Bittensor wallet, RPC URL, etc.
+uv sync
+uv run djinn-validator
+```
+
+See [Running on Testnet](./docs/running_on_testnet.md) and [Running on Mainnet](./docs/running_on_mainnet.md) for detailed setup.
+
+---
+
+## Running a Miner
+
+Miners verify real-time betting line availability and generate TLSNotary proofs.
+
+```bash
+cd miner
+cp .env.example .env
+# Edit .env with your Bittensor wallet, API keys, etc.
+uv sync
+uv run djinn-miner
+```
+
+See [Running on Testnet](./docs/running_on_testnet.md) and [Running on Mainnet](./docs/running_on_mainnet.md) for detailed setup.
+
+---
+
+## Hardware Requirements
+
+### Validator
+
+| Resource | Minimum | Recommended |
+|----------|---------|-------------|
+| CPU | 4 cores | 8 cores |
+| RAM | 8 GB | 16 GB |
+| Disk | 40 GB SSD | 100 GB SSD |
+| Network | 100 Mbps | 1 Gbps |
+
+Validators run the API server, MPC coordination, outcome attestation, and burn ledger. MPC operations are CPU-intensive during purchase flows.
+
+### Miner
+
+| Resource | Minimum | Recommended |
+|----------|---------|-------------|
+| CPU | 4 cores | 8+ cores |
+| RAM | 8 GB | 16 GB |
+| Disk | 20 GB SSD | 50 GB SSD |
+| Network | 100 Mbps | 1 Gbps |
+
+Miners run TLSNotary proof generation (30-90s CPU per attestation) and sports line checking. CPU is the bottleneck for TLSNotary MPC.
+
+---
+
+## Observability
+
+The validator and miner expose Prometheus metrics at `/metrics`. A full observability stack is included:
+
+- **Prometheus** — scrapes validator and miner metrics every 15s
+- **Grafana** — 4 pre-built dashboards:
+  - **Validator Dashboard** — shares stored, MPC sessions, attestation latency, burn gate rejections
+  - **Miner Dashboard** — health checks, TLSNotary proof times, challenge responses
+  - **Protocol Dashboard** — purchases processed, outcomes attested, weight updates
+  - **System Dashboard** — CPU, memory, disk, network
+
+```bash
+# Start the observability stack
+docker compose -f docker-compose.monitoring.yml up
+# Grafana at http://localhost:3001 (admin/admin)
+```
+
+---
+
+## Operations & Runbooks
+
+Production operations lean on two documents:
+
+- **[docs/operations-sla.md](docs/operations-sla.md)** — monitored signals, alert
+  tiers (SEV-1 / SEV-2 / SEV-3), response SLA matrix, and watchdog-the-watchdog.
+  Answers *when* to act.
+- **[docs/runbooks.md](docs/runbooks.md)** — playbook index. Answers *how* to
+  act. Includes five incident-response scenarios (validator down, stuck audit,
+  miner offline, suspicious withdrawal, emergency pause) and five operational
+  guides (watchtower mirror, validator HTTPS, wildcard router, DB backups,
+  IPFS deploy).
+
+Every SEV-1 and every long SEV-2 gets a postmortem in `docs/postmortems/`; the
+template lives at the bottom of `docs/runbooks.md`.
+
+---
+
+## Development
+
+### Testing
+
+```bash
+# All contract tests (unit + fuzz + integration)
+cd contracts && forge test -vvv
+
+# Validator tests (1600+ tests)
+cd validator && uv run pytest
+
+# Miner tests (450+ tests)
+cd miner && uv run pytest
+
+# Web unit + component tests (450+ tests)
+cd web && pnpm vitest run
+
+# Web E2E tests
+cd web && pnpm test:e2e
+```
+
+### Docker
+
+```bash
+# Full local stack
+docker compose up
+
+# Integration tests
+docker compose -f docker-compose.yml -f docker-compose.test.yml up --build
+```
+
+### Deployment
+
+```bash
+# Deploy contracts to Base Sepolia
+DEPLOYER_KEY=0x... ./scripts/deploy_base.sh sepolia
+
+# Update subgraph addresses
+./scripts/update_subgraph.sh --signal 0x... --escrow 0x... [...]
+```
+
+---
+
+## Contract Addresses
+
+Base Sepolia (testnet, UUPS proxies, all verified on-chain):
+
+| Contract | Address |
+|----------|---------|
+| SignalCommitment | `0x4712479Ba57c9ED40405607b2B18967B359209C0` |
+| Escrow | `0xb43BA175a6784973eB3825acF801Cd7920ac692a` |
+| Collateral | `0x71F0a8c6BBFc4C83c5203807fAdd305B0C0F4C88` |
+| Account | `0x4546354Dd32a613B76Abf530F81c8359e7cE440B` |
+| Audit | `0xCa7e642FE31BA83a7a857644E8894c1B93a2a44E` |
+| CreditLedger | `0xA65296cd11B65629641499024AD905FAcAB64C3E` |
+| OutcomeVoting | `0xAD534f4CAB13707BD4d65e4EF086A455e6A643e5` |
+| KeyRecovery | `0x496919DB9BC4590323cd019fE874311AC6116525` |
+| USDC (MockUSDC) | `0x00e8293b05dbD3732EF3396ad1483E87e7265054` |
+| TimelockController | `0x37f41EFfa8492022afF48B9Ef725008963F14f79` |
+
+---
+
+## License
+
+This repository is licensed under the MIT License. See [LICENSE](LICENSE) for details.

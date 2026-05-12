@@ -1,0 +1,992 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import sqlite3
+import time
+import threading
+from collections import defaultdict
+from typing import Dict, Iterable, Optional, Sequence
+
+import aiohttp
+import bittensor as bt
+from game.common.misc import parse_ts
+
+
+class ScoreStore:
+    """SQLite-backed store for finished game snapshots and backend synchronisation."""
+
+    def __init__(
+        self,
+        db_path: str,
+        backend_url: str,
+        fetch_url: Optional[str] = None,
+        signer=None,
+        generic_store=None,
+    ):
+        self.db_path = db_path
+        self.backend_url = backend_url
+        self.fetch_url = fetch_url
+        self.signer = signer
+        self.generic_store = generic_store
+        folder = os.path.dirname(db_path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        self._conn: Optional[sqlite3.Connection] = None
+        self._lock = threading.RLock()
+        bt.logging.info(f"ScoreStore using database at: {db_path}")
+
+    @property
+    def conn(self) -> sqlite3.Connection:
+        if self._conn is None:
+            with self._lock:
+                if self._conn is None:
+                    self._conn = sqlite3.connect(
+                        self.db_path,
+                        isolation_level=None,
+                        check_same_thread=False,
+                    )
+                    self._conn.execute("PRAGMA journal_mode=WAL;")
+                    self._conn.execute("PRAGMA synchronous=NORMAL;")
+        return self._conn
+
+    def init(self):
+        cur = self.conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS scores (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                room_id TEXT NOT NULL UNIQUE,
+                competition TEXT,
+                rs TEXT NOT NULL,
+                ro TEXT NOT NULL,
+                bs TEXT NOT NULL,
+                bo TEXT NOT NULL,
+                winner TEXT,
+                started_at INTEGER NOT NULL,
+                ended_at INTEGER NOT NULL,
+                score_rs REAL NOT NULL,
+                score_ro REAL NOT NULL,
+                score_bs REAL NOT NULL,
+                score_bo REAL NOT NULL,
+                reason TEXT,
+                synced_at INTEGER
+            );
+            """)
+        try:
+            cur.execute("ALTER TABLE scores ADD COLUMN competition TEXT")
+        except sqlite3.OperationalError:
+            pass
+        cur.close()
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS miner_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    validator TEXT NOT NULL,
+                    competition TEXT NOT NULL,
+                    hotkey TEXT NOT NULL,
+                    room_id TEXT NOT NULL,
+                    score REAL NOT NULL,
+                    ts INTEGER NOT NULL,
+                    synced_at INTEGER NOT NULL
+                );
+                """)
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_miner_records_validator ON miner_records(validator);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_miner_records_competition ON miner_records(competition);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_miner_records_hotkey ON miner_records(hotkey);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_miner_records_room_id ON miner_records(room_id);"
+            )
+            cur.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_miner_records_room_id_hotkey ON miner_records(room_id, hotkey);"
+            )
+            self._ensure_miner_records_score_is_real(cur)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS scores_all (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    room_id TEXT NOT NULL,
+                    competition TEXT NOT NULL,
+                    validator TEXT NOT NULL,
+                    rs TEXT NOT NULL,
+                    ro TEXT NOT NULL,
+                    bs TEXT NOT NULL,
+                    bo TEXT NOT NULL,
+                    winner TEXT,
+                    started_at INTEGER NOT NULL,
+                    ended_at INTEGER NOT NULL,
+                    score_rs REAL NOT NULL,
+                    score_ro REAL NOT NULL,
+                    score_bs REAL NOT NULL,
+                    score_bo REAL NOT NULL,
+                    reason TEXT,
+                    synced_at INTEGER
+                );
+                """)
+            cur.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_scores_all_room_id ON scores_all(room_id);"
+            )
+            cur.close()
+
+    def _ensure_miner_records_score_is_real(self, cur: sqlite3.Cursor) -> None:
+        """Migrate `miner_records.score` to REAL when upgrading older schemas."""
+        try:
+            schema_rows = cur.execute("PRAGMA table_info(miner_records)").fetchall()
+        except Exception:
+            return
+        score_type = None
+        for row in schema_rows:
+            # row format: cid, name, type, notnull, dflt_value, pk
+            if str(row[1]).lower() == "score":
+                score_type = str(row[2]).upper()
+                break
+        if score_type is None or score_type == "REAL":
+            return
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS miner_records_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                validator TEXT NOT NULL,
+                competition TEXT NOT NULL,
+                hotkey TEXT NOT NULL,
+                room_id TEXT NOT NULL,
+                score REAL NOT NULL,
+                ts INTEGER NOT NULL,
+                synced_at INTEGER NOT NULL
+            )
+            """)
+        cur.execute("""
+            INSERT INTO miner_records_new(id, validator, competition, hotkey, room_id, score, ts, synced_at)
+            SELECT id, validator, competition, hotkey, room_id, CAST(score AS REAL), ts, synced_at
+            FROM miner_records
+            """)
+        cur.execute("DROP TABLE miner_records")
+        cur.execute("ALTER TABLE miner_records_new RENAME TO miner_records")
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_miner_records_validator ON miner_records(validator);"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_miner_records_competition ON miner_records(competition);"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_miner_records_hotkey ON miner_records(hotkey);"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_miner_records_room_id ON miner_records(room_id);"
+        )
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_miner_records_room_id_hotkey ON miner_records(room_id, hotkey);"
+        )
+
+    def record_game(
+        self,
+        *,
+        room_id: str,
+        competition: str,
+        rs: str,
+        ro: str,
+        bs: str,
+        bo: str,
+        winner: Optional[str],
+        started_at: float,
+        ended_at: float,
+        score_rs: float,
+        score_ro: float,
+        score_bs: float,
+        score_bo: float,
+        reason: Optional[str],
+    ) -> None:
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO scores(
+                    room_id, competition, rs, ro, bs, bo, winner,
+                    started_at, ended_at,
+                    score_rs, score_ro, score_bs, score_bo,
+                    reason, synced_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?, ?, NULL)
+                ON CONFLICT(room_id) DO UPDATE SET
+                    competition=excluded.competition,
+                    rs=excluded.rs,
+                    ro=excluded.ro,
+                    bs=excluded.bs,
+                    bo=excluded.bo,
+                    winner=excluded.winner,
+                    started_at=excluded.started_at,
+                    ended_at=excluded.ended_at,
+                    score_rs=excluded.score_rs,
+                    score_ro=excluded.score_ro,
+                    score_bs=excluded.score_bs,
+                    score_bo=excluded.score_bo,
+                    reason=excluded.reason,
+                    synced_at=NULL
+                ;
+                """,
+                (
+                    room_id,
+                    competition,
+                    rs,
+                    ro,
+                    bs,
+                    bo,
+                    winner,
+                    int(started_at),
+                    int(ended_at),
+                    float(score_rs),
+                    float(score_ro),
+                    float(score_bs),
+                    float(score_bo),
+                    reason,
+                ),
+            )
+            cur.close()
+
+    def pending(self) -> Iterable[Dict[str, object]]:
+        columns = [
+            "room_id",
+            "competition",
+            "rs",
+            "ro",
+            "bs",
+            "bo",
+            "winner",
+            "started_at",
+            "ended_at",
+            "score_rs",
+            "score_ro",
+            "score_bs",
+            "score_bo",
+            "reason",
+        ]
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                "SELECT {} FROM scores WHERE synced_at IS NULL ORDER BY ended_at ASC".format(
+                    ", ".join(columns)
+                )
+            )
+            rows = [dict(zip(columns, row)) for row in cur.fetchall()]
+            cur.close()
+        return rows
+
+    def window_average_scores_by_hotkey(
+        self,
+        competition: Optional[str],
+        since_ts: float,
+        end_ts: float,
+        validator_hotkey: Optional[str] = None,
+    ) -> Dict[str, float]:
+        avg_scores: Dict[str, float] = defaultdict(float)
+        total_scores: Dict[str, float] = defaultdict(float)
+        counts: Dict[str, float] = defaultdict(float)
+        with self._lock:
+            cur = self.conn.cursor()
+            params = [int(since_ts), int(end_ts), competition]
+            query = """
+                SELECT hotkey, SUM(score) * 1.0 / COUNT(*), SUM(score), COUNT(*) FROM miner_records
+                WHERE ts >= ? AND ts < ? AND competition = ?
+            """
+            if validator_hotkey:
+                query += " AND validator = ?"
+                params.append(validator_hotkey)
+            query += " GROUP BY hotkey"
+            cur.execute(query, tuple(params))
+            rows = cur.fetchall()
+            for row in rows:
+                hotkey, avg_score, total_score, count = row
+                avg_scores[hotkey] = float(avg_score or 0.0)
+                total_scores[hotkey] = float(total_score or 0.0)
+                counts[hotkey] = float(count or 0.0)
+            cur.close()
+        return dict(avg_scores), dict(total_scores), dict(counts)
+
+    def records_in_window(
+        self, validator: str, competition: str, since_ts: float, end_ts: float
+    ) -> Dict[str, Dict[str, list]]:
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                """
+                SELECT hotkey, COUNT(*)
+                FROM miner_records
+                WHERE ts >= ? AND ts < ? AND competition = ? AND validator = ?
+                GROUP BY hotkey
+                """,
+                (int(since_ts), int(end_ts), competition, validator),
+            )
+            local_rows = cur.fetchall()
+
+            cur.execute(
+                """
+                SELECT hotkey, COUNT(*)
+                FROM miner_records
+                WHERE ts >= ? AND ts < ? AND competition = ?
+                GROUP BY hotkey
+                """,
+                (int(since_ts), int(end_ts), competition),
+            )
+            global_rows = cur.fetchall()
+            cur.close()
+
+        return (
+            {hotkey: int(count) for hotkey, count in local_rows},
+            {hotkey: int(count) for hotkey, count in global_rows},
+        )
+
+    def observer_records_in_window(
+        self,
+        competition: str,
+        since_ts: float,
+        end_ts: float,
+        validator_hotkey: Optional[str] = None,
+    ) -> Dict[str, int]:
+        """Return counts of games where each hotkey participated only as an observer.
+
+        A miner is treated as an observer in a game if:
+        - They appear in ``miner_records`` for that room/competition, and
+        - Their hotkey is not one of the four main player roles (rs, ro, bs, bo) in ``scores_all``.
+        """
+
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                """
+                SELECT mr.hotkey, COUNT(*)
+                FROM miner_records AS mr
+                JOIN scores_all AS sa
+                    ON mr.room_id = sa.room_id
+                WHERE
+                    mr.ts >= ? AND mr.ts < ?
+                    AND mr.competition = ?
+                    AND sa.competition = mr.competition
+                    AND mr.hotkey NOT IN (sa.rs, sa.ro, sa.bs, sa.bo)
+                    AND (? = '' OR mr.validator = ?)
+                    AND (? = '' OR sa.validator = ?)
+                GROUP BY mr.hotkey
+                """,
+                (
+                    int(since_ts),
+                    int(end_ts),
+                    competition,
+                    validator_hotkey or "",
+                    validator_hotkey or "",
+                    validator_hotkey or "",
+                    validator_hotkey or "",
+                ),
+            )
+            rows = cur.fetchall()
+            cur.close()
+
+        return {hotkey: int(count) for hotkey, count in rows}
+
+    def win_loss_counts_in_window(
+        self,
+        competition: str,
+        since_ts: float,
+        end_ts: float,
+        validator_hotkey: Optional[str] = None,
+    ) -> tuple[Dict[str, int], Dict[str, int]]:
+        """Return per-hotkey win/loss counts from miner_records in the window.
+
+        A "win" is any record with score > 0. A "loss" is score <= 0.
+        """
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                """
+                SELECT
+                    hotkey,
+                    SUM(CASE WHEN score > 0 THEN 1 ELSE 0 END) AS wins,
+                    SUM(CASE WHEN score <= 0 THEN 1 ELSE 0 END) AS losses
+                FROM miner_records
+                WHERE ts >= ? AND ts < ? AND competition = ?
+                  AND (? = '' OR validator = ?)
+                GROUP BY hotkey
+                """,
+                (
+                    int(since_ts),
+                    int(end_ts),
+                    competition,
+                    validator_hotkey or "",
+                    validator_hotkey or "",
+                ),
+            )
+            rows = cur.fetchall()
+            cur.close()
+
+        wins = {str(hotkey): int(win_count or 0) for hotkey, win_count, _ in rows}
+        losses = {str(hotkey): int(loss_count or 0) for hotkey, _, loss_count in rows}
+        return wins, losses
+
+    def max_scores_all_id(self, validator_hotkey: Optional[str] = None) -> int:
+        with self._lock:
+            cur = self.conn.cursor()
+            if validator_hotkey:
+                cur.execute(
+                    "SELECT MAX(id) FROM scores_all WHERE validator = ?",
+                    (validator_hotkey,),
+                )
+            else:
+                cur.execute("SELECT MAX(id) FROM scores_all")
+            row = cur.fetchone()
+            cur.close()
+        if not row or row[0] is None:
+            return 0
+        return int(row[0])
+
+    def latest_scores_all_timestamp(
+        self, validator_hotkey: Optional[str] = None
+    ) -> int:
+        with self._lock:
+            cur = self.conn.cursor()
+            if validator_hotkey:
+                cur.execute(
+                    "SELECT MAX(ended_at) FROM scores_all WHERE validator = ?",
+                    (validator_hotkey,),
+                )
+            else:
+                cur.execute("SELECT MAX(ended_at) FROM scores_all")
+            row = cur.fetchone()
+            if not row or row[0] is None:
+                cur.execute("SELECT MAX(ended_at) FROM scores")
+                row = cur.fetchone()
+            if not row or row[0] is None:
+                if validator_hotkey:
+                    cur.execute(
+                        "SELECT MAX(ts) FROM miner_records WHERE validator = ?",
+                        (validator_hotkey,),
+                    )
+                else:
+                    cur.execute("SELECT MAX(ts) FROM miner_records")
+                row = cur.fetchone()
+            cur.close()
+        if not row or row[0] is None:
+            return 0
+        return int(row[0])
+
+    def games_in_window(
+        self,
+        since_ts: float,
+        end_ts: float,
+        competition: Optional[str] = None,
+        validator_hotkey: Optional[str] = None,
+    ) -> int:
+        with self._lock:
+            cur = self.conn.cursor()
+            params = [int(since_ts), int(end_ts)]
+            query = (
+                "SELECT COUNT(*) FROM scores_all WHERE ended_at >= ? AND ended_at < ?"
+            )
+            if competition is not None:
+                query += " AND competition = ?"
+                params.append(competition)
+            if validator_hotkey:
+                query += " AND validator = ?"
+                params.append(validator_hotkey)
+            cur.execute(query, tuple(params))
+            row = cur.fetchone()
+            if row and row[0]:
+                count = int(row[0])
+            else:
+                count = 0
+                if competition is not None:
+                    fallback_query = """
+                        SELECT COUNT(DISTINCT room_id)
+                        FROM miner_records
+                        WHERE ts >= ? AND ts < ? AND competition = ?
+                    """
+                    fallback_params = [int(since_ts), int(end_ts), competition]
+                    if validator_hotkey:
+                        fallback_query += " AND validator = ?"
+                        fallback_params.append(validator_hotkey)
+                    cur.execute(fallback_query, tuple(fallback_params))
+                    row2 = cur.fetchone()
+                    if row2 and row2[0]:
+                        count = int(row2[0])
+            cur.close()
+        return int(count)
+
+    def mark_synced(self, room_id: str) -> None:
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                "UPDATE scores SET synced_at=? WHERE room_id=?",
+                (int(time.time()), room_id),
+            )
+            cur.close()
+
+    async def upload_score(
+        self,
+        room_id: str,
+        competition: str,
+        rs: str,
+        ro: str,
+        bs: str,
+        bo: str,
+        score_rs: float,
+        score_ro: float,
+        score_bs: float,
+        score_bo: float,
+        reason: str,
+    ) -> bool:
+        scores = [
+            {"hotkey": rs, "score": float(score_rs)},
+            {"hotkey": ro, "score": float(score_ro)},
+            {"hotkey": bs, "score": float(score_bs)},
+            {"hotkey": bo, "score": float(score_bo)},
+        ]
+        return await self.upload_scores(
+            room_id=room_id,
+            competition=competition,
+            scores=scores,
+            reason=reason,
+        )
+
+    async def upload_scores(
+        self,
+        room_id: str,
+        competition: str,
+        scores: Sequence[dict],
+        reason: str,
+    ) -> bool:
+        clean_scores = []
+        for row in scores:
+            hotkey = str((row or {}).get("hotkey") or "").strip()
+            if not hotkey:
+                continue
+            try:
+                score_value = float((row or {}).get("score") or 0.0)
+            except (TypeError, ValueError):
+                score_value = 0.0
+            clean_scores.append({"hotkey": hotkey, "score": score_value})
+
+        self._upsert_local_miner_scores(
+            room_id=room_id,
+            competition=competition,
+            scores=clean_scores,
+        )
+
+        if not self.backend_url:
+            bt.logging.warning("No backend URL configured for score syncing.")
+            return True
+
+        async with aiohttp.ClientSession() as session:
+            participants = [
+                {"hotkey": row["hotkey"], "score": row["score"]} for row in clean_scores
+            ]
+            payload = {
+                "scores": clean_scores,
+                "participants": participants,
+                "reason": reason,
+            }
+            headers = self.signer() if self.signer else {}
+            try:
+                async with session.patch(
+                    self.backend_url + "/" + room_id,
+                    json=payload,
+                    headers=headers,
+                    timeout=10,
+                ) as resp:
+                    if resp.status in (200, 201, 202, 204):
+                        self.mark_synced(room_id)
+                    else:
+                        text = await resp.text()
+                        bt.logging.error(
+                            f"Failed to sync score {room_id}: {resp.status} {text}"
+                        )
+            except Exception as err:  # noqa: BLE001
+                bt.logging.error(f"Exception syncing score {room_id}: {err}")
+            try:
+                await asyncio.wait_for(
+                    self.sync_scores_all(session=session), timeout=600
+                )
+            except asyncio.TimeoutError:
+                bt.logging.warning(
+                    f"Post-upload score sync timed out after 600s for room {room_id}; continuing."
+                )
+        return True
+
+    async def sync_scores_all(
+        self, session: Optional[aiohttp.ClientSession] = None
+    ) -> int:
+        if not self.fetch_url:
+            bt.logging.debug("No fetch URL configured; skipping scores_all sync.")
+            return 0
+
+        close_session = False
+        if session is None:
+            session = aiohttp.ClientSession()
+            close_session = True
+
+        try:
+            headers = self.signer() if self.signer else {}
+            params = {}
+            # Backend sync endpoints return rows with incId > since_id, so send
+            # the last synced id directly. Adding 1 skips the next row.
+            since_id = self.max_scores_all_id()
+            params["since_id"] = since_id
+            params["limit"] = 100
+            page_num = 0
+            total_rows_fetched = 0
+            bt.logging.info(
+                f"Starting scores_all sync: since_id={params['since_id']} limit={params['limit']}"
+            )
+            while True:
+                page_num += 1
+                bt.logging.info(
+                    f"scores_all sync page {page_num}: requesting since_id={params['since_id']} limit={params['limit']}"
+                )
+                async with session.get(
+                    self.fetch_url, headers=headers, params=params, timeout=15
+                ) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        bt.logging.error(
+                            f"Failed to sync scores_all: {resp.status} {text}"
+                        )
+                        return 0
+                    payload = await resp.json(content_type=None)
+                    data = payload.get("data")
+                    meta = payload.get("meta") or {}
+                    if not isinstance(data, list):
+                        bt.logging.error(
+                            "Unexpected payload when syncing scores_all; expected list."
+                        )
+                        return 0
+                    page_count = int(meta.get("count") or len(data))
+                    total_count = int(meta.get("total") or 0)
+                    has_more = bool(meta.get("has_more"))
+                    next_since_id = meta.get("next_since_id")
+                    total_rows_fetched += len(data)
+
+                    bt.logging.info(
+                        "scores_all sync page "
+                        f"{page_num}: status=200 rows={len(data)} count={page_count} "
+                        f"total={total_count} has_more={has_more} next_since_id={next_since_id}"
+                    )
+
+                    if not data and not has_more:
+                        bt.logging.info("scores_all sync: no new scores to sync.")
+                        return 0
+
+                    if not data and has_more:
+                        bt.logging.warning(
+                            "scores_all sync received empty page with has_more=true; "
+                            "stopping to avoid infinite pagination loop."
+                        )
+                        break
+
+                    self._upsert_scores_all(data)
+                    if (params["since_id"] + page_count) <= total_count:
+                        bt.logging.info(
+                            f"Synced Score: {params['since_id'] + page_count} / {total_count}"
+                        )
+                    if not has_more:
+                        bt.logging.info(
+                            "Sync completed: "
+                            f"{total_rows_fetched} row(s) fetched in {page_num} page(s). "
+                            f"Backend total={total_count}."
+                        )
+                        return total_rows_fetched
+                    if next_since_id is None:
+                        bt.logging.warning(
+                            "scores_all sync missing next_since_id while has_more=true; "
+                            "stopping pagination."
+                        )
+                        break
+                    params["since_id"] = next_since_id
+            return total_rows_fetched
+        except Exception as err:  # noqa: BLE001
+            bt.logging.error(f"Exception refreshing scores_all: {err}")
+            return 0
+        finally:
+            if close_session:
+                await session.close()
+
+    def _upsert_local_miner_scores(
+        self,
+        *,
+        room_id: str,
+        competition: str,
+        scores: Sequence[dict],
+    ) -> None:
+        validator_hotkey = ""
+        if self.signer:
+            headers = self.signer() or {}
+            validator_hotkey = str(headers.get("X-Validator-Hotkey") or "")
+        now_ts = int(time.time())
+        rows = []
+        for row in scores:
+            hotkey = str((row or {}).get("hotkey") or "").strip()
+            if not hotkey:
+                continue
+            try:
+                score_value = float((row or {}).get("score") or 0.0)
+            except (TypeError, ValueError):
+                score_value = 0.0
+            rows.append(
+                (
+                    validator_hotkey,
+                    competition,
+                    hotkey,
+                    room_id,
+                    score_value,
+                    now_ts,
+                    now_ts,
+                )
+            )
+        if not rows:
+            return
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.executemany(
+                """
+                INSERT INTO miner_records(validator, competition, hotkey, room_id, score, ts, synced_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(room_id, hotkey) DO UPDATE SET
+                    score=excluded.score,
+                    ts=excluded.ts,
+                    synced_at=excluded.synced_at
+                """,
+                rows,
+            )
+            cur.close()
+
+    def _upsert_scores_all(self, rows: Sequence[dict]) -> None:
+        mapped_rows = []
+        miner_records = []
+        generic_rows = []
+        synced_at = int(time.time())
+        for row in rows:
+            try:
+                started_at = parse_ts(row.get("started_at")) or parse_ts(
+                    row.get("startedAt")
+                )
+                ended_at = parse_ts(row.get("ended_at")) or parse_ts(row.get("endedAt"))
+                competition = row.get("competition") or ""
+                score_rs = float(row.get("score_rs") or row.get("scoreRs") or 0.0)
+                score_ro = float(row.get("score_ro") or row.get("scoreRo") or 0.0)
+                score_bs = float(row.get("score_bs") or row.get("scoreBs") or 0.0)
+                score_bo = float(row.get("score_bo") or row.get("scoreBo") or 0.0)
+                mapped_rows.append(
+                    (
+                        int(row.get("id") or 0),
+                        str(row.get("room_id") or row.get("roomId") or ""),
+                        competition,
+                        str(row.get("validator") or ""),
+                        str(row.get("rs") or ""),
+                        str(row.get("ro") or ""),
+                        str(row.get("bs") or ""),
+                        str(row.get("bo") or ""),
+                        row.get("winner"),
+                        int(started_at or 0),
+                        int(ended_at or 0),
+                        score_rs,
+                        score_ro,
+                        score_bs,
+                        score_bo,
+                        row.get("reason"),
+                        int(time.time()),
+                    )
+                )
+                room_id = str(row.get("room_id") or row.get("roomId") or "")
+                validator = str(row.get("validator") or "")
+                participants = row.get("participants") or []
+                score_map = {}
+                raw_scores = row.get("scores") or []
+                if isinstance(raw_scores, list):
+                    for score_row in raw_scores:
+                        if not isinstance(score_row, dict):
+                            continue
+                        hotkey = str(score_row.get("hotkey") or "").strip()
+                        if not hotkey:
+                            continue
+                        try:
+                            score_map[hotkey] = float(score_row.get("score") or 0.0)
+                        except (TypeError, ValueError):
+                            score_map[hotkey] = 0.0
+                generic_rows.append(
+                    {
+                        "room_id": room_id,
+                        "competition": competition,
+                        "validator": validator,
+                        "status": str(row.get("status") or "completed"),
+                        "started_at": int(started_at or 0),
+                        "ended_at": int(ended_at or 0),
+                        "reason": str(row.get("reason") or "completed"),
+                        "question_count": int(row.get("question_count") or 0),
+                        "question_limit": int(row.get("question_limit") or 0),
+                        "bonus_limit": int(row.get("bonus_limit") or 0),
+                        "participants": participants,
+                        "score_map": score_map,
+                    }
+                )
+                default_scores = [score_rs, score_ro, score_bs, score_bo]
+                for idx, participant in enumerate(participants):
+                    participant_hotkey = ""
+                    if isinstance(participant, str):
+                        participant_hotkey = participant
+                    elif isinstance(participant, dict):
+                        participant_hotkey = str(participant.get("hotkey") or "")
+                    participant_hotkey = participant_hotkey.strip()
+                    if not participant_hotkey or participant_hotkey == validator:
+                        continue
+                    if participant_hotkey in score_map:
+                        participant_score = score_map[participant_hotkey]
+                    elif idx < len(default_scores):
+                        participant_score = default_scores[idx]
+                    else:
+                        participant_score = 0.0
+                    miner_records.append(
+                        (
+                            validator,
+                            competition,
+                            participant_hotkey,
+                            str(row.get("room_id") or row.get("roomId") or ""),
+                            float(participant_score),
+                            int(ended_at or 0),
+                            int(
+                                row.get("synced_at") or row.get("syncedAt") or synced_at
+                            ),
+                        )
+                    )
+            except Exception as err:  # noqa: BLE001
+                bt.logging.error(f"Skipping malformed scores_all row {row}: {err}")
+
+        if not mapped_rows:
+            return
+
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.executemany(
+                """
+                INSERT INTO scores_all(
+                    id, room_id, competition, validator, rs, ro, bs, bo,
+                    winner, started_at, ended_at,
+                    score_rs, score_ro, score_bs, score_bo,
+                    reason, synced_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(room_id) DO UPDATE SET
+                    competition=excluded.competition,
+                    rs=excluded.rs,
+                    ro=excluded.ro,
+                    bs=excluded.bs,
+                    bo=excluded.bo,
+                    winner=excluded.winner,
+                    started_at=excluded.started_at,
+                    ended_at=excluded.ended_at,
+                    score_rs=excluded.score_rs,
+                    score_ro=excluded.score_ro,
+                    score_bs=excluded.score_bs,
+                    score_bo=excluded.score_bo,
+                    reason=excluded.reason,
+                    synced_at=excluded.synced_at
+                ;
+                """,
+                mapped_rows,
+            )
+            cur.executemany(
+                """
+                INSERT INTO miner_records(validator, competition, hotkey, room_id, score, ts, synced_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(room_id, hotkey) DO UPDATE SET
+                    score=excluded.score,
+                    ts=excluded.ts,
+                    synced_at=excluded.synced_at
+                """,
+                miner_records,
+            )
+            cur.close()
+        self._upsert_generic_scores_all(generic_rows)
+
+    def _upsert_generic_scores_all(self, rows: Sequence[dict]) -> None:
+        if not self.generic_store:
+            return
+
+        for row in rows:
+            competition = str(row.get("competition") or "")
+            if not competition or competition == "codenames":
+                continue
+
+            room_id = str(row.get("room_id") or "")
+            validator = str(row.get("validator") or "")
+            started_at = int(row.get("started_at") or 0)
+            ended_at = int(row.get("ended_at") or 0)
+            participants = row.get("participants") or []
+            score_map = dict(row.get("score_map") or {})
+            reason = str(row.get("reason") or "completed")
+            status = str(row.get("status") or "completed")
+            metadata = {
+                "reason": reason,
+                "question_count": int(row.get("question_count") or 0),
+                "question_limit": int(row.get("question_limit") or 0),
+                "bonus_limit": int(row.get("bonus_limit") or 0),
+            }
+
+            self.generic_store.upsert_session(
+                {
+                    "session_id": room_id,
+                    "game_code": competition,
+                    "competition_code": competition,
+                    "validator_hotkey": validator,
+                    "status": status,
+                    "started_at": started_at,
+                    "ended_at": ended_at,
+                    "metadata_json": json.dumps(metadata, sort_keys=True),
+                }
+            )
+
+            for participant in participants:
+                participant_hotkey = ""
+                participant_score = 0.0
+                participant_status = "completed"
+                summary_json = None
+                if isinstance(participant, str):
+                    participant_hotkey = participant.strip()
+                elif isinstance(participant, dict):
+                    participant_hotkey = str(participant.get("hotkey") or "").strip()
+                    try:
+                        participant_score = float(participant.get("score") or 0.0)
+                    except (TypeError, ValueError):
+                        participant_score = 0.0
+                    participant_status = (
+                        str(
+                            participant.get("finish_reason")
+                            or participant.get("status")
+                            or "completed"
+                        )
+                        or "completed"
+                    )
+                    summary_json = json.dumps(participant, sort_keys=True)
+                if not participant_hotkey or participant_hotkey == validator:
+                    continue
+                if participant_hotkey in score_map:
+                    participant_score = float(score_map[participant_hotkey])
+                self.generic_store.upsert_attempt(
+                    {
+                        "attempt_id": f"{room_id}:{participant_hotkey}",
+                        "session_id": room_id,
+                        "miner_hotkey": participant_hotkey,
+                        "status": participant_status,
+                        "score": participant_score,
+                        "started_at": started_at,
+                        "ended_at": ended_at,
+                        "summary_json": summary_json,
+                    }
+                )
+
+    def close(self):
+        with self._lock:
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                finally:
+                    self._conn = None

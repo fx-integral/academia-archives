@@ -1,0 +1,49 @@
+# TrajectoryRL Validator
+#
+# Season 1: validator orchestrates trajrl-bench sandbox containers via
+# Docker API.  No embedded agent gateway or mock-tools needed.
+#
+# Build (from repo root):
+#   docker build -f docker/Dockerfile.validator -t trajectoryrl-validator .
+#
+# Run:
+#   docker run --network host --env-file .env.validator \
+#     -v /var/run/docker.sock:/var/run/docker.sock \
+#     -v ~/.bittensor/wallets:/root/.bittensor/wallets:ro \
+#     trajectoryrl-validator
+
+FROM python:3.10-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git curl openssh-client && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# ── Python dependencies ─────────────────────────────────────────
+COPY pyproject.toml requirements.txt VERSION ./
+COPY trajectoryrl/ trajectoryrl/
+COPY neurons/ neurons/
+COPY scripts/ scripts/
+
+RUN pip install --no-cache-dir -e .
+
+# ── Directories ─────────────────────────────────────────────────
+RUN mkdir -p /var/lib/trajectoryrl
+
+# ── Entrypoint ──────────────────────────────────────────────────
+COPY docker/entrypoint-validator.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# ── Environment defaults ────────────────────────────────────────
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV WALLET_NAME=validator
+ENV WALLET_HOTKEY=default
+ENV NETUID=11
+ENV NETWORK=finney
+ENV EVAL_INTERVAL_BLOCKS=1200
+ENV WEIGHT_INTERVAL_BLOCKS=360
+ENV INACTIVITY_BLOCKS=14400
+ENV LOG_LEVEL=INFO
+
+ENTRYPOINT ["/entrypoint.sh"]

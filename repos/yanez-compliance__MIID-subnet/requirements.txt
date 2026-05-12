@@ -1,0 +1,29 @@
+starlette>=0.30.0
+pydantic>=2
+rich>=13
+pytest>=8
+torch>=2
+pandas
+tqdm
+numpy>=1
+setuptools>=68,<82
+faker
+ollama
+python-Levenshtein
+jellyfish
+aiohttp
+substrate-interface
+bittensor==10.0.0
+bittensor-cli # Use latest or desired version
+wandb
+python-dotenv # Add dotenv for .env file handling
+requests
+unidecode
+geonamescache==3.0.0
+
+# Phase 4: shared (validator + miner)
+Pillow>=9.0.0
+
+# Phase 4 miner-only packages (diffusion models, face validation, etc.)
+# are in requirements-miner.txt.  Miners should also run:
+#   pip install -r requirements-miner.txt

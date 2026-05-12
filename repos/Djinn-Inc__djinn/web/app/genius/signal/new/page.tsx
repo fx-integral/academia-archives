@@ -1,0 +1,2331 @@
+"use client";
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+import { useAccount, useWalletClient } from "wagmi";
+import { useCommitSignal, useCollateral, useDepositCollateral, useWalletUsdcBalance, useMutationGate } from "@/lib/hooks";
+import { saveSavedSignalsEncrypted, getSavedSignalsEncrypted } from "@/lib/hooks/useSettledSignals";
+import { ADDRESSES } from "@/lib/contracts";
+import { getGeniusDefaults, setGeniusDefaults } from "@/lib/preferences";
+import SecretModal from "@/components/SecretModal";
+import { triggerOnboardingRefresh } from "@/components/OnboardingChecklist";
+import PrivateWorkspace from "@/components/PrivateWorkspace";
+import {
+  encrypt,
+  keyToBigInt,
+  toHex,
+  deriveMasterSeedTyped,
+  deriveSignalKey,
+  isMasterSeedCached,
+  generateBeaverTriples,
+} from "@/lib/crypto";
+import { discoverValidatorClients, checkLinesViaSubnet } from "@/lib/api";
+import { useActiveSignals } from "@/lib/hooks/useSignals";
+import { fetchProtocolStats } from "@/lib/subgraph";
+import { formatUsdc } from "@/lib/types";
+import {
+  SPORT_GROUPS,
+  SPORTS,
+  generateDecoys,
+  extractBets,
+  betToLine,
+  formatLine,
+  formatOdds,
+  usesDecimalOdds,
+  serializeLine,
+  toCandidateLine,
+  type OddsEvent,
+  type AvailableBet,
+  type StructuredLine,
+  type SportOption,
+} from "@/lib/odds";
+
+// Shamir fan-out bounds.
+// SHAMIR_MIN: floor for reconstruction threshold (must be >= 2 for MPC privacy).
+// SHAMIR_MAX: cap on number of validators that receive shares.
+// Actual threshold: clamp(ceil(2/3 * nShares), SHAMIR_MIN, SHAMIR_MAX).
+//
+// Design rule: SHAMIR_MAX must be >= OutcomeVoting.quorumThreshold (currently 4
+// on testnet with 6 validators at 2/3 rule). With SHAMIR_MAX < quorumThreshold,
+// fewer validators hold shares than are required to reach quorum, so no batch can
+// ever finalize on-chain. SHAMIR_MAX=7 is the original design cap (never require
+// more than 7 even as the subnet grows past 10+ validators).
+const SHAMIR_MIN = 2;
+const SHAMIR_MAX = 7;
+
+type WizardStep = "browse" | "review" | "configure" | "preflight" | "committing" | "distributing" | "success" | "error";
+
+/** Success screen that auto-redirects after 5s to prevent accidental
+ *  double-submits (user report #21). Shows a countdown and lets the
+ *  user click "Back to Dashboard" or "Stay on this page" explicitly. */
+function SignalCreatedSuccess({
+  txHash,
+  signalId,
+  onBack,
+}: {
+  txHash: string | null;
+  signalId: string | null;
+  onBack: () => void;
+}) {
+  const [stay, setStay] = useState(false);
+  const [remaining, setRemaining] = useState(5);
+  useEffect(() => {
+    if (stay) return;
+    if (remaining <= 0) {
+      onBack();
+      return;
+    }
+    const t = setTimeout(() => setRemaining((r) => r - 1), 1000);
+    return () => clearTimeout(t);
+  }, [remaining, stay, onBack]);
+
+  return (
+    <div className="max-w-2xl mx-auto text-center py-20">
+      <div className="w-16 h-16 rounded-full bg-green-100 flex items-center justify-center mx-auto mb-6">
+        <svg className="w-8 h-8 text-green-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+        </svg>
+      </div>
+      <h1 className="text-3xl font-bold text-slate-900 mb-4">
+        Signal Committed &amp; Shares Distributed
+      </h1>
+      <p className="text-slate-500 mb-2">
+        Your signal has been committed on-chain and encryption key shares
+        have been distributed to validators.
+      </p>
+      <p className="text-sm text-slate-500 font-mono break-all mb-6">
+        tx: {txHash}
+      </p>
+      {signalId && (
+        <p data-signal-id={signalId} className="hidden" />
+      )}
+      <div className="flex flex-col sm:flex-row gap-3 justify-center items-center">
+        <button onClick={onBack} className="btn-primary">
+          Back to Dashboard{!stay && remaining > 0 ? ` (${remaining})` : ""}
+        </button>
+        {!stay && (
+          <button
+            onClick={() => setStay(true)}
+            className="text-sm text-slate-500 hover:text-slate-700 underline"
+          >
+            Stay on this page
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+export default function CreateSignal() {
+  const router = useRouter();
+  const { isConnected, address } = useAccount();
+  const { data: walletClient } = useWalletClient();
+  const { commit, loading: commitLoading, error: commitError } =
+    useCommitSignal();
+  const { signals: existingSignals } = useActiveSignals(undefined, address);
+  const signalCount = existingSignals.length;
+  const MAX_PROOF_SIGNALS = 20;
+
+  // Collateral for inline deposit on configure step
+  const { deposit: collateralDeposit, available: collateralAvailable, refresh: refreshCollateral } = useCollateral(address);
+  const { deposit: depositCollateral, loading: depositCollateralLoading } = useDepositCollateral();
+  const checkPause = useMutationGate();
+  const { balance: walletUsdc } = useWalletUsdcBalance(address);
+  const [inlineDepositAmount, setInlineDepositAmount] = useState("");
+  const [inlineDepositError, setInlineDepositError] = useState<string | null>(null);
+
+  // Wizard step
+  const [step, setStep] = useState<WizardStep>("browse");
+
+  // Step 1: Browse
+  const [selectedSport, setSelectedSport] = useState<SportOption>(SPORTS[0]);
+  const [events, setEvents] = useState<OddsEvent[]>([]);
+  const [eventsLoading, setEventsLoading] = useState(false);
+  const [eventsError, setEventsError] = useState<string | null>(null);
+  const [selectedBet, setSelectedBet] = useState<AvailableBet | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
+
+  // Step 2: Review lines
+  const [realPick, setRealPick] = useState<StructuredLine | null>(null);
+  const [decoyLines, setDecoyLines] = useState<StructuredLine[]>([]);
+  const [realIndex, setRealIndex] = useState(0);
+
+  // Odds: market reference and genius's signal odds (American format string)
+  const [marketOdds, setMarketOdds] = useState<number | null>(null);
+  const [editOdds, setEditOdds] = useState("");
+  // Which line is expanded for editing (0-9 index, null = none)
+  const [expandedLine, setExpandedLine] = useState<number | null>(null);
+  const [decoysExpanded, setDecoysExpanded] = useState(false);
+
+  // Per-book prices derived from current realPick side/line (updates when side changes)
+  const bookPrices = useMemo(() => {
+    if (!selectedBet || !realPick) return [];
+    const prices: { book: string; price: number }[] = [];
+    for (const bk of selectedBet.event.bookmakers) {
+      for (const mkt of bk.markets) {
+        if (mkt.key !== realPick.market) continue;
+        for (const outcome of mkt.outcomes) {
+          if (outcome.name === realPick.side && (outcome.point ?? null) === (realPick.line ?? null)) {
+            prices.push({ book: bk.title, price: outcome.price });
+          }
+        }
+      }
+    }
+    return prices.sort((a, b) => b.price - a.price);
+  }, [selectedBet, realPick]);
+
+  // BPA mode (Best Price Available)
+  const [bpaMode, setBpaMode] = useState(false);
+
+  // Step 3: Configure
+  const [maxPriceBps, setMaxPriceBps] = useState("10");
+  const [slaMultiplier, setSlaMultiplier] = useState("100");
+  const [maxNotional, setMaxNotional] = useState("100");
+  const [minNotional, setMinNotional] = useState("");
+  const [isExclusive, setIsExclusive] = useState(false);
+  const [expiresIn, setExpiresIn] = useState("24");
+  const [selectedSportsbooks, setSelectedSportsbooks] = useState<string[]>([]);
+
+  // Master seed derivation — prompt on page load so it's cached before submit.
+  // seedReady tracks whether the seed is cached (drives button label).
+  const [seedDeriving, setSeedDeriving] = useState(false);
+  const [seedReady, setSeedReady] = useState(() => isMasterSeedCached());
+  const seedAttemptedRef = useRef(false);
+  const submittingRef = useRef(false);
+
+  useEffect(() => {
+    if (!walletClient || seedAttemptedRef.current || isMasterSeedCached()) {
+      if (isMasterSeedCached()) setSeedReady(true);
+      return;
+    }
+    seedAttemptedRef.current = true;
+    setSeedDeriving(true);
+    deriveMasterSeedTyped(async (params) => {
+      const sig = await walletClient.signTypedData(params);
+      return sig;
+    })
+      .then(() => setSeedReady(true))
+      .catch(() => {
+        // User dismissed — reset the guard so a wallet reconnect (new
+        // walletClient identity) can re-prompt on this mount. Submit still
+        // handles first-click fallback for the no-reconnect case.
+        seedAttemptedRef.current = false;
+      })
+      .finally(() => setSeedDeriving(false));
+  }, [walletClient]);
+
+  // Load saved genius defaults exactly once per mount, and never after the
+  // user has started typing. Fixes a silent-override bug where a late
+  // wallet-connect would fire this effect and overwrite what the user had
+  // already entered (e.g. user types 11% fee before connecting wallet →
+  // wallet connects → saved-defaults 10.98% stomps the input → signal
+  // commits at 10.98%).
+  const [defaultsSaved, setDefaultsSaved] = useState(false);
+  const defaultsLoadedRef = useRef(false);
+  const userEditedRef = useRef(false);
+  const markUserEdited = useCallback(() => {
+    userEditedRef.current = true;
+  }, []);
+  useEffect(() => {
+    if (!address || defaultsLoadedRef.current || userEditedRef.current) return;
+    defaultsLoadedRef.current = true;
+    const d = getGeniusDefaults(address);
+    if (d.maxPriceBps) setMaxPriceBps(d.maxPriceBps);
+    if (d.slaMultiplier) setSlaMultiplier(d.slaMultiplier);
+    if (d.maxNotional) setMaxNotional(d.maxNotional);
+    if (d.minNotional !== undefined) setMinNotional(d.minNotional);
+    if (d.expiresIn) setExpiresIn(d.expiresIn);
+    if (d.isExclusive !== undefined) setIsExclusive(d.isExclusive);
+  }, [address]);
+
+  // Platform liquidity (from subgraph)
+  const [totalVolume, setTotalVolume] = useState<string | null>(null);
+
+  // Progress
+  const [txHash, setTxHash] = useState<string | null>(null);
+  const [committedSignalId, setCommittedSignalId] = useState<string | null>(null);
+  const [stepError, setStepError] = useState<string | null>(null);
+
+  // Tick every 60s so the filter drops games that start while the page is open
+  const [filterTick, setFilterTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setFilterTick((t) => t + 1), 60_000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Sort events by commence time, exclude started games only.
+  // Games about to start are kept (peak volume) but get a visual warning.
+  const filteredEvents = useMemo(() => {
+    const now = Date.now();
+    const sorted = [...events]
+      .filter((ev) => new Date(ev.commence_time).getTime() > now)
+      .sort(
+        (a, b) => new Date(a.commence_time).getTime() - new Date(b.commence_time).getTime(),
+      );
+    if (!searchQuery.trim()) return sorted;
+    const q = searchQuery.toLowerCase();
+    return sorted.filter(
+      (ev) =>
+        ev.home_team.toLowerCase().includes(q) ||
+        ev.away_team.toLowerCase().includes(q),
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [events, searchQuery, filterTick]);
+
+  const fetchEvents = useCallback(async (sport: SportOption) => {
+    setEventsLoading(true);
+    setEventsError(null);
+    setEvents([]);
+    setSelectedBet(null);
+    setSearchQuery("");
+    try {
+      const resp = await fetch(`/api/odds?sport=${sport.key}`);
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => ({ error: resp.statusText }));
+        throw new Error(data.error || `Failed to load games (${resp.status})`);
+      }
+      const data: OddsEvent[] = await resp.json();
+      setEvents(data);
+    } catch (err) {
+      setEventsError(
+        err instanceof Error ? err.message : "Failed to load games",
+      );
+    } finally {
+      setEventsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (isConnected) {
+      fetchEvents(selectedSport);
+    }
+  }, [selectedSport, isConnected, fetchEvents]);
+
+  // Fetch platform-wide liquidity once
+  useEffect(() => {
+    fetchProtocolStats().then((stats) => {
+      if (stats?.totalVolume) setTotalVolume(stats.totalVolume);
+    }).catch(() => {});
+  }, []);
+
+
+  const handleSelectBet = async (bet: AvailableBet) => {
+    setSelectedBet(bet);
+    const pick = betToLine(bet);
+    setRealPick(pick);
+    setMarketOdds(bet.avgPrice);
+    // Default the committed price to the WORST book currently on offer, not
+    // the cross-book average. A floor equal to the current worst means:
+    //   (a) every selected book is at or above committed at creation time,
+    //   (b) the displayed "committed" matches an odds value a real book
+    //       actually has on the line (no phantom -124 that no book offers),
+    //   (c) executability (max(prices) >= committed) stays maximally true.
+    // The genius can still edit this up if they want a tighter floor.
+    setEditOdds(decimalToAmerican(bet.minPrice));
+    setSelectedSportsbooks(bet.books);
+
+    // Fetch alt lines for dynamic decoy generation
+    let allEventsForDecoys = events;
+    try {
+      const { fetchAltLines } = await import("@/lib/odds");
+      const altData = await fetchAltLines(bet.event.id, bet.event.sport_key);
+      if (altData) {
+        // Merge alt lines into existing events for richer decoy pool
+        allEventsForDecoys = [...events, altData];
+      }
+    } catch {
+      // Alt lines are a nice-to-have, not blocking
+    }
+
+    // Dynamic decoy count: fill from available data, up to 999
+    const targetDecoys = Math.min(999, Math.max(9, allEventsForDecoys.length * 10));
+    const decoys = generateDecoys(pick, allEventsForDecoys, targetDecoys);
+    setDecoyLines(decoys);
+    const totalLines = decoys.length + 1;
+    const pos = cryptoRandomInt(totalLines);
+    setRealIndex(pos);
+    setExpandedLine(pos);
+    setStep("review");
+  };
+
+  const handleRegenerateDecoys = () => {
+    if (!realPick) return;
+    const targetDecoys = Math.min(999, Math.max(9, events.length * 10));
+    const decoys = generateDecoys(realPick, events, targetDecoys);
+    setDecoyLines(decoys);
+    setRealIndex(cryptoRandomInt(decoys.length + 1));
+  };
+
+  const getAllLines = (): StructuredLine[] => {
+    if (!realPick) return [];
+    const totalCount = decoyLines.length + 1;
+    const lines: StructuredLine[] = [];
+    let decoyIdx = 0;
+    for (let i = 0; i < totalCount; i++) {
+      if (i === realIndex) {
+        lines.push(realPick);
+      } else {
+        lines.push(decoyLines[decoyIdx++]);
+      }
+    }
+    return lines;
+  };
+
+  /** Update any line (real pick or decoy) by its global 0-9 index. */
+  const updateLine = (globalIdx: number, updates: Partial<StructuredLine>) => {
+    if (globalIdx === realIndex) {
+      setRealPick((prev) => prev ? { ...prev, ...updates } : prev);
+      // Sync editOdds if price changed on the real pick
+      if (updates.price != null) {
+        setEditOdds(decimalToAmerican(updates.price));
+      }
+    } else {
+      const decoyIdx = globalIdx < realIndex ? globalIdx : globalIdx - 1;
+      setDecoyLines((prev) =>
+        prev.map((d, i) => (i === decoyIdx ? { ...d, ...updates } : d)),
+      );
+    }
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (submittingRef.current) return;
+    submittingRef.current = true;
+    try {
+    setStepError(null);
+
+    const pauseErr = checkPause("signalCommitment", "Commit signal");
+    if (pauseErr) { setStepError(pauseErr); return; }
+
+    if (!realPick) {
+      setStepError("No signal selected");
+      return;
+    }
+
+    const geniusAddress = address;
+    if (!geniusAddress) {
+      setStepError("Wallet address not available");
+      return;
+    }
+
+    // Collateral gate: block signal creation without sufficient collateral
+    const mn = parseFloat(maxNotional) || 0;
+    const sla = parseFloat(slaMultiplier) || 100;
+    const requiredCollateral = BigInt(Math.round(mn * (sla / 100 + 0.005) * 1e6));
+    if (collateralAvailable < requiredCollateral) {
+      const shortfall = Number(requiredCollateral - collateralAvailable) / 1e6;
+      setStepError(`Insufficient collateral. Deposit $${shortfall.toLocaleString("en-US")} more before creating this signal.`);
+      return;
+    }
+
+    // Sync realPick.price from editOdds to prevent stale odds in serialized lines
+    const minOddsDecimal = editOdds ? americanToDecimal(editOdds) : null;
+    if (minOddsDecimal != null && realPick.price !== minOddsDecimal) {
+      setRealPick((prev) => prev ? { ...prev, price: minOddsDecimal } : prev);
+      // Also update the local reference for this submission
+      realPick.price = minOddsDecimal;
+    }
+
+    const allLines = getAllLines();
+    if (allLines.length < 2) {
+      setStepError("Need at least 2 lines (1 real + 1 decoy)");
+      return;
+    }
+
+    try {
+      // ── Gate 1: Ensure encryption key is ready ──
+      // Coinbase Smart Wallet can only handle one popup per user action.
+      // If signTypedData hasn't been done yet, do it NOW and stop —
+      // don't chain into writeContract. User clicks "Create Signal"
+      // again and gets a single writeContract popup.
+      if (!isMasterSeedCached()) {
+        if (!walletClient) throw new Error("Wallet not connected");
+        setSeedDeriving(true);
+        try {
+          await deriveMasterSeedTyped(async (params) => {
+            const sig = await walletClient.signTypedData(params);
+            return sig;
+          });
+          setSeedReady(true);
+        } finally {
+          setSeedDeriving(false);
+        }
+        // Seed is now cached. Return to configure step so the NEXT
+        // click goes straight to commit with a single popup.
+        setStepError(null);
+        return;
+      }
+
+      // Show immediate feedback
+      setStep("preflight");
+
+      // Pre-flight: discover validators and check that enough are reachable
+      const preflightValidators = await discoverValidatorClients();
+      if (preflightValidators.length < SHAMIR_MIN) {
+        setStepError(
+          `Only ${preflightValidators.length} validators discovered, need at least ${SHAMIR_MIN}. The network may be down.`,
+        );
+        setStep("configure");
+        return;
+      }
+      // Health check with two-phase strategy:
+      //  1. Collect healthy validators up to min(SHAMIR_MAX, available) within
+      //     the timeout. Exit early once we have enough for the desired fan-out.
+      //  2. If we don't hit SHAMIR_MAX but have >= SHAMIR_MIN, proceed with
+      //     however many responded.
+      //
+      // We wait for up to SHAMIR_MAX validators (not just SHAMIR_MIN) so that
+      // enough validators hold shares to reach OutcomeVoting.quorumThreshold.
+      // Exiting at SHAMIR_MIN=2 was the root cause of the quorum-topology gap:
+      // only 2 validators received shares, but quorum=4 requires 4 voters.
+      const HEALTH_TIMEOUT_MS = 12_000;
+      const targetShares = Math.min(SHAMIR_MAX, preflightValidators.length);
+
+      // P0-01 architectural fix (2026-04-26): only target OV signer-registered
+      // validators. Pre-fix, the SDK fanned out to any healthy validator. If
+      // the discovered set diverged from the on-chain OV signer set, audit
+      // MPC at settlement time couldn't reach quorum because non-signer
+      // validators have shares but no vote, and signer validators may not
+      // have shares. Filtering on settlement_registered here aligns the
+      // share-distribution set with the vote-quorum set, which is what the
+      // audit pipeline actually needs.
+      const healthPromises = preflightValidators.map((v) =>
+        Promise.race([
+          v.health().then((h) =>
+            h.status === "ok" && h.settlement_registered === true ? v : null
+          ).catch(() => null),
+          new Promise<null>((resolve) =>
+            setTimeout(() => resolve(null), HEALTH_TIMEOUT_MS),
+          ),
+        ]),
+      );
+
+      // Track healthy validators as they come in. Resolve early once
+      // we have targetShares of them (up to SHAMIR_MAX).
+      const healthyValidators: typeof preflightValidators = [];
+      await new Promise<void>((resolve) => {
+        let pending = healthPromises.length;
+        if (pending === 0) {
+          resolve();
+          return;
+        }
+        for (const p of healthPromises) {
+          p.then((vc) => {
+            if (vc) {
+              healthyValidators.push(vc);
+              if (healthyValidators.length >= targetShares) {
+                // Collected enough validators for desired fan-out — proceed.
+                resolve();
+              }
+            }
+            pending -= 1;
+            if (pending === 0) resolve();
+          });
+        }
+      });
+
+      const healthyCount = healthyValidators.length;
+      if (healthyCount < SHAMIR_MIN) {
+        setStepError(
+          `Only ${healthyCount} validators responded within ${HEALTH_TIMEOUT_MS / 1000}s, need at least ${SHAMIR_MIN}. ` +
+          `This usually means the validator network just cold-started — try again in a few seconds.`,
+        );
+        setStep("configure");
+        return;
+      }
+      // healthyValidators (not all preflightValidators) are used for
+      // distribution below, so shares only go to compatible validators.
+
+      // Pre-flight: verify real pick is available (just the real pick, not all decoys)
+      // With v2 off-chain decoys, we only verify the real pick at preflight.
+      // Decoy failures are tolerable since decoys are jiggered anyway.
+      const realLineIdx = realIndex + 1; // Protocol uses 1-indexed
+      const realCandidate = toCandidateLine(allLines[realIndex], realLineIdx);
+      try {
+        const checkResult = await checkLinesViaSubnet({ lines: [realCandidate] });
+
+        if (checkResult.api_error) {
+          setStepError(
+            "The odds data source is experiencing errors and cannot verify your lines right now.\n" +
+            `(${checkResult.api_error})\n` +
+            "Please try again in a few minutes.",
+          );
+          setStep("configure");
+          return;
+        }
+
+        const realResult = checkResult.results.find((r) => r.index === realLineIdx);
+        if (!realResult || !realResult.available) {
+          const reason = realResult?.unavailable_reason;
+          const reasonMessages: Record<string, string> = {
+            game_started: "This game has already started and lines are no longer available. Please select a different game.",
+            line_moved: "The line for your pick has moved and is no longer available at the value you selected. Please select a different line or refresh the odds.",
+            market_unavailable: "This market type is no longer offered for this game. Please select a different market.",
+            no_data: "No sportsbook data is available for this game right now. Please try again in a few minutes.",
+          };
+          setStepError(
+            reason && reasonMessages[reason]
+              ? reasonMessages[reason]
+              : "Your pick is not currently available at any sportsbook. The line may have moved or the game may have started. Please select a different bet.",
+          );
+          setStep("browse");
+          return;
+        }
+      } catch (minerErr) {
+        console.warn("Line verification failed:", minerErr);
+        setStepError(
+          "Could not verify your lines with any data source. " +
+          "Please check your internet connection and try again.",
+        );
+        setStep("configure");
+        return;
+      }
+
+      setStep("committing");
+
+      // Generate signalId first so we can derive the AES key from it
+      const signalId = BigInt(
+        "0x" +
+          Array.from(crypto.getRandomValues(new Uint8Array(32)))
+            .map((b) => b.toString(16).padStart(2, "0"))
+            .join(""),
+      );
+
+      // Derive AES key from the cached master seed.
+      // Gate 1 above guarantees the seed is cached by this point —
+      // if it wasn't, we returned early after the signTypedData popup.
+      if (!walletClient) throw new Error("Wallet not connected");
+      const masterSeed = await deriveMasterSeedTyped(
+        async (params) => {
+          const sig = await walletClient.signTypedData(params);
+          return sig;
+        },
+      );
+      const aesKey = await deriveSignalKey(masterSeed, signalId);
+
+      const pickPayload = JSON.stringify({
+        realIndex: realIndex + 1,
+        pick: formatLine(realPick),
+        minOdds: minOddsDecimal,
+        minOddsAmerican: editOdds || null,
+      });
+      const { ciphertext, iv } = await encrypt(pickPayload, aesKey);
+      const encryptedBlob = `${iv}:${ciphertext}`;
+
+      const encoder = new TextEncoder();
+      const hashBuffer = await crypto.subtle.digest(
+        "SHA-256",
+        encoder.encode(encryptedBlob),
+      );
+      const commitHash =
+        "0x" +
+        Array.from(new Uint8Array(hashBuffer))
+          .map((b) => b.toString(16).padStart(2, "0"))
+          .join("");
+
+      const expiresInNum = parseFloat(expiresIn);
+      const maxPriceNum = parseFloat(maxPriceBps);
+      const slaNum = parseFloat(slaMultiplier);
+      if (isNaN(expiresInNum) || !Number.isFinite(expiresInNum) || expiresInNum <= 0) {
+        setStepError("Invalid expiration time");
+        setStep("configure");
+        return;
+      }
+      if (isNaN(maxPriceNum) || !Number.isFinite(maxPriceNum) || maxPriceNum <= 0 || maxPriceNum > 100) {
+        setStepError("Invalid max price (must be 0-100%)");
+        setStep("configure");
+        return;
+      }
+      if (isNaN(slaNum) || !Number.isFinite(slaNum) || slaNum < 100 || slaNum > 300) {
+        setStepError("Invalid backing multiplier (must be 100-300%)");
+        setStep("configure");
+        return;
+      }
+      const maxNotionalNum = parseFloat(maxNotional);
+      if (isNaN(maxNotionalNum) || !Number.isFinite(maxNotionalNum) || maxNotionalNum < 1) {
+        setStepError("Invalid max notional (must be at least $1)");
+        setStep("configure");
+        return;
+      }
+
+      const expiresAt = BigInt(
+        Math.floor(Date.now() / 1000) + expiresInNum * 3600,
+      );
+
+      // Jigger all lines for privacy (random perturbations to odds and spreads)
+      const jiggeredLines = allLines.map((line) => {
+        const jiggered = { ...line };
+        const rng = new Uint32Array(2);
+        crypto.getRandomValues(rng);
+        const oddsShift = ((rng[0] % 31) - 15) / 100; // -0.15 to +0.15 decimal
+        if (jiggered.price) {
+          jiggered.price = Math.max(1.01, jiggered.price + oddsShift);
+        }
+        if (jiggered.line !== null) {
+          const lineShift = ((rng[1] % 5) - 2) * 0.5; // -1.0 to +1.0
+          jiggered.line = jiggered.line + lineShift;
+        }
+        return jiggered;
+      });
+
+      const serializedLines = jiggeredLines.map(serializeLine);
+
+      // Compute linesHash: keccak256 of ABI-encoded string[]
+      const { AbiCoder, keccak256: ethersKeccak } = await import("ethers");
+      const encoded = AbiCoder.defaultAbiCoder().encode(["string[]"], [serializedLines]);
+      const linesHash = ethersKeccak(encoded);
+
+      const hash = await commit({
+        signalId,
+        encryptedBlob: "0x" + toHex(encoder.encode(encryptedBlob)),
+        commitHash,
+        sport: selectedSport.key,
+        maxPriceBps: BigInt(Math.round(maxPriceNum * 100)),
+        slaMultiplierBps: BigInt(Math.round(slaNum * 100)),
+        maxNotional: BigInt(Math.round(maxNotionalNum * 1e6)),
+        minNotional: minNotional ? BigInt(Math.round(parseFloat(minNotional) * 1e6)) : 0n,
+        expiresAt,
+        decoyLines: [], // v2: empty on-chain, lines stored off-chain
+        availableSportsbooks: selectedSportsbooks,
+        linesHash,
+        lineCount: allLines.length,
+        bpaMode,
+      });
+      setTxHash(hash);
+      setCommittedSignalId(signalId.toString());
+
+      setStep("distributing");
+
+      const validators = healthyValidators;
+      const signalIdStr = signalId.toString();
+      const keyBigInt = keyToBigInt(aesKey);
+      // realIndex is 0-based internally, but 1-indexed for the protocol (1-10)
+      const indexBigInt = BigInt(realIndex + 1);
+
+      // Pre-compute Beaver triples for MPC gate computation at purchase time.
+      // One triple per line (available_index check). Without these, the MPC
+      // falls back to OT triple generation over the network, which takes
+      // 30-60s and frequently times out.
+      const triples = generateBeaverTriples(allLines.length);
+      const triplesData = triples.map((t) => ({
+        a: t.a.toString(16).padStart(64, "0"),
+        b: t.b.toString(16).padStart(64, "0"),
+        c: t.c.toString(16).padStart(64, "0"),
+      }));
+
+      // Bundle fan-out (Phase 3 of share recovery) is the only supported
+      // share-distribution path. Legacy /v1/signal plaintext fan-out has
+      // been removed; if SHARE_RECOVERY is unsupported on chain, the
+      // signal create fails loudly below.
+      let usedBundlePath = false;
+      let succeeded = 0;
+      let nShares = validators.length;
+      let effectiveThreshold = Math.min(
+        SHAMIR_MAX,
+        Math.max(SHAMIR_MIN, Math.ceil(nShares * 2 / 3)),
+      );
+
+      try {
+        // Lazy-load the share-recovery modules so the signal-create page
+        // chunk stays small and doesn't pull tweetnacl into the initial
+        // bundle. The dynamic import resolves once per first run, then the
+        // module is cached by the bundler for subsequent invocations.
+        const [
+          { ovSupportsShareRecovery, fetchOVValidatorPubkeys },
+          { buildShareBundle },
+          { enqueue: enqueueRetry },
+        ] = await Promise.all([
+          import("@/lib/encryption-pubkeys"),
+          import("@/lib/share-bundle"),
+          import("@/lib/share-retry-queue"),
+        ]);
+
+        // Bundle path is the only supported share-distribution path now.
+        // Legacy /v1/signal plaintext fan-out has been removed. If the OV
+        // impl doesn't expose SHARE_RECOVERY or fewer than SHAMIR_MIN
+        // validators have published pubkeys, fail loudly — operator must
+        // upgrade OV or wait for validator pubkey publication.
+        if (!(await ovSupportsShareRecovery())) {
+          throw new Error(
+            "OutcomeVoting impl does not expose SHARE_RECOVERY feature. Operator must upgrade OV before signal creation.",
+          );
+        }
+        const ovValidators = await fetchOVValidatorPubkeys();
+        const encryptableCount = ovValidators.filter((v) => v.pubkey.some((b) => b !== 0)).length;
+        if (encryptableCount < SHAMIR_MIN) {
+          throw new Error(
+            `Only ${encryptableCount} validator(s) have published encryption pubkeys (need >=${SHAMIR_MIN}). Wait for validator setEncryptionPubkey or contact operator.`,
+          );
+        }
+        const result = buildShareBundle({
+          signalId: signalIdStr,
+          geniusAddress,
+          keyBigInt,
+          indexBigInt,
+          validators: ovValidators,
+          shamirMin: SHAMIR_MIN,
+          shamirMax: SHAMIR_MAX,
+        });
+        nShares = result.nShares;
+        effectiveThreshold = result.effectiveThreshold;
+        const bundlePayload = {
+          ...result.bundle,
+          precomputed_triples: triplesData,
+        };
+        const bundleResults = await Promise.allSettled(
+          validators.map((v) => v.storeShareBundle(bundlePayload)),
+        );
+        bundleResults.forEach((r, i) => {
+          if (r.status === "fulfilled") {
+            succeeded += 1;
+          } else {
+            enqueueRetry(signalIdStr, validators[i].baseUrl, bundlePayload);
+          }
+        });
+        usedBundlePath = true;
+      } catch (e) {
+        // Bundle-path setup failure is now fatal (no legacy fallback).
+        // Surface the error so the user sees what's wrong.
+        throw e;
+      }
+
+      const failed = nShares - succeeded;
+      if (succeeded < effectiveThreshold) {
+        throw new Error(
+          `Key distribution failed: ${succeeded} of ${effectiveThreshold} required validators responded.`,
+        );
+      }
+      if (failed > 0) {
+        console.warn(`${failed}/${nShares} bundle deliveries failed (${succeeded} succeeded, queued for retry)`);
+      }
+
+      // Register signal metadata on validators for outcome resolution and live odds.
+      // Non-blocking: metadata is needed for check-odds and settlement, not for
+      // the immediate purchase flow (which uses MPC on stored shares).
+      if (selectedBet) {
+        const regPayload = {
+          sport: selectedSport.key,
+          event_id: selectedBet.event.id,
+          home_team: selectedBet.event.home_team,
+          away_team: selectedBet.event.away_team,
+          lines: serializedLines,
+          genius_address: geniusAddress,
+        };
+        Promise.allSettled(
+          validators.map((v) => v.registerSignal(signalIdStr, regPayload)),
+        ).then((regResults) => {
+          const regOk = regResults.filter((r) => r.status === "fulfilled").length;
+          console.log(`[signal] Metadata registered on ${regOk}/${validators.length} validators`);
+        }).catch(() => {});
+      }
+
+      // Persist private signal data for wallet recovery and audit tracking
+      const newEntry = {
+        signalId: signalId.toString(),
+        preimage: keyToBigInt(aesKey).toString(),
+        realIndex: realIndex + 1, // 1-indexed
+        sport: selectedSport.label,
+        pick: formatLine(realPick),
+        minOdds: minOddsDecimal,
+        minOddsAmerican: editOdds || null,
+        slaMultiplierBps: Math.round(slaNum * 100),
+        createdAt: Math.floor(Date.now() / 1000),
+        minerVerified: true,
+      };
+      const { getCachedMasterSeed } = await import("@/lib/crypto");
+      const seed = getCachedMasterSeed();
+      const existingResult = await getSavedSignalsEncrypted(geniusAddress, seed);
+      const updated = [...existingResult.signals, newEntry];
+      await saveSavedSignalsEncrypted(geniusAddress, updated, seed);
+
+      // Store recovery blob on-chain (non-blocking — localStorage is primary).
+      // Debounced: rapid back-to-back signal creations don't each fire a store
+      // popup. See maybeStoreRecovery (web/lib/recovery.ts).
+      if (walletClient) {
+        import("@/lib/contracts").then(({ ADDRESSES }) => {
+          if (ADDRESSES.keyRecovery === "0x0000000000000000000000000000000000000000") return;
+          Promise.all([
+            import("@wagmi/core"),
+            import("@/app/providers"),
+            import("@/lib/recovery"),
+          ]).then(([{ waitForTransactionReceipt }, { wagmiConfig }, { maybeStoreRecovery }]) => {
+            maybeStoreRecovery(
+              geniusAddress,
+              (params: Parameters<typeof walletClient.signTypedData>[0]) => walletClient.signTypedData(params),
+              walletClient,
+              updated,
+              async (h: `0x${string}`) => { await waitForTransactionReceipt(wagmiConfig, { hash: h }); },
+            ).catch((err: unknown) => {
+              console.warn("[recovery] Failed to store genius recovery blob:", err);
+            });
+          });
+        });
+      }
+
+      setStep("success");
+      triggerOnboardingRefresh();
+      // Flag so the genius dashboard does a cache-busting refresh on mount
+      try { sessionStorage.setItem("djinn_signal_just_created", "1"); } catch { /* sessionStorage unavailable in private browsing */ }
+    } catch (err) {
+      const { humanizeError } = await import("@/lib/hooks");
+      const msg = humanizeError(err, "Signal creation failed");
+      setStepError(msg);
+      // Stay on configure page for recoverable errors (wallet, validation)
+      // so the user can fix and retry without losing their settings
+      setStep("configure");
+    }
+    } finally {
+      submittingRef.current = false;
+    }
+  };
+
+  if (!isConnected) {
+    return (
+      <div className="text-center py-20">
+        <h1 className="text-3xl font-bold text-slate-900 mb-4">
+          Create Signal
+        </h1>
+        <p className="text-slate-500">
+          Connect your wallet to create a signal.
+        </p>
+      </div>
+    );
+  }
+
+  // ---------- Success ----------
+  if (step === "success") {
+    // Per user-report #21: the "stays on create page" feedback came from
+    // users who didn't realize the success screen had rendered, then
+    // clicked submit again and paid for a duplicate signal. Auto-redirect
+    // to the dashboard after a short beat gives a clean end-state and
+    // eliminates the "did it work?" ambiguity. Users who want to linger
+    // click the explicit button immediately.
+    return (
+      <SignalCreatedSuccess
+        txHash={txHash}
+        signalId={committedSignalId}
+        onBack={() => router.push("/genius")}
+      />
+    );
+  }
+
+  // ---------- Error ----------
+  if (step === "error") {
+    return (
+      <div className="max-w-2xl mx-auto text-center py-20">
+        <div className="w-16 h-16 rounded-full bg-red-100 flex items-center justify-center mx-auto mb-6">
+          <svg className="w-8 h-8 text-red-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+          </svg>
+        </div>
+        <h1 className="text-3xl font-bold text-slate-900 mb-4">
+          Signal Creation Failed
+        </h1>
+        <p className="text-sm text-red-600 mb-8 whitespace-pre-line">{stepError}</p>
+        <button onClick={() => setStep("browse")} className="btn-primary">
+          Try Again
+        </button>
+      </div>
+    );
+  }
+
+  const isProcessing = step === "preflight" || step === "committing" || step === "distributing";
+  const isInteractiveStep = step === "browse" || step === "review" || step === "configure";
+
+  // ---------- Step 1: Browse games & pick a bet ----------
+  if (step === "browse") {
+    return (
+      <PrivateWorkspace open onClose={() => router.push("/genius")}>
+      <div className="max-w-3xl mx-auto">
+        {/* Encryption key derivation overlay — shown once on first visit */}
+        {seedDeriving && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-white/80 backdrop-blur-sm">
+            <div className="text-center max-w-sm mx-auto px-6">
+              <div className="inline-block w-10 h-10 border-2 border-genius-500 border-t-transparent rounded-full animate-spin mb-4" />
+              <h2 className="text-lg font-semibold text-slate-900 mb-2">Setting up encryption</h2>
+              <p className="text-sm text-slate-500">
+                Your wallet will ask you to sign a message. This is free (no gas)
+                and derives your encryption key so your picks stay secret.
+              </p>
+            </div>
+          </div>
+        )}
+        <WizardStepper currentStep="browse" />
+        {stepError && (
+          <div className="rounded-lg bg-red-50 border border-red-200 p-4 mb-4" role="alert">
+            <p className="text-sm text-red-600 whitespace-pre-line">{stepError}</p>
+          </div>
+        )}
+        <div className="flex items-start justify-between gap-4 mb-2">
+          <h1 className="text-3xl font-bold text-slate-900">Create Signal</h1>
+          {totalVolume && (
+            <div className="text-right flex-shrink-0">
+              <p className="text-[10px] text-slate-400 uppercase tracking-wide">Platform Liquidity</p>
+              <p className="text-sm font-semibold text-genius-700">
+                ${formatUsdc(BigInt(totalVolume))}
+              </p>
+            </div>
+          )}
+        </div>
+        <p className="text-slate-500 mb-6">
+          Browse upcoming games and select your signal. The system will auto-generate
+          plausible decoy lines from real odds data.
+        </p>
+
+        {signalCount >= MAX_PROOF_SIGNALS && (
+          <div className="rounded-lg px-4 py-3 mb-6 text-sm bg-amber-50 text-amber-700 border border-amber-200">
+            You have {signalCount} active signals. Audit batches settle automatically
+            once enough outcomes are resolved per buyer. Your track record updates as batches are finalized.
+          </div>
+        )}
+
+        {/* Sport Selector — horizontal scroll on mobile, grouped grid on desktop */}
+        <div className="mb-6">
+          {/* Mobile: single horizontal scroll strip */}
+          <div className="flex gap-1.5 overflow-x-auto pb-2 -mx-5 px-5 sm:hidden scrollbar-hide">
+            {SPORTS.map((sport) => (
+              <button
+                key={sport.key}
+                type="button"
+                onClick={() => setSelectedSport(sport)}
+                className={`rounded-lg px-3 py-1.5 text-sm font-medium whitespace-nowrap flex-shrink-0 transition-colors ${
+                  selectedSport.key === sport.key
+                    ? "bg-genius-500 text-white"
+                    : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+                }`}
+              >
+                {sport.label}
+              </button>
+            ))}
+          </div>
+
+          {/* Desktop: grouped layout */}
+          <div className="hidden sm:block space-y-3">
+            {SPORT_GROUPS.map((group) => (
+              <div key={group.label}>
+                <p className="text-xs font-medium text-slate-400 uppercase tracking-wide mb-1.5">
+                  {group.label}
+                </p>
+                <div className="flex flex-wrap gap-1.5">
+                  {group.sports.map((sport) => (
+                    <button
+                      key={sport.key}
+                      type="button"
+                      onClick={() => setSelectedSport(sport)}
+                      className={`rounded-lg px-3 py-1.5 text-sm font-medium transition-colors ${
+                        selectedSport.key === sport.key
+                          ? "bg-genius-500 text-white"
+                          : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+                      }`}
+                    >
+                      {sport.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Search */}
+        {events.length > 0 && (
+          <div className="mb-4">
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder={`Search ${selectedSport.label} teams...`}
+              className="input w-full"
+              autoComplete="off"
+              aria-label={`Search ${selectedSport.label} teams`}
+            />
+          </div>
+        )}
+
+        {/* Loading */}
+        {eventsLoading && (
+          <div className="text-center py-12">
+            <div className="inline-block w-8 h-8 border-2 border-genius-500 border-t-transparent rounded-full animate-spin mb-4" />
+            <p className="text-sm text-slate-500">Loading {selectedSport.label} games...</p>
+          </div>
+        )}
+
+        {/* Error */}
+        {eventsError && (
+          <div className="rounded-lg bg-red-50 border border-red-200 p-4 mb-6" role="alert">
+            <p className="text-sm text-red-600">{eventsError}</p>
+            <button
+              onClick={() => fetchEvents(selectedSport)}
+              className="text-sm text-red-700 underline mt-2"
+            >
+              Retry
+            </button>
+          </div>
+        )}
+
+        {/* No events */}
+        {!eventsLoading && !eventsError && events.length === 0 && (
+          <div className="text-center py-12">
+            <div className="w-12 h-12 rounded-full bg-slate-100 flex items-center justify-center mx-auto mb-3">
+              <svg className="w-6 h-6 text-slate-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+            </div>
+            <p className="text-slate-500 mb-1">
+              No upcoming {selectedSport.label} games found
+            </p>
+            <p className="text-xs text-slate-400">
+              All current games have already started. Try another sport or check back later.
+            </p>
+          </div>
+        )}
+
+        {/* Search no results */}
+        {!eventsLoading && events.length > 0 && filteredEvents.length === 0 && (
+          <div className="text-center py-12">
+            <p className="text-slate-500">
+              No games matching &ldquo;{searchQuery}&rdquo;
+            </p>
+          </div>
+        )}
+
+        {/* Events list */}
+        {!eventsLoading && filteredEvents.length > 0 && (
+          <div className="space-y-3">
+            <p className="text-xs text-slate-400">
+              {filteredEvents.length} game{filteredEvents.length !== 1 ? "s" : ""}, sorted by start time
+            </p>
+            {filteredEvents.map((event) => (
+              <EventCard
+                key={event.id}
+                event={event}
+                onSelectBet={handleSelectBet}
+                oddsFormat={usesDecimalOdds(selectedSport.key) ? "decimal" : "american"}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+      </PrivateWorkspace>
+    );
+  }
+
+  // ---------- Step 2: Review lines ----------
+  if (step === "review") {
+    const allLines = getAllLines();
+    const sameMarketCount = allLines.filter(
+      (l) => l.market === realPick?.market,
+    ).length;
+    const useDecimal = usesDecimalOdds(selectedSport.key);
+    const oddsFormat: "american" | "decimal" = useDecimal ? "decimal" : "american";
+    const signalDecimal = editOdds ? americanToDecimal(editOdds) : null;
+    const LINE_STEP = 0.5; // spread/total increment for nudge buttons
+
+    return (
+      <PrivateWorkspace open onClose={() => router.push("/genius")}>
+      <div className="max-w-2xl mx-auto">
+        <WizardStepper currentStep="review" />
+        <button
+          onClick={() => setStep("browse")}
+          className="text-sm text-slate-500 hover:text-slate-900 mb-6 transition-colors"
+        >
+          &larr; Back to Games
+        </button>
+
+        {stepError && (
+          <div className="rounded-lg bg-red-50 border border-red-200 p-4 mb-4" role="alert">
+            <p className="text-sm text-red-600 whitespace-pre-line">{stepError}</p>
+          </div>
+        )}
+        <h1 className="text-3xl font-bold text-slate-900 mb-2">Review Lines</h1>
+        <p className="text-slate-500 mb-4">
+          Tap any line to edit it. {allLines.length - 1} decoy lines are auto-generated from real odds data.
+          Purchasers won&apos;t know which line is yours.
+        </p>
+
+        <p className="text-xs text-slate-400 mb-3">
+          {sameMarketCount}/{allLines.length} lines are {realPick?.market === "h2h" ? "moneyline" : realPick?.market}. Higher same-market ratio = harder to identify your signal
+        </p>
+
+        <div className="space-y-2 mb-6">
+          {allLines.map((line, i) => {
+            const isReal = i === realIndex;
+            const isDecoy = !isReal;
+            // Skip decoys when collapsed
+            if (isDecoy && !decoysExpanded) return null;
+            const isExpanded = expandedLine === i;
+            const sides = line.market === "totals"
+              ? ["Over", "Under"]
+              : [line.home_team, line.away_team];
+
+            return (
+              <div
+                key={i}
+                className={`rounded-lg overflow-hidden transition-all ${
+                  isReal
+                    ? "border-2 border-genius-300 bg-genius-50"
+                    : "border border-slate-200 bg-slate-50"
+                }`}
+              >
+                {/* Collapsed row — click to expand */}
+                <div
+                  className={`flex items-center gap-3 px-4 py-3 text-sm cursor-pointer ${
+                    isReal ? "font-medium text-genius-800" : "text-slate-600"
+                  }`}
+                  onClick={() => setExpandedLine(isExpanded ? null : i)}
+                >
+                  <span className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0 ${
+                    isReal ? "bg-genius-500 text-white" : "bg-slate-200 text-slate-500"
+                  }`}>
+                    {i + 1}
+                  </span>
+                  <span className="flex-1 min-w-0 truncate">{formatLine(line, oddsFormat)}</span>
+                  {isReal && (
+                    <span className="text-xs bg-genius-200 text-genius-700 rounded px-2 py-0.5 flex-shrink-0">
+                      YOUR PICK
+                    </span>
+                  )}
+                  <svg
+                    className={`w-4 h-4 flex-shrink-0 transition-transform ${isExpanded ? "rotate-180" : ""} ${isReal ? "text-genius-500" : "text-slate-400"}`}
+                    fill="none" viewBox="0 0 24 24" stroke="currentColor"
+                  >
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                  </svg>
+                </div>
+
+                {/* Expanded edit panel */}
+                {isExpanded && (
+                  <div className={`px-4 pb-4 pt-2 border-t space-y-3 ${isReal ? "border-genius-200" : "border-slate-200"}`}>
+                    {/* Side selector */}
+                    <div>
+                      <p className="text-[10px] text-slate-500 uppercase tracking-wide mb-1">Side</p>
+                      <div className="flex gap-2">
+                        {sides.map((s) => (
+                          <button
+                            key={s}
+                            type="button"
+                            onClick={() => updateLine(i, { side: s })}
+                            className={`rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
+                              line.side === s
+                                ? isReal ? "bg-genius-500 text-white" : "bg-slate-700 text-white"
+                                : "bg-slate-200 text-slate-600 hover:bg-slate-300"
+                            }`}
+                          >
+                            {s}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Change game — decoys only */}
+                    {!isReal && (
+                      <div>
+                        <p className="text-[10px] text-slate-500 uppercase tracking-wide mb-1">Game</p>
+                        <select
+                          value={line.event_id}
+                          onChange={(e) => {
+                            const ev = events.find((ev) => ev.id === e.target.value);
+                            if (!ev) return;
+                            updateLine(i, {
+                              event_id: ev.id,
+                              home_team: ev.home_team,
+                              away_team: ev.away_team,
+                              sport: ev.sport_key,
+                            });
+                          }}
+                          className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs text-slate-700 focus:ring-2 focus:ring-genius-400"
+                        >
+                          {events.map((ev) => (
+                            <option key={ev.id} value={ev.id}>
+                              {ev.away_team} @ {ev.home_team}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
+
+                    {/* Line value (spreads/totals only) */}
+                    {line.market !== "h2h" && (
+                      <div>
+                        <p className="text-[10px] text-slate-500 uppercase tracking-wide mb-1">
+                          {line.market === "spreads" ? "Spread" : "Total"}
+                        </p>
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="number"
+                            step="0.5"
+                            value={line.line ?? ""}
+                            onChange={(e) => {
+                              const val = parseFloat(e.target.value);
+                              if (!isNaN(val) && Number.isFinite(val)) {
+                                updateLine(i, { line: val });
+                              }
+                            }}
+                            className="w-20 rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-sm font-mono focus:ring-2 focus:ring-genius-400"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => updateLine(i, { line: (line.line ?? 0) - LINE_STEP })}
+                            className="w-8 h-8 rounded-lg bg-slate-200 text-slate-600 hover:bg-slate-300 font-bold text-sm flex-shrink-0 flex items-center justify-center"
+                          >
+                            &minus;
+                          </button>
+                          <input
+                            type="range"
+                            min={line.market === "totals" ? 100 : -15}
+                            max={line.market === "totals" ? 300 : 15}
+                            step="0.5"
+                            value={line.line ?? 0}
+                            onChange={(e) => updateLine(i, { line: parseFloat(e.target.value) })}
+                            className="flex-1 accent-genius-500 h-2"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => updateLine(i, { line: (line.line ?? 0) + LINE_STEP })}
+                            className="w-8 h-8 rounded-lg bg-slate-200 text-slate-600 hover:bg-slate-300 font-bold text-sm flex-shrink-0 flex items-center justify-center"
+                          >
+                            +
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Odds */}
+                    <div>
+                      <p className="text-[10px] text-slate-500 uppercase tracking-wide mb-1">
+                        {isReal ? "Signal Odds" : "Odds"}{useDecimal ? " (decimal)" : " (American)"}
+                      </p>
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="text"
+                          value={
+                            useDecimal
+                              ? (isReal ? (signalDecimal?.toFixed(2) ?? line.price?.toFixed(2) ?? "") : (line.price?.toFixed(2) ?? ""))
+                              : (isReal ? editOdds : (line.price ? decimalToAmerican(line.price) : ""))
+                          }
+                          onChange={(e) => {
+                            const raw = e.target.value;
+                            if (useDecimal) {
+                              if (!/^\d*\.?\d{0,2}$/.test(raw)) return;
+                              const dec = parseFloat(raw);
+                              if (!isNaN(dec) && dec >= 1.01) {
+                                if (isReal) {
+                                  setEditOdds(decimalToAmerican(dec));
+                                  setRealPick((prev) => prev ? { ...prev, price: dec } : prev);
+                                } else {
+                                  updateLine(i, { price: dec });
+                                }
+                              }
+                            } else {
+                              if (!/^[+-]?\d*$/.test(raw)) return;
+                              if (isReal) {
+                                setEditOdds(raw);
+                                const dec = americanToDecimal(raw);
+                                if (dec != null) setRealPick((prev) => prev ? { ...prev, price: dec } : prev);
+                              } else {
+                                const dec = americanToDecimal(raw);
+                                if (dec != null) updateLine(i, { price: dec });
+                              }
+                            }
+                          }}
+                          placeholder={useDecimal ? "1.91" : "-110"}
+                          className="w-20 rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-sm font-mono focus:ring-2 focus:ring-genius-400"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const cur = isReal ? (signalDecimal ?? line.price ?? 1.91) : (line.price ?? 1.91);
+                            const next = nudgeOdds(cur, -1, useDecimal);
+                            if (isReal) {
+                              setEditOdds(decimalToAmerican(next));
+                              setRealPick((prev) => prev ? { ...prev, price: next } : prev);
+                            } else {
+                              updateLine(i, { price: next });
+                            }
+                          }}
+                          className="w-8 h-8 rounded-lg bg-slate-200 text-slate-600 hover:bg-slate-300 font-bold text-sm flex-shrink-0 flex items-center justify-center"
+                        >
+                          &minus;
+                        </button>
+                        <input
+                          type="range"
+                          min="1.1"
+                          max="10"
+                          step="0.01"
+                          value={isReal ? (signalDecimal ?? line.price ?? 1.91) : (line.price ?? 1.91)}
+                          onChange={(e) => {
+                            const dec = parseFloat(e.target.value);
+                            if (isReal) {
+                              setEditOdds(decimalToAmerican(dec));
+                              setRealPick((prev) => prev ? { ...prev, price: dec } : prev);
+                            } else {
+                              updateLine(i, { price: dec });
+                            }
+                          }}
+                          className="flex-1 accent-genius-500 h-2"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const cur = isReal ? (signalDecimal ?? line.price ?? 1.91) : (line.price ?? 1.91);
+                            const next = nudgeOdds(cur, 1, useDecimal);
+                            if (isReal) {
+                              setEditOdds(decimalToAmerican(next));
+                              setRealPick((prev) => prev ? { ...prev, price: next } : prev);
+                            } else {
+                              updateLine(i, { price: next });
+                            }
+                          }}
+                          className="w-8 h-8 rounded-lg bg-slate-200 text-slate-600 hover:bg-slate-300 font-bold text-sm flex-shrink-0 flex items-center justify-center"
+                        >
+                          +
+                        </button>
+                      </div>
+                      {isReal && (
+                        <p className="text-[10px] text-genius-500 mt-1">
+                          Your committed floor (limit order). Buyers execute only
+                          while at least one of their selected books is at this
+                          price or better. Default is the current worst book so
+                          every book is executable at creation.
+                        </p>
+                      )}
+                    </div>
+
+                    {/* Market depth — real pick only */}
+                    {isReal && bookPrices.length > 0 && (() => {
+                      const bestPrice = bookPrices[0].price;
+                      const worstPrice = bookPrices[bookPrices.length - 1].price;
+                      const hasRange = bestPrice !== worstPrice;
+                      return (
+                      <div className="rounded-lg bg-white border border-genius-200 overflow-hidden">
+                        <p className="text-[10px] text-genius-600 uppercase tracking-wide font-medium px-3 pt-2 pb-1">
+                          Market Depth: tap a book to use its odds
+                        </p>
+                        <table className="w-full text-xs">
+                          <tbody>
+                            {bookPrices.map(({ book, price }, bi) => {
+                              const displayOdds = formatOdds(price, oddsFormat);
+                              const isBest = hasRange && price === bestPrice;
+                              const isWorst = hasRange && price === worstPrice;
+                              const atOrBetter = signalDecimal != null && price >= signalDecimal - 0.001;
+                              return (
+                                <tr
+                                  key={`${book}-${bi}`}
+                                  className={`cursor-pointer transition-colors hover:bg-genius-100 active:bg-genius-200 ${
+                                    isBest ? "bg-green-50" : isWorst ? "bg-red-50" : ""
+                                  }`}
+                                  onClick={() => {
+                                    setEditOdds(decimalToAmerican(price));
+                                    setRealPick((prev) => prev ? { ...prev, price } : prev);
+                                  }}
+                                >
+                                  <td className="w-5 pl-2.5 py-2.5">
+                                    {atOrBetter ? (
+                                      <svg className="w-3.5 h-3.5 text-green-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+                                        <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                                      </svg>
+                                    ) : (
+                                      <span className="w-3.5 h-3.5 block" />
+                                    )}
+                                  </td>
+                                  <td className={`py-2.5 font-medium ${
+                                    isBest ? "text-green-700" : isWorst ? "text-red-600" : "text-slate-500"
+                                  }`}>
+                                    {book}
+                                    {isBest && <span className="ml-1.5 text-[9px] font-semibold text-green-600 uppercase">Best</span>}
+                                    {isWorst && <span className="ml-1.5 text-[9px] font-semibold text-red-500 uppercase">Worst</span>}
+                                  </td>
+                                  <td className={`pr-3 py-2.5 text-right font-mono font-semibold ${
+                                    isBest ? "text-green-700" : isWorst ? "text-red-600" : atOrBetter ? "text-genius-700" : "text-slate-400"
+                                  }`}>{displayOdds}</td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                        {signalDecimal != null && (
+                          <p className="text-[10px] text-genius-500 px-3 py-1.5 border-t border-genius-100">
+                            {bookPrices.filter(p => p.price >= signalDecimal - 0.001).length}/{bookPrices.length} at or above your signal odds
+                          </p>
+                        )}
+                      </div>
+                      );
+                    })()}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+
+          {/* Decoy toggle */}
+          <button
+            type="button"
+            onClick={() => setDecoysExpanded(!decoysExpanded)}
+            className="w-full flex items-center justify-between rounded-lg border border-dashed border-slate-300 bg-slate-50 px-4 py-3 text-sm text-slate-500 hover:bg-slate-100 transition-colors"
+          >
+            <span>
+              {decoysExpanded ? "Hide" : "Show"} {allLines.length - 1} decoy lines
+              {!decoysExpanded && <span className="text-slate-400 ml-1">(tap to review)</span>}
+            </span>
+            <svg
+              className={`w-4 h-4 text-slate-400 transition-transform ${decoysExpanded ? "rotate-180" : ""}`}
+              fill="none" viewBox="0 0 24 24" stroke="currentColor"
+            >
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+            </svg>
+          </button>
+        </div>
+
+        {/* Sticky CTA bar */}
+        <div className="sticky bottom-0 -mx-5 px-5 py-3 sm:-mx-8 sm:px-8 bg-white/95 backdrop-blur-sm border-t border-slate-200 shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.05)] mt-6 -mb-6">
+          <div className="flex gap-3 max-w-2xl mx-auto">
+            <button
+              onClick={handleRegenerateDecoys}
+              className="px-4 py-2 text-sm rounded-lg border border-slate-300 text-slate-600 hover:bg-slate-50 transition-colors"
+            >
+              Regenerate
+            </button>
+            <button
+              onClick={() => {
+                // Sync realPick.price from editOdds before transitioning
+                const dec = editOdds ? americanToDecimal(editOdds) : null;
+                if (dec != null) {
+                  setRealPick((prev) => prev ? { ...prev, price: dec } : prev);
+                }
+                setStep("configure");
+              }}
+              className="btn-primary flex-1 py-2"
+            >
+              Continue to Pricing
+            </button>
+          </div>
+        </div>
+      </div>
+      </PrivateWorkspace>
+    );
+  }
+
+  // ---------- Step 3: Configure & Submit ----------
+  return (
+    <PrivateWorkspace open onClose={() => router.push("/genius")}>
+    <div className="max-w-2xl mx-auto">
+      <WizardStepper currentStep="configure" />
+      <button
+        onClick={() => setStep("browse")}
+        className="text-sm text-slate-500 hover:text-slate-900 mb-6 transition-colors"
+      >
+        &larr; Back to Games
+      </button>
+
+      <h1 className="text-3xl font-bold text-slate-900 mb-2">Configure Signal</h1>
+      <p className="text-slate-500 mb-6">
+        Set your pricing and expiration.
+      </p>
+
+      {(commitError || stepError) && (
+        <div className="rounded-lg bg-red-50 border border-red-200 p-4 mb-6" role="alert">
+          <p className="text-sm text-red-600 whitespace-pre-line">{commitError || stepError}</p>
+        </div>
+      )}
+
+      {realPick && (
+        <div className="rounded-lg bg-genius-50 border border-genius-200 p-4 mb-6">
+          <p className="text-xs text-genius-600 uppercase tracking-wide mb-1">Your Pick</p>
+          <p className="text-sm font-bold text-genius-800">{formatLine(realPick)}</p>
+          <p className="text-xs text-genius-600 mt-1">
+            + {decoyLines.length} decoy lines (privacy-enhanced)
+            {selectedSportsbooks.length > 0 && (
+              <> &middot; {selectedSportsbooks.length} sportsbook{selectedSportsbooks.length !== 1 ? "s" : ""}</>
+            )}
+          </p>
+        </div>
+      )}
+
+      <form onSubmit={handleSubmit} className="space-y-6">
+        <div>
+          <label htmlFor="maxPriceBps" className="label">Signal Fee (%)</label>
+          <input
+            id="maxPriceBps"
+            type="number"
+            value={maxPriceBps}
+            onChange={(e) => { markUserEdited(); setMaxPriceBps(e.target.value); }}
+            placeholder="5"
+            min="0.01"
+            max="50"
+            step="0.01"
+            className="input"
+            required
+          />
+          {(() => {
+            const pct = parseFloat(maxPriceBps);
+            if (maxPriceBps && (isNaN(pct) || pct <= 0)) {
+              return <p className="text-xs text-red-500 mt-1">Fee must be greater than 0%</p>;
+            }
+            if (pct > 50) {
+              return <p className="text-xs text-red-500 mt-1">Fee cannot exceed 50%</p>;
+            }
+            return (
+              <p className="text-xs text-slate-500 mt-1">
+                Percentage buyers pay per purchase. Higher fee = more revenue but fewer buyers.
+              </p>
+            );
+          })()}
+          {(() => {
+            const pct = parseFloat(maxPriceBps);
+            if (!isNaN(pct) && pct > 0 && pct <= 50) {
+              return (
+                <div className="mt-2 rounded-lg bg-slate-50 border border-slate-200 px-3 py-2 text-xs text-slate-600 space-y-0.5">
+                  <p>At $100 notional, buyer pays <span className="font-semibold text-genius-700">${(100 * pct / 100).toFixed(2)}</span> fee</p>
+                  <p>At $500 notional, buyer pays <span className="font-semibold text-genius-700">${(500 * pct / 100).toFixed(2)}</span> fee</p>
+                  <p>At $1,000 notional, buyer pays <span className="font-semibold text-genius-700">${(1000 * pct / 100).toFixed(2)}</span> fee</p>
+                </div>
+              );
+            }
+            return null;
+          })()}
+        </div>
+
+        <div>
+          <label htmlFor="slaMultiplier" className="label">Backing Multiplier (%)</label>
+          <input
+            id="slaMultiplier"
+            type="number"
+            value={slaMultiplier}
+            onChange={(e) => { markUserEdited(); setSlaMultiplier(e.target.value); }}
+            placeholder="100"
+            min="100"
+            max="300"
+            step="1"
+            className="input"
+            required
+          />
+          {(() => {
+            const sla = parseFloat(slaMultiplier);
+            if (slaMultiplier && !isNaN(sla) && sla < 100) {
+              return <p className="text-xs text-red-500 mt-1">Minimum is 100%. Buyers must be guaranteed at least their full stake back on a wrong pick.</p>;
+            }
+            if (sla > 300) {
+              return <p className="text-xs text-red-500 mt-1">Backing multiplier cannot exceed 300% (contract limit)</p>;
+            }
+            return (
+              <p className="text-xs text-slate-500 mt-1">
+                Skin in the game: if your pick is wrong, you pay the buyer this % of
+                their stake from your locked collateral. 100% = full refund on loss.
+                200% = buyer profits even when you&apos;re wrong. Higher multipliers
+                signal more confidence and attract more buyers.
+              </p>
+            );
+          })()}
+        </div>
+
+        <div>
+          <label htmlFor="expiresIn" className="label">Expires In (hours)</label>
+          <input
+            id="expiresIn"
+            type="number"
+            value={expiresIn}
+            onChange={(e) => { markUserEdited(); setExpiresIn(e.target.value); }}
+            placeholder="24"
+            min="1"
+            max="168"
+            className="input"
+            required
+          />
+          {(() => {
+            const hrs = parseFloat(expiresIn);
+            if (expiresIn && !isNaN(hrs) && hrs < 1) {
+              return <p className="text-xs text-red-500 mt-1">Expiry must be at least 1 hour</p>;
+            }
+            if (hrs > 168) {
+              return <p className="text-xs text-red-500 mt-1">Expiry cannot exceed 168 hours (7 days)</p>;
+            }
+            return null;
+          })()}
+          <p className="text-xs text-slate-500 mt-1">
+            Signals also become unavailable once the game starts. Setting expiry
+            well before game time avoids revealing which event your signal is on.
+          </p>
+        </div>
+
+        <div>
+          <label htmlFor="maxNotional" className="label">Max Notional (USDC)</label>
+          <input
+            id="maxNotional"
+            type="number"
+            value={maxNotional}
+            onChange={(e) => {
+              markUserEdited();
+              const val = e.target.value;
+              setMaxNotional(val);
+              if (isExclusive) setMinNotional(val);
+            }}
+            placeholder="10000"
+            min="1"
+            max="1000000000"
+            step="1"
+            className="input"
+            required
+          />
+          {(() => {
+            const mn = parseFloat(maxNotional);
+            if (maxNotional && !isNaN(mn) && mn < 1) {
+              return <p className="text-xs text-red-500 mt-1">Max notional must be at least $1</p>;
+            }
+            return (
+              <p className="text-xs text-slate-500 mt-1">
+                {isExclusive
+                  ? "Exactly one buyer will purchase this full amount."
+                  : "Total notional capacity for this signal. Multiple buyers can purchase until this is filled."}
+              </p>
+            );
+          })()}
+          {(() => {
+            const mn = parseFloat(maxNotional);
+            const sla = parseFloat(slaMultiplier);
+            if (!isNaN(mn) && mn > 0 && !isNaN(sla) && sla > 0) {
+              const maxLock = mn * (sla / 100 + 0.005); // SLA + 0.5% protocol fee
+              return (
+                <p className="text-xs text-slate-500 mt-1">
+                  At max notional, <span className="font-semibold text-genius-700">${maxLock.toLocaleString()}</span> of your collateral would be locked.
+                </p>
+              );
+            }
+            return null;
+          })()}
+        </div>
+
+        {/* Exclusivity */}
+        <fieldset>
+          <legend className="text-sm font-medium text-slate-700 mb-2">Exclusivity</legend>
+          <div className="space-y-2">
+            <label className="flex items-start gap-3 cursor-pointer rounded-lg border border-slate-200 p-3 hover:bg-slate-50 transition-colors has-[:checked]:border-genius-500 has-[:checked]:bg-genius-50">
+              <input
+                type="radio"
+                name="exclusivity"
+                checked={!isExclusive}
+                onChange={() => {
+                  markUserEdited();
+                  setIsExclusive(false);
+                  setMinNotional("");
+                }}
+                className="mt-0.5 h-4 w-4 border-slate-300 text-genius-600 focus:ring-genius-500"
+              />
+              <div>
+                <span className="text-sm font-medium text-slate-900">Shared</span>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Multiple buyers can purchase portions of this signal up to the max notional.
+                </p>
+              </div>
+            </label>
+            <label className="flex items-start gap-3 cursor-pointer rounded-lg border border-slate-200 p-3 hover:bg-slate-50 transition-colors has-[:checked]:border-genius-500 has-[:checked]:bg-genius-50">
+              <input
+                type="radio"
+                name="exclusivity"
+                checked={isExclusive}
+                onChange={() => {
+                  markUserEdited();
+                  setIsExclusive(true);
+                  setMinNotional(maxNotional);
+                }}
+                className="mt-0.5 h-4 w-4 border-slate-300 text-genius-600 focus:ring-genius-500"
+              />
+              <div>
+                <span className="text-sm font-medium text-slate-900">Exclusive</span>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Only one buyer can purchase this signal, for the full notional.
+                </p>
+              </div>
+            </label>
+          </div>
+        </fieldset>
+
+        {/* Pricing Mode */}
+        <fieldset>
+          <legend className="text-sm font-medium text-slate-700 mb-2">Pricing Mode</legend>
+          <div className="space-y-2">
+            <label className="flex items-start gap-3 cursor-pointer rounded-lg border border-slate-200 p-3 hover:bg-slate-50 transition-colors has-[:checked]:border-genius-500 has-[:checked]:bg-genius-50">
+              <input
+                type="radio"
+                name="pricingMode"
+                checked={!bpaMode}
+                onChange={() => setBpaMode(false)}
+                className="mt-0.5 h-4 w-4 border-slate-300 text-genius-600 focus:ring-genius-500"
+              />
+              <div>
+                <span className="text-sm font-medium text-slate-900">Worst Price Available (WPA)</span>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Buyers receive the worst available odds at execution time. Protects the genius from
+                  line movement by locking in the least favorable price for the buyer.
+                </p>
+              </div>
+            </label>
+            <label className="flex items-start gap-3 cursor-pointer rounded-lg border border-slate-200 p-3 hover:bg-slate-50 transition-colors has-[:checked]:border-genius-500 has-[:checked]:bg-genius-50">
+              <input
+                type="radio"
+                name="pricingMode"
+                checked={bpaMode}
+                onChange={() => setBpaMode(true)}
+                className="mt-0.5 h-4 w-4 border-slate-300 text-genius-600 focus:ring-genius-500"
+              />
+              <div>
+                <span className="text-sm font-medium text-slate-900">Best Price Available (BPA)</span>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Buyers receive the best available odds at execution time. More attractive to
+                  buyers on fast-moving lines, but the genius bears more line movement risk.
+                </p>
+              </div>
+            </label>
+          </div>
+        </fieldset>
+
+        {!isExclusive && (
+        <div>
+          <label htmlFor="minNotional" className="label">Min Purchase (USDC) <span className="text-slate-400 font-normal">(optional)</span></label>
+          <input
+            id="minNotional"
+            type="number"
+            value={minNotional}
+            onChange={(e) => {
+              markUserEdited();
+              const val = e.target.value;
+              setMinNotional(val);
+              // Auto-detect exclusivity: if min == max and both are valid numbers
+              const minN = parseFloat(val);
+              const maxN = parseFloat(maxNotional);
+              if (val && !isNaN(minN) && !isNaN(maxN) && minN === maxN && maxN > 0) {
+                setIsExclusive(true);
+              }
+            }}
+            placeholder="0 (no minimum)"
+            min="0"
+            max={maxNotional || "1000000000"}
+            step="1"
+            className="input"
+          />
+          {(() => {
+            const minN = parseFloat(minNotional);
+            const maxN = parseFloat(maxNotional);
+            if (minNotional && !isNaN(minN) && !isNaN(maxN) && minN > maxN) {
+              return <p className="text-xs text-red-500 mt-1">Min purchase cannot exceed max notional</p>;
+            }
+            return (
+              <p className="text-xs text-slate-500 mt-1">
+                Minimum notional per purchase. Prevents many tiny buyers.
+              </p>
+            );
+          })()}
+        </div>
+        )}
+
+        <SecretModal
+          open={isProcessing}
+          variant={step === "preflight" ? "network" : step === "committing" ? "local" : "distribute"}
+          title={step === "preflight" ? "Verifying Your Lines" : step === "committing" ? "Sealing Your Pick" : "Distributing Key Shares"}
+          message={step === "preflight"
+            ? "Miners are checking that your picks are live at sportsbooks right now."
+            : step === "committing"
+            ? "Encrypting your pick and recording it on-chain. Confirm in your wallet."
+            : "Splitting your encryption key and distributing the pieces to validators."}
+        >
+          {/* Progress indicator */}
+          <div className="w-full max-w-xs mx-auto mb-3">
+            <div className="flex justify-between text-xs text-slate-500 mb-1">
+              <span className={step === "preflight" ? "text-blue-400 font-medium" : ""}>Verify</span>
+              <span className={step === "committing" ? "text-emerald-400 font-medium" : ""}>Seal</span>
+              <span className={step === "distributing" ? "text-amber-400 font-medium" : ""}>Distribute</span>
+            </div>
+            <div className="w-full bg-slate-700 rounded-full h-1.5">
+              <div
+                className={`h-1.5 rounded-full transition-all duration-1000 ease-out ${
+                  step === "preflight" ? "bg-blue-500 w-1/3"
+                  : step === "committing" ? "bg-emerald-500 w-2/3"
+                  : "bg-amber-500 w-full"
+                }`}
+              />
+            </div>
+          </div>
+          <p className="text-xs text-slate-500">
+            {step === "preflight"
+              ? `Your real pick is hidden among ${decoyLines.length} decoys. Verifying availability.`
+              : step === "committing"
+              ? "AES-256 encryption, then on-chain commit. Takes 10-30s on mainnet."
+              : "Shamir secret sharing splits the key so no single party can read your pick."}
+          </p>
+        </SecretModal>
+
+        {/* Collateral check — genius needs enough to cover SLA */}
+        {(() => {
+          const maxNotionalUsdc = parseFloat(maxNotional) || 0;
+          const slaPct = parseFloat(slaMultiplier) || 100;
+          const requiredCollateral = BigInt(Math.round(maxNotionalUsdc * (slaPct / 100 + 0.005) * 1e6));
+          const hasEnough = collateralAvailable >= requiredCollateral;
+
+          if (!hasEnough) {
+            const needed = Number(requiredCollateral - collateralAvailable) / 1e6;
+            const walletHasUsdc = walletUsdc > 0n;
+            // Auto-populate deposit amount with shortfall when field is empty
+            const displayAmount = inlineDepositAmount || needed.toString();
+            return (
+              <div className="rounded-lg bg-amber-50 border border-amber-200 p-4 mb-4">
+                <p className="text-sm font-medium text-amber-800 mb-1">
+                  Deposit ${needed.toLocaleString("en-US")} more to create this signal
+                </p>
+                <p className="text-xs text-amber-600 mb-3">
+                  This signal locks ${(Number(requiredCollateral) / 1e6).toLocaleString()} of collateral (${maxNotionalUsdc.toLocaleString()} notional &times; {slaPct}% backing + 0.5% protocol fee).
+                  {" "}You have ${(Number(collateralAvailable) / 1e6).toLocaleString()} unlocked but need ${(Number(requiredCollateral) / 1e6).toLocaleString()}.
+                  {walletHasUsdc ? ` Deposit from your $${(Number(walletUsdc) / 1e6).toLocaleString()} wallet balance below.` : ""}
+                </p>
+                <div className="flex gap-2">
+                  <input
+                    type="number"
+                    placeholder="Amount (USDC)"
+                    className="input flex-1 text-sm"
+                    value={displayAmount}
+                    onChange={(e) => setInlineDepositAmount(e.target.value)}
+                  />
+                  <button
+                    type="button"
+                    disabled={depositCollateralLoading || !displayAmount}
+                    className="btn-primary text-sm whitespace-nowrap"
+                    onClick={async () => {
+                      setInlineDepositError(null);
+                      const pauseErr = checkPause("collateral", "Deposit");
+                      if (pauseErr) { setInlineDepositError(pauseErr); return; }
+                      try {
+                        const { parseUsdc } = await import("@/lib/types");
+                        const result = await depositCollateral(parseUsdc(displayAmount));
+                        if (result === "approved") {
+                          // Approval done — user clicks again for the actual deposit
+                          return;
+                        }
+                        setInlineDepositAmount("");
+                        refreshCollateral();
+                      } catch (err) {
+                        const { humanizeError } = await import("@/lib/hooks");
+                        setInlineDepositError(humanizeError(err, "Deposit failed"));
+                      }
+                    }}
+                  >
+                    {depositCollateralLoading ? "Processing..." : "Deposit Collateral"}
+                  </button>
+                </div>
+                {inlineDepositError && (
+                  <p className="text-xs text-red-600 mt-2">{inlineDepositError}</p>
+                )}
+              </div>
+            );
+          }
+          return null;
+        })()}
+
+        {/* Save defaults */}
+        <div className="flex items-center gap-2 mb-2">
+          <button
+            type="button"
+            className="text-xs text-slate-400 hover:text-slate-600 underline underline-offset-2 transition-colors"
+            onClick={() => {
+              if (!address) return;
+              setGeniusDefaults(address, { maxPriceBps, slaMultiplier, maxNotional, minNotional, expiresIn, isExclusive });
+              setDefaultsSaved(true);
+              setTimeout(() => setDefaultsSaved(false), 2000);
+            }}
+          >
+            Save as my defaults
+          </button>
+          {defaultsSaved && <span className="text-xs text-green-600">Saved!</span>}
+        </div>
+
+        {/* Sticky CTA bar */}
+        <div className="sticky bottom-0 -mx-5 px-5 py-3 sm:-mx-8 sm:px-8 bg-white/95 backdrop-blur-sm border-t border-slate-200 shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.05)] mt-6 -mb-6">
+          {seedReady && !isProcessing && (
+            <div className="text-xs text-slate-400 mb-2 leading-relaxed">
+              <span className="text-slate-500 font-medium">What happens next:</span>{" "}
+              Your pick is encrypted locally with AES-256. The encryption key is then
+              split into one share per live validator using Shamir secret sharing
+              (threshold: 2/3 of active validators). Multiple validators must cooperate via
+              MPC to verify a purchase. No single party (including us) can see your signal.
+            </div>
+          )}
+          <button
+            type="submit"
+            disabled={isProcessing || commitLoading || seedDeriving || (() => {
+              const pct = parseFloat(maxPriceBps);
+              const sla = parseFloat(slaMultiplier);
+              const hrs = parseFloat(expiresIn);
+              const mn = parseFloat(maxNotional);
+              if (isNaN(pct) || pct <= 0 || pct > 50
+                || isNaN(sla) || sla < 100 || sla > 300
+                || isNaN(hrs) || hrs < 1 || hrs > 168
+                || isNaN(mn) || mn < 1) return true;
+              // Block submission if collateral is insufficient
+              const requiredCollateral = BigInt(Math.round(mn * (sla / 100 + 0.005) * 1e6));
+              if (collateralAvailable < requiredCollateral) return true;
+              return false;
+            })()}
+            className="btn-primary w-full py-3 text-base"
+          >
+            {isProcessing ? "Processing..." : seedDeriving ? "Setting up encryption..." : !seedReady ? "Set Up Encryption" : "Create Signal"}
+          </button>
+          {!seedReady && !isProcessing && !seedDeriving && (
+            <p className="text-xs text-slate-400 text-center mt-2">
+              Your wallet will ask you to sign a free message to set up encryption. Then click again to create.
+            </p>
+          )}
+        </div>
+      </form>
+    </div>
+    </PrivateWorkspace>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Sub-components
+// ---------------------------------------------------------------------------
+
+/** Format a relative countdown like "Starts in 3h 12m" or "Started 45m ago" */
+function timeUntil(dateStr: string): { text: string; isLive: boolean; imminent: boolean } {
+  const target = new Date(dateStr).getTime();
+  const now = Date.now();
+  const diffMs = target - now;
+
+  if (diffMs <= 0) {
+    const ago = Math.abs(diffMs);
+    if (ago < 60_000) return { text: "Just started", isLive: true, imminent: false };
+    if (ago < 3_600_000) return { text: `Started ${Math.floor(ago / 60_000)}m ago`, isLive: true, imminent: false };
+    return { text: `Started ${Math.floor(ago / 3_600_000)}h ago`, isLive: true, imminent: false };
+  }
+
+  // Games starting within 60 min are "imminent" (odds may be pulled any time)
+  const imminent = diffMs < 3_600_000;
+
+  const hours = Math.floor(diffMs / 3_600_000);
+  const minutes = Math.floor((diffMs % 3_600_000) / 60_000);
+
+  if (hours > 24) {
+    const days = Math.floor(hours / 24);
+    return { text: `in ${days}d ${hours % 24}h`, isLive: false, imminent };
+  }
+  if (hours > 0) {
+    return { text: `in ${hours}h ${minutes}m`, isLive: false, imminent };
+  }
+  return { text: `in ${minutes}m`, isLive: false, imminent };
+}
+
+function EventCard({
+  event,
+  onSelectBet,
+  oddsFormat = "american",
+}: {
+  event: OddsEvent;
+  onSelectBet: (bet: AvailableBet) => void;
+  oddsFormat?: "american" | "decimal";
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const bets = extractBets(event);
+  const { text: countdown, isLive, imminent } = timeUntil(event.commence_time);
+  const commence = new Date(event.commence_time);
+
+  const spreadBets = bets.filter((b) => b.market === "spreads");
+  const totalBets = bets.filter((b) => b.market === "totals");
+  const mlBets = bets.filter((b) => b.market === "h2h");
+
+  // Build compact spread preview showing both sides
+  const spreadPreview = spreadBets.length >= 2
+    ? spreadBets.slice(0, 2).map((b) => {
+        const last = b.side.split(" ").pop();
+        const sign = b.line != null && b.line > 0 ? "+" : "";
+        return `${last} ${sign}${b.line}`;
+      })
+    : null;
+
+  // Build compact ML preview
+  const mlPreview = mlBets.length >= 2
+    ? mlBets.slice(0, 2).map((b) => {
+        const last = b.side.split(" ").pop();
+        return `${last} ${formatOdds(b.avgPrice, oddsFormat)}`;
+      })
+    : null;
+
+  return (
+    <div className={`card ${isLive ? "opacity-40 pointer-events-none" : ""}`}>
+      <div
+        className="flex items-center justify-between cursor-pointer gap-3"
+        onClick={() => setExpanded(!expanded)}
+      >
+        {/* Left: Teams + time */}
+        <div className="flex-1 min-w-0">
+          <h3 className="text-sm font-semibold text-slate-900 truncate">
+            {event.away_team} @ {event.home_team}
+          </h3>
+          <div className="flex items-center gap-2 mt-0.5">
+            <span className={`text-xs font-medium ${isLive ? "text-red-600" : imminent ? "text-amber-600" : "text-slate-500"}`}>
+              {isLive ? "LIVE" : countdown}
+            </span>
+            {imminent && !isLive && (
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 font-medium" title="Odds may be pulled before game starts">
+                Starting soon
+              </span>
+            )}
+            {isLive && (
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-100 text-red-700 font-medium">
+                Odds unavailable
+              </span>
+            )}
+            <span className="text-xs text-slate-400">
+              {commence.toLocaleDateString(undefined, {
+                weekday: "short",
+                month: "short",
+                day: "numeric",
+              })}{" "}
+              {commence.toLocaleTimeString(undefined, {
+                hour: "numeric",
+                minute: "2-digit",
+              })}
+            </span>
+          </div>
+        </div>
+
+        {/* Center: Quick odds preview (collapsed only) */}
+        {!expanded && (
+          <div className="hidden sm:flex items-center gap-4 text-right flex-shrink-0">
+            {spreadPreview && (
+              <div>
+                <p className="text-[10px] text-slate-400 uppercase">Spread</p>
+                <div className="text-xs font-mono text-slate-600 space-y-0.5">
+                  {spreadPreview.map((s, i) => (
+                    <p key={i}>{s}</p>
+                  ))}
+                </div>
+              </div>
+            )}
+            {mlPreview && (
+              <div>
+                <p className="text-[10px] text-slate-400 uppercase">ML</p>
+                <div className="text-xs font-mono text-slate-600 space-y-0.5">
+                  {mlPreview.map((s, i) => (
+                    <p key={i}>{s}</p>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        <svg
+          className={`w-5 h-5 text-slate-400 transition-transform flex-shrink-0 ${
+            expanded ? "rotate-180" : ""
+          }`}
+          fill="none"
+          viewBox="0 0 24 24"
+          stroke="currentColor"
+        >
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+        </svg>
+      </div>
+
+      {expanded && (
+        <div className="mt-4 pt-4 border-t border-slate-100 space-y-4">
+          {spreadBets.length > 0 && (
+            <BetSection title="Spread" bets={spreadBets} onSelect={onSelectBet} oddsFormat={oddsFormat} />
+          )}
+          {totalBets.length > 0 && (
+            <BetSection title="Total" bets={totalBets} onSelect={onSelectBet} oddsFormat={oddsFormat} />
+          )}
+          {mlBets.length > 0 && (
+            <BetSection title="Moneyline" bets={mlBets} onSelect={onSelectBet} oddsFormat={oddsFormat} />
+          )}
+          {bets.length === 0 && (
+            <p className="text-xs text-slate-400">No odds available for this game</p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BetSection({
+  title,
+  bets,
+  onSelect,
+  oddsFormat = "american",
+}: {
+  title: string;
+  bets: AvailableBet[];
+  onSelect: (bet: AvailableBet) => void;
+  oddsFormat?: "american" | "decimal";
+}) {
+  // Group bets into pairs by line value for compact mobile display
+  const pairs: AvailableBet[][] = [];
+  const used = new Set<number>();
+  for (let i = 0; i < bets.length; i++) {
+    if (used.has(i)) continue;
+    const pair = [bets[i]];
+    used.add(i);
+    // Find the matching opposite side with the same line
+    for (let j = i + 1; j < bets.length; j++) {
+      if (used.has(j)) continue;
+      if (bets[j].line === bets[i].line && bets[j].side !== bets[i].side) {
+        pair.push(bets[j]);
+        used.add(j);
+        break;
+      }
+    }
+    pairs.push(pair);
+  }
+
+  return (
+    <div>
+      <p className="text-xs font-medium text-slate-500 uppercase tracking-wide mb-2">
+        {title}
+      </p>
+      <div className="space-y-2">
+        {pairs.map((pair, pi) => {
+          const lineVal = pair[0].line;
+          const lineStr = pair[0].market === "h2h"
+            ? ""
+            : lineVal != null
+              ? `${lineVal > 0 ? "+" : ""}${lineVal}`
+              : "";
+
+          return (
+            <div key={pi} className="flex gap-2">
+              {pair.map((bet, bi) => {
+                const priceStr = formatOdds(bet.avgPrice, oddsFormat);
+                const bookLabel = bet.bookCount === 1
+                  ? "1 book"
+                  : `${bet.bookCount} books`;
+                // Use short label: just side name for h2h, side + line for spreads/totals
+                const shortSide = bet.market === "h2h"
+                  ? bet.side
+                  : `${bet.side} ${lineStr}`;
+
+                return (
+                  <button
+                    key={`${bet.side}-${bet.line}-${bi}`}
+                    type="button"
+                    onClick={() => onSelect(bet)}
+                    className="flex-1 flex items-center justify-between rounded-lg border border-slate-200 px-3 py-2.5 text-left hover:border-genius-400 hover:bg-genius-50 transition-colors group min-w-0"
+                  >
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm font-medium text-slate-800 group-hover:text-genius-800 break-words">
+                        {shortSide}
+                      </p>
+                      <p className="text-[10px] text-slate-400 group-hover:text-genius-500">
+                        {bookLabel}
+                        {bet.bookCount > 1 && bet.minPrice !== bet.maxPrice && (
+                          <> &middot; {formatOdds(bet.minPrice, oddsFormat)} to {formatOdds(bet.maxPrice, oddsFormat)}</>
+                        )}
+                      </p>
+                    </div>
+                    <span className="text-sm font-mono font-semibold text-slate-600 group-hover:text-genius-600 ml-2 flex-shrink-0">
+                      {priceStr}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/** Convert decimal odds to American format for display. */
+function decimalToAmerican(decimal: number): string {
+  if (decimal >= 2.0) {
+    return `+${Math.round((decimal - 1) * 100)}`;
+  }
+  if (decimal > 1.0) {
+    return `${Math.round(-100 / (decimal - 1))}`;
+  }
+  return "EVEN";
+}
+
+/** Convert American odds string to decimal. Returns null if invalid. */
+function americanToDecimal(american: string): number | null {
+  const n = parseInt(american, 10);
+  if (isNaN(n) || n === 0) return null;
+  // Reject invalid American odds in the range (-100, 0) and (0, 100)
+  if (n > 0 && n < 100) return null;
+  if (n < 0 && n > -100) return null;
+  if (n > 0) return 1 + n / 100;      // +150 → 2.50
+  return 1 + 100 / Math.abs(n);        // -150 → 1.667
+}
+
+/**
+ * Nudge decimal odds by ±1 American unit or ±0.01 decimal.
+ * For American: convert to American integer, add delta, convert back.
+ * Skips the dead zone (-99..+99) automatically.
+ */
+function nudgeOdds(currentDecimal: number, delta: number, useDecimal: boolean): number {
+  if (useDecimal) {
+    return Math.max(1.01, Math.min(50, currentDecimal + delta * 0.01));
+  }
+  // Work in American space: round to nearest integer, step by 1
+  let american = 0;
+  if (currentDecimal >= 2.0) {
+    american = Math.round((currentDecimal - 1) * 100); // positive
+  } else if (currentDecimal > 1.0) {
+    american = Math.round(-100 / (currentDecimal - 1)); // negative
+  }
+  american += delta;
+  // Skip dead zone: -99..+99 are invalid American odds
+  if (american >= -99 && american <= 0) american = delta > 0 ? 100 : -100;
+  if (american > 0 && american < 100) american = delta > 0 ? 100 : -100;
+  // Clamp
+  american = Math.max(-5000, Math.min(5000, american));
+  // Convert back to decimal
+  if (american > 0) return 1 + american / 100;
+  if (american < 0) return 1 + 100 / Math.abs(american);
+  return 2.0; // fallback for zero
+}
+
+/** Cryptographically secure random integer in [0, max). Uses rejection sampling. */
+function cryptoRandomInt(max: number): number {
+  if (max <= 0) throw new Error("max must be positive");
+  const limit = Math.floor(0x100000000 / max) * max;
+  const arr = new Uint32Array(1);
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    crypto.getRandomValues(arr);
+    if (arr[0] < limit) return arr[0] % max;
+  }
+}
+
+function WizardStepper({ currentStep }: { currentStep: "browse" | "review" | "configure" }) {
+  const steps = [
+    { key: "browse", label: "Browse", num: 1 },
+    { key: "review", label: "Review", num: 2 },
+    { key: "configure", label: "Configure", num: 3 },
+  ] as const;
+  const currentIdx = steps.findIndex((s) => s.key === currentStep);
+
+  return (
+    <div className="flex items-center gap-1 mb-4">
+      {steps.map((s, i) => {
+        const isActive = s.key === currentStep;
+        const isPast = currentIdx > i;
+        return (
+          <div key={s.key} className="flex items-center gap-1">
+            {i > 0 && (
+              <div className={`w-4 h-px ${isPast ? "bg-genius-400" : "bg-slate-200"}`} />
+            )}
+            <div
+              className={`flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium transition-colors ${
+                isActive
+                  ? "bg-genius-500 text-white"
+                  : isPast
+                    ? "bg-genius-100 text-genius-700"
+                    : "bg-slate-100 text-slate-400"
+              }`}
+            >
+              <span>{s.num}</span>
+              <span className="hidden sm:inline">{s.label}</span>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}

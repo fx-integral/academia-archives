@@ -1,0 +1,57 @@
+version: '1.0'
+
+compute_spec:
+  miner:
+    bittensor:
+      description: "Bittensor Archive Node"
+      cpu:
+        min_cores: 8
+        min_speed: 3.0
+        recommended_cores: 12
+        recommended_speed: 3.5
+        architecture: "x86_64"
+      memory:
+        min_ram: 32
+        recommended_ram: 64
+        min_swap: 8
+        recommended_swap: 16
+        ram_type: "DDR4"
+      storage:
+        min_space: 4000
+        recommended_space: 8000
+        type: "NVMe SSD"
+        min_iops: 50000
+        recommended_iops: 100000
+
+  validator:
+    cpu:
+      min_cores: 6
+      min_speed: 2.6
+      recommended_cores: 8
+      recommended_speed: 3
+      architecture: "x86_64"
+    memory:
+      min_ram: 8
+      recommended_ram: 16
+    storage:
+      min_space: 20
+      recommended_space: 50
+
+
+network_spec:
+  bandwidth:
+    ethereum:
+      download: 1000
+      upload: 1000
+    sui:
+      download: 500
+      upload: 500
+    bittensor:
+      download: 500
+      upload: 500
+
+
+os:
+  name: "Ubuntu"
+  version: "20.04 LTS"
+  recommended_version: "22.04 LTS"
